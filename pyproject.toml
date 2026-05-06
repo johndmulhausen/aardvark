@@ -6,7 +6,12 @@ requires-python = ">=3.11"
 dependencies = [
     "streamlit>=1.53.0",
     "openai>=1.40.0",
-    "weave>=0.52.0",
+    # 0.52.24+ is required for ``kind=`` / ``color=`` kwargs on ``@weave.op``.
+    # Older 0.52.x installs reject those kwargs with ``TypeError`` at module
+    # import time. agent.py / tools.py / mcp_servers.py also include a runtime
+    # ``_op`` shim that gracefully drops them on older weave, but we pin the
+    # floor here so fresh installs get the proper Weave UI categorization.
+    "weave>=0.52.24",
     "mcp>=1.19.0",
 ]
 

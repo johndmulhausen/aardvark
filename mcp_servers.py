@@ -42,6 +42,7 @@ headers in plaintext, so the file is written with mode 0600.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -57,6 +58,27 @@ import weave
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
+
+# ---------------------------------------------------------------------------
+# weave.op compat shim
+# ---------------------------------------------------------------------------
+# ``kind`` and ``color`` were added to ``weave.op`` partway through the 0.52
+# series; on older installs the decorator raises ``TypeError`` at import time
+# the moment Python evaluates ``@weave.op(..., kind="tool", color="green")``,
+# which crashes the whole app before the UI ever loads. We feature-detect the
+# supported kwargs once at module load and silently drop the unsupported ones,
+# so older weave still gives us correct trace trees (just without the UI
+# kind/color categorization). pyproject pins a recent enough weave for fresh
+# installs; this shim handles upgrade-laggers.
+_WEAVE_OP_PARAMS = set(inspect.signature(weave.op).parameters)
+_WEAVE_OP_DROP = {k for k in ("kind", "color") if k not in _WEAVE_OP_PARAMS}
+
+
+def _op(*args: Any, **kwargs: Any) -> Any:
+    """``@weave.op`` wrapper that drops kwargs unsupported by older weave."""
+    for k in _WEAVE_OP_DROP:
+        kwargs.pop(k, None)
+    return weave.op(*args, **kwargs)
 
 CONFIG_DIR = Path.home() / ".wb_coding_agent"
 CONFIG_FILE = CONFIG_DIR / "mcp.json"
@@ -571,7 +593,7 @@ class MCPRegistry:
         return _calltool_result_to_dict(result)
 
 
-@weave.op(name="mcp_dispatch_tool", kind="tool", color="green")
+@_op(name="mcp_dispatch_tool", kind="tool", color="green")
 def dispatch(name: str, arguments_json: str) -> dict[str, Any]:
     """Run an MCP tool by namespaced name.
 

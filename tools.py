@@ -16,6 +16,7 @@ decorator is a no-op and dispatch behaves identically.
 from __future__ import annotations
 
 import difflib
+import inspect
 import json
 import subprocess
 from dataclasses import dataclass
@@ -23,6 +24,24 @@ from pathlib import Path
 from typing import Any, Callable
 
 import weave
+
+# ---------------------------------------------------------------------------
+# weave.op compat shim
+# ---------------------------------------------------------------------------
+# See ``mcp_servers._op`` for the full rationale: ``kind`` and ``color`` were
+# added to ``weave.op`` partway through the 0.52 series; older installs raise
+# ``TypeError`` at decorator-evaluation time. We feature-detect once at module
+# load so older weave loses the UI categorization but still produces a correct
+# trace tree. pyproject pins a recent-enough weave for fresh installs.
+_WEAVE_OP_PARAMS = set(inspect.signature(weave.op).parameters)
+_WEAVE_OP_DROP = {k for k in ("kind", "color") if k not in _WEAVE_OP_PARAMS}
+
+
+def _op(*args: Any, **kwargs: Any) -> Any:
+    """``@weave.op`` wrapper that drops kwargs unsupported by older weave."""
+    for k in _WEAVE_OP_DROP:
+        kwargs.pop(k, None)
+    return weave.op(*args, **kwargs)
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build", ".next"}
 
@@ -340,7 +359,7 @@ _DISPATCH: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 
-@weave.op(name="dispatch_tool", kind="tool", color="green")
+@_op(name="dispatch_tool", kind="tool", color="green")
 def dispatch(name: str, arguments_json: str, ctx: ToolContext) -> dict[str, Any]:
     """Run a tool call by name with JSON-encoded arguments.
 

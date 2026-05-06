@@ -39,6 +39,7 @@ already captures the relevant request fields (model, messages, tools).
 """
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Iterator, Literal
@@ -48,6 +49,24 @@ from openai import OpenAI
 
 import mcp_servers
 import project_context
+
+# ---------------------------------------------------------------------------
+# weave.op compat shim
+# ---------------------------------------------------------------------------
+# See ``mcp_servers._op`` for the full rationale: ``kind`` and ``color`` were
+# added to ``weave.op`` partway through the 0.52 series; older installs raise
+# ``TypeError`` at decorator-evaluation time. We feature-detect once at module
+# load so older weave loses the UI categorization but still produces a correct
+# trace tree. pyproject pins a recent-enough weave for fresh installs.
+_WEAVE_OP_PARAMS = set(inspect.signature(weave.op).parameters)
+_WEAVE_OP_DROP = {k for k in ("kind", "color") if k not in _WEAVE_OP_PARAMS}
+
+
+def _op(*args: Any, **kwargs: Any) -> Any:
+    """``@weave.op`` wrapper that drops kwargs unsupported by older weave."""
+    for k in _WEAVE_OP_DROP:
+        kwargs.pop(k, None)
+    return weave.op(*args, **kwargs)
 from tools import ToolContext, dispatch, tools_for_mode
 
 
@@ -113,7 +132,7 @@ def _short_model_name(model: str) -> str:
     return model.split("/")[-1]
 
 
-@weave.op(
+@_op(
     name="stream_one_call",
     kind="llm",
     color="blue",
@@ -216,7 +235,7 @@ def _stream_one_call(
         }
 
 
-@weave.op(
+@_op(
     name="run_agent_turn",
     kind="agent",
     color="purple",
