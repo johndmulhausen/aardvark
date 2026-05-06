@@ -19,14 +19,32 @@ patch Weave's stream post-processor at init time to default a missing
 ``finish_reason`` to ``"tool_calls"`` (when tool calls were produced) or
 ``"stop"`` (otherwise) so traces are captured cleanly. See
 :func:`_patch_weave_openai_finish_reason`.
+
+Storage-pressure auto-prune
+---------------------------
+W&B Weave does not expose an account-level storage quota via the SDK, so we
+can't proactively check "% full". Instead, :class:`_StorageHandler` attaches
+to the ``weave`` logger tree at init time and watches for upload-pipeline
+errors that look like storage / quota exhaustion (substrings ``storage``,
+``quota``, ``insufficient``, ``exceeded``, or HTTP 403 paired with
+``forbidden``/``limit``). When one fires, the handler sets a process-wide
+``threading.Event``; the agent loop calls
+:func:`prune_oldest_calls_if_pressured` at the end of each turn, which deletes
+the oldest 200 root calls from the active project, clears the flag, and
+debounces further prunes for 60 s so a burst of failed uploads doesn't
+cascade into repeated deletions.
 """
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import time
 from typing import Any
 
 import weave
 from openai import OpenAI
+from weave.trace.context import weave_client_context
 from weave.trace.weave_client import WeaveClient
 
 WB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
@@ -35,6 +53,130 @@ WB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 # `team/project` field in the sidebar. Weave creates this project under the
 # user's default entity on first call, so no upfront setup is required.
 DEFAULT_WEAVE_PROJECT = "wandb-coding-agent"
+
+# How many root calls to delete per prune cycle. The W&B Service API caps a
+# single ``calls_delete`` request at 1000; 200 is a conservative default that
+# clears enough headroom to keep tracing for several more turns without
+# delaying the user noticeably.
+DEFAULT_PRUNE_BATCH_SIZE = 200
+MAX_PRUNE_BATCH_SIZE = 1000
+
+# Don't re-run the prune more than once per minute even if the pressure flag
+# keeps re-firing. Backend visibility lags after a delete; prune storms also
+# eat into the user's ingest quota with their own delete traffic.
+PRUNE_DEBOUNCE_SECONDS = 60.0
+
+# Substrings (case-insensitive) on a Weave log record that we treat as
+# evidence of storage / quota pressure. Deliberately conservative: 5xx
+# transients and 413 ("payload too large") are NOT in this list because they
+# don't indicate the user is out of storage.
+_STORAGE_KEYWORDS = ("storage", "quota", "insufficient", "exceeded")
+
+# Module-level state shared across threads. The Weave upload thread sets the
+# flag from inside the logging handler; the agent loop reads it at end of
+# turn from the main thread.
+_storage_pressure_flag = threading.Event()
+_storage_pressure_reason: str | None = None
+_storage_pressure_lock = threading.Lock()
+_last_prune_ts: float = 0.0
+_storage_handler_attached = False
+
+
+class _StorageHandler(logging.Handler):
+    """Watches the ``weave`` logger for storage-quota signals.
+
+    Weave's background upload thread funnels permanent upload failures through
+    two log records:
+
+    - ``weave.utils.retry`` at INFO ``"retry_failed"`` with the underlying
+      exception attached on the record's ``exception`` extra field.
+    - ``weave.trace_server_bindings.remote_http_trace_server`` at WARNING
+      ``"Batch failed after max retries, requeueing batch ..."``.
+
+    On every record we examine the formatted message plus any attached
+    exception text for the keywords in :data:`_STORAGE_KEYWORDS` (or for
+    HTTP 403 paired with the words ``forbidden`` / ``limit``). When matched,
+    we set :data:`_storage_pressure_flag` and stash a short reason so the UI
+    can display *why* the prune fired.
+
+    All exceptions raised inside the handler are swallowed; a bug in detection
+    must never crash Weave's upload pipeline.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            haystack_parts = [record.getMessage()]
+            exc_extra = record.__dict__.get("exception")
+            if exc_extra:
+                haystack_parts.append(str(exc_extra))
+            if record.exc_info:
+                haystack_parts.append(repr(record.exc_info))
+            haystack = " ".join(haystack_parts).lower()
+
+            matched = False
+            for kw in _STORAGE_KEYWORDS:
+                if kw in haystack:
+                    matched = True
+                    break
+            if not matched and "403" in haystack and (
+                "forbidden" in haystack or "limit" in haystack
+            ):
+                matched = True
+
+            if not matched:
+                return
+
+            # Compose a short reason combining the log message with any
+            # attached exception. ``retry_failed`` records carry the actual
+            # 4xx text on the ``exception`` extra, not in the message.
+            reason = record.getMessage()
+            if exc_extra:
+                reason = f"{reason}: {exc_extra}"
+            # Cap to keep the UI caption tidy.
+            if len(reason) > 200:
+                reason = reason[:197] + "..."
+
+            global _storage_pressure_reason
+            with _storage_pressure_lock:
+                _storage_pressure_reason = reason
+            _storage_pressure_flag.set()
+        except Exception:
+            # Detection bugs must never crash the Weave upload thread.
+            pass
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        # Default behavior writes to sys.stderr; we'd rather stay silent
+        # because logging from inside a logging handler can re-enter Weave.
+        pass
+
+
+def _ensure_storage_handler_attached() -> None:
+    """Idempotently attach :class:`_StorageHandler` to the ``weave`` logger.
+
+    Mirrors :func:`_patch_weave_openai_finish_reason`'s "patch once" pattern.
+    Setting the handler level to INFO ensures we see ``retry_failed`` records
+    from ``weave.utils.retry``, which are the earliest signal of permanent
+    upload failure.
+    """
+    global _storage_handler_attached
+    if _storage_handler_attached:
+        return
+    handler = _StorageHandler(level=logging.INFO)
+    weave_logger = logging.getLogger("weave")
+    weave_logger.addHandler(handler)
+    # Don't lower the logger's effective level globally — users may have
+    # configured ``weave`` at WARNING. We only need to *receive* INFO records
+    # if the logger is already configured to emit them; raising the logger's
+    # level here would surprise users who rely on the default verbosity.
+    _storage_handler_attached = True
+
+
+def reset_storage_pressure() -> None:
+    """Clear the storage-pressure flag and reason. Test/debug helper."""
+    global _storage_pressure_reason
+    _storage_pressure_flag.clear()
+    with _storage_pressure_lock:
+        _storage_pressure_reason = None
 
 
 def make_client(api_key: str, project: str | None = None) -> OpenAI:
@@ -126,4 +268,113 @@ def init_weave(api_key: str, project: str | None = None) -> tuple[WeaveClient, s
     # during init / first openai call) picks up our tolerant post-processor.
     _patch_weave_openai_finish_reason()
     client = weave.init(target)
+    # Now that the weave logger tree is in use, attach the storage-pressure
+    # listener so any subsequent upload failure with a quota-shaped message
+    # flips the prune flag. Idempotent across reconnects.
+    _ensure_storage_handler_attached()
     return client, target
+
+
+def prune_oldest_calls(
+    client: WeaveClient,
+    *,
+    batch_size: int = DEFAULT_PRUNE_BATCH_SIZE,
+) -> dict[str, Any]:
+    """Delete the oldest ``batch_size`` root calls from the active project.
+
+    Used by :func:`prune_oldest_calls_if_pressured` after the storage-pressure
+    flag flips. We restrict to root calls (``trace_roots_only=True``) because
+    Weave deletes children transitively when a root is removed; trying to
+    delete a child whose parent has already been deleted would be wasteful
+    and risks confusing later traversal.
+
+    Returns a JSON-serializable status dict mirroring the contract used by
+    other agent events: ``status="ok"`` with ``deleted: int`` on success;
+    ``status="error"`` with ``message: str`` on failure (the caller never
+    raises).
+    """
+    if batch_size <= 0:
+        batch_size = DEFAULT_PRUNE_BATCH_SIZE
+    batch_size = min(batch_size, MAX_PRUNE_BATCH_SIZE)
+
+    try:
+        from weave.trace_server.trace_server_interface import (
+            CallsDeleteReq,
+            CallsFilter,
+            SortBy,
+        )
+
+        calls_iter = client.get_calls(
+            filter=CallsFilter(trace_roots_only=True),
+            sort_by=[SortBy(field="started_at", direction="asc")],
+            limit=batch_size,
+            # ``id`` is always returned; asking for nothing else keeps the
+            # query light when the project has many calls.
+            columns=["id"],
+        )
+        call_ids = [c.id for c in calls_iter]
+        if not call_ids:
+            return {"status": "ok", "deleted": 0}
+        client.server.calls_delete(
+            CallsDeleteReq(
+                project_id=client._project_id(),
+                call_ids=call_ids,
+            )
+        )
+        return {"status": "ok", "deleted": len(call_ids)}
+    except Exception as e:  # noqa: BLE001 — surfaced verbatim to the UI
+        return {"status": "error", "message": str(e)}
+
+
+def prune_oldest_calls_if_pressured(
+    *,
+    batch_size: int = DEFAULT_PRUNE_BATCH_SIZE,
+) -> dict[str, Any] | None:
+    """Run :func:`prune_oldest_calls` only if Weave has flagged storage pressure.
+
+    Called by ``agent.run_agent_turn`` at the end of every turn. Returns
+    ``None`` when the flag is unset (so the agent can skip yielding an event
+    altogether), or one of:
+
+    - ``{"status": "skipped", "reason": "no_client"}`` — pressure flag set
+      but Weave isn't initialized in this process.
+    - ``{"status": "skipped", "reason": "debounced"}`` — another prune ran
+      within the last :data:`PRUNE_DEBOUNCE_SECONDS`.
+    - ``{"status": "ok", "deleted": N, "reason": <quota log message>}`` —
+      successful prune; flag and reason cleared.
+    - ``{"status": "error", "message": str}`` — query or delete raised; the
+      flag is cleared so we don't fail in a loop, but the next storage log
+      record will trip it again.
+
+    On any non-``None`` return the pressure flag is cleared.
+    """
+    if not _storage_pressure_flag.is_set():
+        return None
+
+    global _last_prune_ts, _storage_pressure_reason
+    now = time.monotonic()
+    if now - _last_prune_ts < PRUNE_DEBOUNCE_SECONDS:
+        # Keep the flag set so a later turn (after the debounce window) will
+        # actually prune; just don't fire right now.
+        return {"status": "skipped", "reason": "debounced"}
+
+    client = weave_client_context.get_weave_client()
+    if client is None:
+        # Pressure was detected but Weave isn't initialized in this process,
+        # which shouldn't happen in normal flow. Clear the flag so we don't
+        # spin on it indefinitely.
+        _storage_pressure_flag.clear()
+        return {"status": "skipped", "reason": "no_client"}
+
+    with _storage_pressure_lock:
+        reason = _storage_pressure_reason
+
+    result = prune_oldest_calls(client, batch_size=batch_size)
+    _last_prune_ts = time.monotonic()
+    _storage_pressure_flag.clear()
+    with _storage_pressure_lock:
+        _storage_pressure_reason = None
+
+    if result.get("status") == "ok" and reason:
+        result["reason"] = reason
+    return result

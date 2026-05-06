@@ -10,10 +10,14 @@
 # Keep the two lists in sync.
 
 [client]
-# Hide the hamburger menu and "Deploy" button so the app looks like a desktop
-# tool rather than a hosted Streamlit instance. Options: "auto", "developer",
-# "viewer", "minimal".
-toolbarMode = "minimal"
+# We render this app as a local-only desktop-style tool, so we don't want the
+# "Deploy" button or developer-mode hamburger menu, but we DO want the
+# Settings menu's built-in light/dark/system toggle to stay reachable —
+# otherwise users have no way to switch theme at runtime (Streamlit doesn't
+# expose a programmatic theme switch). Options: "auto", "developer",
+# "viewer", "minimal". "viewer" hides the Deploy button and developer
+# tooling but keeps Settings.
+toolbarMode = "viewer"
 
 [browser]
 # This is a personal-use coding tool; do not phone home with telemetry.

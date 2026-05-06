@@ -4,7 +4,9 @@ A local Streamlit app that turns any [W&B Inference](https://docs.wandb.ai/infer
 
 ## Features
 
-- Bring your own W&B API key (kept only in session memory, never written to disk).
+- Bring your own W&B API key. By default it's session-only; tick **Remember on this machine** in the settings popover and it persists to `~/.wb_coding_agent/credentials.json` (mode 0600) so future launches connect automatically.
+- **Settings tab in the top nav** — verify a GitHub Personal Access Token (your GitHub avatar then renders in the page header and the agent commits as you), see the active theme + a pointer to Streamlit's built-in light/dark/system toggle, and connect to W&B Inference with optional opt-in API-key persistence.
+- **Usage and cost dashboard** as a separate page — KPI cards for today / 7-day token use and dollar cost, daily token volume + cost line charts, cost-by-model bar chart, and a recent-turns table. Driven by live `usage` chunks the W&B Inference service emits during each streamed completion, priced via the per-model rates published at [wandb.ai/site/pricing/inference](https://wandb.ai/site/pricing/inference). Persisted to `~/.wb_coding_agent/usage.jsonl` so the data survives restarts.
 - Live-fetched model list from `https://api.inference.wandb.ai/v1/models`, with descriptions from the W&B docs — pick whichever model you want to code with from the dropdown below the chat input.
 - Two modes: **Agent** (full read/write/edit, plus optional shell) and **Ask only** (read-only — the model can list and read files but cannot modify the project).
 - Working-directory dropdown below the chat input remembers your recent project folders and includes a folder icon that opens a native OS picker. The recents list is persisted to `~/.wb_coding_agent/recent_dirs.json`.
@@ -44,10 +46,12 @@ streamlit run streamlit_app.py
 
 Then in the app:
 
-1. Paste a W&B API key from [wandb.ai/settings](https://wandb.ai/settings).
-2. (Optional) Enter `team/project` for usage attribution.
-3. Click **Connect** to fetch the model list.
-4. Below the chat input, pick a **Working directory** (use the folder icon to browse, or pick a recent), a **Mode** (Agent or Ask only), and a **Model** — then start chatting.
+1. Open the **Settings** tab in the top nav.
+2. Paste a W&B API key from [wandb.ai/settings](https://wandb.ai/settings). (Optional: tick **Remember on this machine** to save it.)
+3. (Optional) Enter `team/project` for usage attribution and Weave tracing.
+4. Click **Connect** to fetch the model list.
+5. Switch to the **Chat** tab. Below the chat input, pick a **Working directory** (use the folder icon to browse, or pick a recent), a **Mode** (Agent or Ask only), and a **Model** — then start chatting.
+6. Switch to the **Usage** tab any time to see token use and dollar cost across every turn you've run.
 
 ## Desktop build (optional)
 
@@ -77,7 +81,7 @@ The packaged app hides Streamlit's hamburger menu and "Deploy" button so it look
 
 ## MCP servers
 
-In the sidebar, expand **MCP servers** and click **Add server** to connect one. Two transports are supported:
+Open the **Settings** tab in the top nav, scroll to the **MCP servers** card, and click **Add server** to connect one. Two transports are supported:
 
 - **Stdio** — runs a local subprocess. Example: connect the [filesystem](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem) reference server.
   - Name: `Filesystem`
@@ -90,7 +94,7 @@ In the sidebar, expand **MCP servers** and click **Add server** to connect one. 
   - URL: `https://example.com/mcp`
   - Headers: `Authorization: Bearer ...`
 
-Each row in the **MCP servers** sidebar panel shows the server's name, transport, connection status (or error), an enable/disable checkbox, and an edit button. Configurations are persisted to `~/.wb_coding_agent/mcp.json` (mode 0600 — header tokens are stored in plaintext, so only enter credentials you're comfortable having on disk).
+Each row in the **MCP servers** card on the Settings page shows the server's name, transport, connection status (or error), an enable/disable checkbox, and an edit button. Configurations are persisted to `~/.wb_coding_agent/mcp.json` (mode 0600 — header tokens are stored in plaintext, so only enter credentials you're comfortable having on disk).
 
 Note: the **W&B Inference service does not need to know anything about MCP**. The local app holds the MCP session, lists each server's tools, and exposes them as ordinary OpenAI-format function schemas in the `tools` array of every chat-completion request. When the model returns a tool call named `mcp__<server>__<tool>`, the app dispatches it to the right MCP session locally and feeds the result back to the model. This is the same bridge pattern Claude Code, Cursor, and the OpenAI Agents SDK use.
 
@@ -108,22 +112,57 @@ To make the agent more reliable in your project, drop guidance files where it ex
 
 A "Project context" expander below the chat input shows what was detected, and a `:material/auto_fix_high: Loaded N skills` caption appears above each assistant turn so you know which skills actually fired.
 
+## Settings and GitHub identity
+
+The **Settings** tab in the top nav manages everything per-user. The flow:
+
+- **Avatar.** When you verify a GitHub PAT (below), your GitHub avatar is downloaded once and cached for the rest of the Streamlit session, and renders in the GitHub identity card. Without a verified PAT, an inline-SVG `account_circle` glyph is shown instead. There is no separate avatar uploader.
+- **GitHub identity.** Generate a fine-grained personal access token at [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new). Recommended permissions:
+  - `read:user` and `user:email` — required for the verify step (`GET /user`) to return your username and primary email.
+  - `repo` — only if you want to grant the agent push access to repositories under your control. This isn't required for verification or for stamping commit authorship.
+
+  Paste the PAT, click **Verify and save**, and the app calls GitHub's `/user` endpoint to confirm the token + pull your username, email, and avatar. The PAT is stored in `~/.wb_coding_agent/credentials.json` (mode 0600), the non-secret identity fields in `~/.wb_coding_agent/preferences.json`. When you chat in a directory that's a git repo, the agent runs `git config --local user.name`/`user.email` so commits it makes via `run_shell` are authored as you.
+- **Theme.** The Settings page surfaces the active theme (read via `st.context.theme.base`) and points at the toolbar's Settings menu (the **⋮** at the top-right of the page) for the actual Light / Dark / System toggle, since that's the only place Streamlit lets the theme change at runtime. Your choice is persisted by Streamlit itself across sessions.
+- **W&B Inference connection.** API key + optional `team/project` + Connect button. Tick **Remember on this machine** to persist the API key (mode 0600); leave it unchecked for the original session-only behavior.
+
+## Usage and cost
+
+Click **Usage** in the top nav (next to **Chat**) to see a dashboard of every turn you've run:
+
+- KPI cards for today's tokens, today's cost, the trailing 7-day tokens, and the trailing 7-day cost (with deltas vs the prior period).
+- A 30-day stacked line chart of prompt vs completion tokens.
+- A 30-day line chart of daily USD cost.
+- A horizontal bar chart of cost-by-model.
+- A scrollable table of the most recent 100 turns with timestamp, model, mode, prompt/completion/total tokens, USD cost, and latency.
+
+Cost is computed from the per-model rates published at [wandb.ai/site/pricing/inference](https://wandb.ai/site/pricing/inference); for any model without published pricing the cost cell renders `-`. Data is persisted to `~/.wb_coding_agent/usage.jsonl` (one JSON object per turn, append-only) so it survives restarts. The same `usage.jsonl` powers the per-turn footer caption in chat.
+
+To capture this data the app passes `stream_options={"include_usage": True}` on every chat completion — the W&B Inference service responds with a final usage chunk containing prompt / completion / total token counts, which we accumulate across all inference rounds in the turn.
+
 ## Safety
 
 - All file paths are resolved against the working directory; paths that escape the directory are rejected.
 - `run_shell` is always available in Agent mode and runs with `cwd` set to your working directory and a 30-second timeout. It is a real shell — only point the agent at directories whose contents (and surrounding environment) you're comfortable letting it touch. Switch to Ask only mode to disable shell, writes, and edits when you just want the model to look at code.
-- The W&B API key is held in `st.session_state` for the duration of the browser session only. It is not persisted.
+- The W&B API key is held in `st.session_state` for the duration of the browser session by default. If you tick **Remember on this machine** on the Settings page, it's saved to `~/.wb_coding_agent/credentials.json` (mode 0600); anyone with read access to your home directory could read it. Untick the box and click **Forget saved API key** to remove it.
+- The GitHub PAT (when set) is also saved at `~/.wb_coding_agent/credentials.json` (mode 0600). The token is sent only to `https://api.github.com/user` for verification and is otherwise inert; the agent itself never makes GitHub API calls with it.
 - Always review the unified diffs the agent emits before relying on its edits.
 
 ## Project layout
 
-- `streamlit_app.py` — UI entry point.
+- `streamlit_app.py` — Entry point. Page config, session-state init, shared sidebar (file changes + clear chat), and `st.navigation` between the chat, usage, and settings pages.
+- `app_pages/chat.py` — The chat page (history + chat input + workdir + mode/model controls). Captures token usage from each turn and persists it.
+- `app_pages/usage.py` — The usage and cost dashboard.
+- `app_pages/settings.py` — GitHub PAT verify-and-save, theme info, W&B Inference Connect / Disconnect / Forget, and the MCP servers card + add/edit dialog.
+- `actions.py` — Cross-page callbacks (recents, folder picker, Connect, GitHub PAT) imported by every page.
 - `chat_input.py` — Slash-command autocomplete enhancer. CCv2 component that attaches a floating dropdown to `st.chat_input` while typing `/`.
-- `agent.py` — Tool-calling agent loop. Decorated with `@weave.op` so each turn is a single Weave trace.
+- `agent.py` — Tool-calling agent loop. Decorated with `@weave.op` so each turn is a single Weave trace. Streams with `stream_options={"include_usage": True}` so the dashboard has token counts to render.
 - `tools.py` — Tool schemas and sandboxed executors. `dispatch` is decorated with `@weave.op(kind="tool")`.
 - `wb_client.py` — OpenAI-client wrapper for W&B Inference, plus the Weave bootstrap (`init_weave`).
 - `mcp_servers.py` — MCP runtime: `ServerConfig`, the registry singleton, the daemon-thread asyncio loop that owns every live MCP session, and the on-disk config at `~/.wb_coding_agent/mcp.json`. `dispatch` is decorated with `@weave.op(kind="tool")`.
 - `project_context.py` — Auto-detects `AGENTS.md` / `CLAUDE.md` / `CONVENTIONS.md`, `.cursor/rules`, and `.cursor/skills` and selects which guidance to splice into each turn's system prompt.
+- `models.py` — Single source of truth for model display labels, descriptions, context windows, parameter counts, and per-million-token pricing.
+- `account.py` — GitHub PAT verification, opt-in W&B API key persistence, theme/avatar preferences. Pure stdlib.
+- `usage.py` — Token-usage capture, cost compute, and aggregation. Owns `~/.wb_coding_agent/usage.jsonl`.
 - `scripts/build_desktop.py` — Packaged-desktop-app build script.
 - `scripts/build_desktop.sh` — Bootstrap wrapper that creates / re-syncs the build venv, then invokes `build_desktop.py`.
 - `.streamlit/config.toml` — Streamlit runtime options for local dev (mirrored in the build script for packaged builds).

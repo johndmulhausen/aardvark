@@ -43,6 +43,10 @@ ENTRY_SCRIPT = "streamlit_app.py"
 # does not pick them up - we must ship them as data files alongside the
 # bundled entry script. Add to this list whenever a new top-level module is
 # imported by ``streamlit_app.py``; see AGENTS.md.
+#
+# Paths may include a directory prefix (e.g. ``app_pages/chat.py``); the
+# destination inside the bundle preserves the same relative location so
+# ``st.navigation`` can find the Page modules at runtime.
 BUNDLED_MODULES: tuple[str, ...] = (
     "agent.py",
     "tools.py",
@@ -50,6 +54,14 @@ BUNDLED_MODULES: tuple[str, ...] = (
     "mcp_servers.py",
     "project_context.py",
     "chat_input.py",
+    "models.py",
+    "account.py",
+    "actions.py",
+    "usage.py",
+    "app_pages/__init__.py",
+    "app_pages/chat.py",
+    "app_pages/usage.py",
+    "app_pages/settings.py",
 )
 
 # Third-party packages imported by ``BUNDLED_MODULES`` (not by
@@ -79,7 +91,12 @@ COLLECT_ALL_PACKAGES: tuple[str, ...] = (
 # Settings UI used to switch modes — so there is nothing to toggle in the
 # packaged build anyway and no asymmetry the user can observe.
 STREAMLIT_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("client.toolbarMode", "minimal"),
+    # "viewer" (rather than "minimal") so the Settings menu's built-in
+    # light/dark/system theme toggle stays reachable inside the packaged
+    # app — Streamlit has no programmatic theme switch, so without
+    # Settings the user is locked to whichever theme matches their OS at
+    # launch. Mirror in .streamlit/config.toml for the local-dev workflow.
+    ("client.toolbarMode", "viewer"),
     ("browser.gatherUsageStats", "false"),
     ("theme.baseFontSize", "14"),
 )
@@ -144,7 +161,13 @@ def main() -> int:
                 file=sys.stderr,
             )
             continue
-        pyinstaller_opts.extend(["--add-data", f"{module_path}{sep}."])
+        # Preserve the file's relative directory inside the bundle so that
+        # subpackages like ``app_pages/`` end up at the same import path
+        # they have in the source tree. ``Path("foo.py").parent`` is ``.``,
+        # which is the bundle root — exactly what we want for top-level
+        # modules.
+        rel_dir = str(Path(module).parent) or "."
+        pyinstaller_opts.extend(["--add-data", f"{module_path}{sep}{rel_dir}"])
 
     for pkg in COLLECT_ALL_PACKAGES:
         pyinstaller_opts.extend(["--collect-all", pkg])

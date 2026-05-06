@@ -14,7 +14,16 @@ Exposes a generator, ``run_agent_turn``, that yields events the UI renders:
   what the UI replays from history on rerun.
 - ``{"type": "tool_call", "id": ..., "name": ..., "args": ...}``
 - ``{"type": "tool_result", "id": ..., "name": ..., "result": ...}``
+- ``{"type": "usage", "model": ..., "prompt_tokens": ..., "completion_tokens": ...,
+  "total_tokens": ...}`` — emitted once per inference round (a turn with N
+  tool-calling rounds emits N of these). The UI sums them per turn for the
+  Usage dashboard and the per-turn footer caption.
 - ``{"type": "error", "message": ...}``
+- ``{"type": "weave_pruned", "status": ..., ...}`` — emitted at most once per
+  turn (always last), only when W&B Weave's upload pipeline reported storage
+  pressure during the turn (see ``wb_client.prune_oldest_calls_if_pressured``).
+  The payload includes ``status`` (``"ok"`` / ``"skipped"`` / ``"error"``)
+  and context-specific fields (``deleted``, ``reason``, ``message``).
 
 The generator mutates the supplied ``messages`` list in place so the caller can
 persist it across turns. Each model call is made with ``stream=True``; tool-call
@@ -49,6 +58,7 @@ from openai import OpenAI
 
 import mcp_servers
 import project_context
+import wb_client
 
 # ---------------------------------------------------------------------------
 # weave.op compat shim
@@ -168,6 +178,12 @@ def _stream_one_call(
         tools=tools,
         tool_choice="auto",
         stream=True,
+        # Ask the server to emit a final ``usage`` chunk with prompt /
+        # completion / total token counts. Compatible OpenAI-style providers
+        # (W&B Inference included) only send the usage block when this flag
+        # is set; without it ``chunk.usage`` is always ``None``. We need
+        # those numbers to drive the Usage dashboard.
+        stream_options={"include_usage": True},
     )
 
     content_parts: list[str] = []
@@ -175,8 +191,16 @@ def _stream_one_call(
     # land on the first delta for that index, then arguments stream in as a
     # sequence of string fragments that must be concatenated in order.
     tool_calls_by_index: dict[int, dict[str, Any]] = {}
+    # Captured from the trailing ``usage`` chunk emitted because we passed
+    # ``stream_options={"include_usage": True}``. That chunk has no choices
+    # (just a populated ``usage`` field) so it falls through the
+    # ``not chunk.choices`` short-circuit below.
+    usage_obj: Any = None
 
     for chunk in stream:
+        usage_attr = getattr(chunk, "usage", None)
+        if usage_attr is not None:
+            usage_obj = usage_attr
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -211,6 +235,21 @@ def _stream_one_call(
     if tool_calls:
         assistant_entry["tool_calls"] = tool_calls
     messages.append(assistant_entry)
+
+    # Surface the per-call token usage to the caller before yielding the
+    # final-text / tool-call events. The agent loop forwards this to the UI
+    # (so each assistant turn can show its tokens + cost) and also folds it
+    # into the per-turn record persisted to ``usage.jsonl``. Emitting before
+    # the terminal events lets the agent loop decide what to do with the
+    # numbers without having to scan a trailing event after iteration ends.
+    if usage_obj is not None:
+        yield {
+            "type": "usage",
+            "model": model,
+            "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+        }
 
     if not tool_calls:
         yield {"type": "assistant_text", "content": full_content, "_final": True}
@@ -320,7 +359,12 @@ def run_agent_turn(
     if mode != "ask":
         tools.extend(mcp_servers.get_registry().openai_tool_schemas())
 
-    while True:
+    # ``done`` lets us route every natural exit through the same post-turn
+    # bookkeeping (the storage-pressure prune below). We can't yield from a
+    # ``finally`` because the generator may be closed early by the caller,
+    # which makes yielding inside ``finally`` raise RuntimeError.
+    done = False
+    while not done:
         try:
             stream_events = _stream_one_call(client, model, messages, tools)
             pending_tool_calls: list[dict[str, Any]] = []
@@ -336,10 +380,12 @@ def run_agent_turn(
                     yield event
         except Exception as e:
             yield {"type": "error", "message": f"Inference call failed: {e}"}
-            return
+            done = True
+            break
 
         if saw_final:
-            return
+            done = True
+            break
 
         if not pending_tool_calls:
             yield {
@@ -349,7 +395,8 @@ def run_agent_turn(
                     "tool calls. Try rephrasing your request."
                 ),
             }
-            return
+            done = True
+            break
 
         for call_event in pending_tool_calls:
             yield call_event
@@ -375,3 +422,15 @@ def run_agent_turn(
                     "content": json.dumps(result),
                 }
             )
+
+    # End-of-turn storage-pressure check. ``prune_oldest_calls_if_pressured``
+    # returns ``None`` when Weave hasn't logged any quota-shaped errors during
+    # the turn (the common case), so we only yield a UI event when the user
+    # actually needs to know something happened. See ``wb_client`` for the
+    # detection contract and the 60s debounce.
+    try:
+        pruned = wb_client.prune_oldest_calls_if_pressured()
+    except Exception as e:  # noqa: BLE001 — auto-prune must never crash a turn
+        pruned = {"status": "error", "message": str(e)}
+    if pruned is not None:
+        yield {"type": "weave_pruned", **pruned}
