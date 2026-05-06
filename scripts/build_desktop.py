@@ -47,6 +47,9 @@ BUNDLED_MODULES: tuple[str, ...] = (
     "agent.py",
     "tools.py",
     "wb_client.py",
+    "mcp_servers.py",
+    "project_context.py",
+    "chat_input.py",
 )
 
 # Third-party packages imported by ``BUNDLED_MODULES`` (not by
@@ -58,15 +61,27 @@ BUNDLED_MODULES: tuple[str, ...] = (
 COLLECT_ALL_PACKAGES: tuple[str, ...] = (
     "openai",
     "weave",
+    "mcp",
+    "httpx",
 )
 
 # Streamlit CLI options forwarded to the bundled app at launch. These mirror
 # the values in .streamlit/config.toml because that file is not picked up
 # from inside the .app bundle (cwd at launch is /, not the project root).
 # Keep this list in sync with .streamlit/config.toml.
+# Note on ``theme.baseFontSize``: in ``.streamlit/config.toml`` we duplicate
+# this into both ``[theme.light]`` and ``[theme.dark]`` so the in-app
+# light/dark toggle stays available. Streamlit's CLI does not expose
+# per-mode variants for ``baseFontSize`` (only color options have
+# ``--theme.light.X`` / ``--theme.dark.X`` flags), so the packaged build
+# uses the top-level form. That would normally lock the mode, but the
+# packaged app also runs with ``toolbarMode = minimal``, which hides the
+# Settings UI used to switch modes — so there is nothing to toggle in the
+# packaged build anyway and no asymmetry the user can observe.
 STREAMLIT_OPTIONS: tuple[tuple[str, str], ...] = (
     ("client.toolbarMode", "minimal"),
     ("browser.gatherUsageStats", "false"),
+    ("theme.baseFontSize", "14"),
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

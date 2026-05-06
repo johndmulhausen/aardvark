@@ -10,7 +10,11 @@ from typing import Any
 
 import streamlit as st
 
+import mcp_servers
+import project_context
 from agent import run_agent_turn
+from chat_input import mount_slash_autocomplete
+from mcp_servers import MCPRegistry, ServerConfig, make_server_id
 from wb_client import init_weave, list_models, make_client
 
 # Persistent recent-working-directories list. We store this in the user's home
@@ -24,16 +28,6 @@ st.set_page_config(
     page_icon=":material/smart_toy:",
     layout="wide",
 )
-
-PREFERRED_CODING_MODELS = [
-    "Qwen/Qwen3-Coder-480B-A35B-Instruct",
-    "openai/gpt-oss-120b",
-    "MiniMaxAI/MiniMax-M2.5",
-    "zai-org/GLM-5.1",
-    "deepseek-ai/DeepSeek-V3.1",
-    "Qwen/Qwen3-235B-A22B-Thinking-2507",
-    "openai/gpt-oss-20b",
-]
 
 # Model metadata transcribed from the W&B Inference "Available models" page:
 # https://docs.wandb.ai/inference/models
@@ -185,12 +179,6 @@ def _model_label(model_id: str) -> str:
     return meta["label"] if meta else model_id.split("/")[-1]
 
 
-def _model_description(model_id: str) -> str | None:
-    """Return the W&B docs description for a model id, or ``None`` if unknown."""
-    meta = MODEL_METADATA.get(model_id)
-    return meta["description"] if meta else None
-
-
 def _load_recent_dirs() -> list[str]:
     """Load recently used working directories from disk.
 
@@ -285,6 +273,48 @@ TOOL_ICONS = {
     "run_shell": ":material/terminal:",
 }
 
+# Fallback icon for any ``mcp__<server>__<tool>`` tool name. Looked up in
+# ``_render_tool_event`` after the per-name lookup misses; lets the UI
+# render every MCP tool with a consistent badge instead of the generic
+# ``:material/build:`` fallback.
+MCP_TOOL_ICON = ":material/extension:"
+
+
+@st.cache_resource
+def _get_mcp_registry() -> MCPRegistry:
+    """Return the process-wide MCP registry, lazily initialized.
+
+    Wrapped in ``@st.cache_resource`` so the registry (and the daemon
+    thread + live MCP sessions it holds) survives Streamlit reruns. The
+    underlying singleton in ``mcp_servers`` would survive anyway, but
+    routing through the cache makes the intent explicit and keeps the
+    dependency boundary tidy.
+    """
+    return mcp_servers.get_registry()
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _scan_project_summary(working_dir: str) -> dict[str, Any]:
+    """Cached UI summary of the project context for ``working_dir``.
+
+    The 5-second TTL keeps the dropdown / popover responsive without
+    re-globbing the working directory on every Streamlit rerun. The
+    actual per-turn scan that drives the system prompt happens inside
+    ``agent.run_agent_turn`` and is not cached, so the model always sees
+    a fresh ``AGENTS.md`` if the user just edited it.
+    """
+    if not working_dir:
+        return {
+            "agents_md": [],
+            "cursor_rules": [],
+            "workspace_skills": [],
+            "user_skills": [],
+            "all_skills": [],
+            "slug_conflicts": [],
+        }
+    ctx = project_context.scan(Path(working_dir))
+    return project_context.summary(ctx)
+
 
 def _init_state() -> None:
     ss = st.session_state
@@ -308,12 +338,21 @@ def _init_state() -> None:
     # uses ``key="conn_open"`` + ``on_change="rerun"`` so manual toggles by the
     # user write back here and persist across reruns.
     ss.setdefault("conn_open", True)
+    # MCP server config dialog state. ``mcp_dialog_open`` gates the modal
+    # and ``mcp_dialog_editing`` is either ``None`` (add) or the id of an
+    # existing server being edited.
+    ss.setdefault("mcp_dialog_open", False)
+    ss.setdefault("mcp_dialog_editing", None)
 
 
 def _sort_models(models: list[str]) -> list[str]:
-    preferred = [m for m in PREFERRED_CODING_MODELS if m in models]
-    rest = sorted(m for m in models if m not in preferred)
-    return preferred + rest
+    """Sort model IDs alphabetically by the label shown in the dropdown.
+
+    Sorting by the displayed label (case-insensitive) keeps the dropdown
+    visually alphabetical for the user, even when the model id casing
+    (``OpenPipe/...`` vs. ``openai/...``) would produce a surprising order.
+    """
+    return sorted(models, key=lambda m: _model_label(m).casefold())
 
 
 def _connect(api_key: str, project: str) -> None:
@@ -388,7 +427,11 @@ def _short_args(args: dict[str, Any]) -> str:
 def _render_tool_event(call_event: dict[str, Any], result_event: dict[str, Any] | None) -> None:
     name = call_event["name"]
     args = call_event.get("args", {}) or {}
-    icon = TOOL_ICONS.get(name, ":material/build:")
+    is_mcp = name.startswith(mcp_servers.TOOL_NAME_PREFIX)
+    if is_mcp:
+        icon = MCP_TOOL_ICON
+    else:
+        icon = TOOL_ICONS.get(name, ":material/build:")
     label = f"{icon} `{name}`({_short_args(args)})"
 
     expanded = result_event is None
@@ -403,6 +446,10 @@ def _render_tool_event(call_event: dict[str, Any], result_event: dict[str, Any] 
         result = result_event.get("result", {}) or {}
         if "error" in result:
             st.error(result["error"], icon=":material/error:")
+            return
+
+        if is_mcp:
+            _render_mcp_result(result)
             return
 
         diff = result.get("diff")
@@ -443,6 +490,80 @@ def _render_tool_event(call_event: dict[str, Any], result_event: dict[str, Any] 
                 st.caption(" ".join(msg_parts))
 
 
+def _render_mcp_result(result: dict[str, Any]) -> None:
+    """Render an MCP ``CallToolResult`` payload.
+
+    Walks ``content`` blocks in order; each block has a ``type`` field
+    (``text``, ``image``, ``resource``, ...) that we case on. Unknown
+    block types fall back to a JSON dump so the user can still see what
+    the server returned.
+    """
+    if result.get("isError") or result.get("is_error"):
+        st.warning("Server reported an error.", icon=":material/warning:")
+    blocks = result.get("content") or []
+    if not isinstance(blocks, list):
+        st.code(json.dumps(result, indent=2), language="json")
+        return
+    for block in blocks:
+        if not isinstance(block, dict):
+            st.write(block)
+            continue
+        btype = block.get("type", "")
+        if btype == "text":
+            text = block.get("text", "")
+            st.markdown(text) if text and len(text) < 1000 else st.code(text or "", language="text")
+        elif btype == "image":
+            data = block.get("data")
+            mime = block.get("mimeType", "image/png")
+            if data:
+                st.image(f"data:{mime};base64,{data}")
+        elif btype == "resource":
+            resource = block.get("resource") or {}
+            uri = resource.get("uri", "")
+            st.caption(f":material/link: {uri}")
+            text = resource.get("text")
+            if text:
+                st.code(text, language="text")
+        else:
+            st.code(json.dumps(block, indent=2), language="json")
+    structured = result.get("structuredContent") or result.get("structured_content")
+    if structured:
+        st.markdown("**Structured content**")
+        st.code(json.dumps(structured, indent=2), language="json")
+
+
+def _render_skills_loaded(event: dict[str, Any]) -> None:
+    """Show a caption listing skills the auto-loader picked for this turn.
+
+    Persisted on every assistant turn so replays match what the user saw
+    live. Kept compact: a single ``st.caption`` that lists each selected
+    skill (with its trigger reason) and any unknown ``/foo`` slugs the
+    user typed so they catch typos.
+    """
+    selected = event.get("selected") or []
+    unknown = event.get("unknown_slash") or []
+    if not selected and not unknown:
+        return
+    parts: list[str] = []
+    if selected:
+        chips = []
+        for s in selected:
+            slug = s.get("slug", "")
+            reason = s.get("trigger_reason", "")
+            chips.append(f"`/{slug}` ({reason})")
+        parts.append(
+            f":material/auto_fix_high: Loaded {len(selected)} skill"
+            f"{'s' if len(selected) != 1 else ''}: " + ", ".join(chips)
+        )
+    if unknown:
+        parts.append(
+            ":material/help: Unknown slash command"
+            f"{'s' if len(unknown) != 1 else ''}: "
+            + ", ".join(f"`/{u}`" for u in unknown)
+        )
+    st.caption(" \u00b7 ".join(parts))
+
+
 def _render_assistant_turn(turn: dict[str, Any]) -> None:
     events: list[dict[str, Any]] = turn.get("events", [])
 
@@ -456,7 +577,9 @@ def _render_assistant_turn(turn: dict[str, Any]) -> None:
 
     with st.chat_message("assistant"):
         for ev in events:
-            if ev["type"] == "assistant_text":
+            if ev["type"] == "skills_loaded":
+                _render_skills_loaded(ev)
+            elif ev["type"] == "assistant_text":
                 content = ev.get("content") or ""
                 if content.strip():
                     st.markdown(content)
@@ -539,6 +662,14 @@ def _run_turn(prompt: str) -> None:
             )
             for event in events_iter:
                 etype = event["type"]
+                if etype == "skills_loaded":
+                    assistant_turn["events"].append(event)
+                    selected = event.get("selected") or []
+                    unknown = event.get("unknown_slash") or []
+                    if selected or unknown:
+                        with live_container:
+                            _render_skills_loaded(event)
+                    continue
                 if etype == "assistant_text_delta":
                     _hide_thinking()
                     if text_ph is None:
@@ -622,15 +753,116 @@ def _on_working_dir_select() -> None:
         _record_recent_dir(chosen)
 
 
-def _render_chat_controls() -> None:
-    """Render the working-directory, mode, and model selectors above chat input.
+def _render_project_context_indicator(working_dir: str) -> None:
+    """Render a compact "guidance files detected" expander.
 
-    Layout (top to bottom, all directly above the sticky chat input):
+    Shown directly below the working-directory selector. Splits into two
+    sections: eagerly-loaded files (AGENTS.md / CLAUDE.md / .cursor/rules)
+    and conditionally-loaded skills with their slash command. When
+    nothing is detected, the function renders nothing — quiet workspaces
+    don't need a panel.
+    """
+    summary = _scan_project_summary(working_dir or "")
+    eager: list[dict[str, Any]] = list(summary.get("agents_md", [])) + list(
+        summary.get("cursor_rules", [])
+    )
+    all_skills: list[dict[str, Any]] = summary.get("all_skills", [])
+    if not eager and not all_skills:
+        return
+
+    pieces: list[str] = []
+    if eager:
+        pieces.append(f"{len(eager)} guidance file{'s' if len(eager) != 1 else ''}")
+    if all_skills:
+        pieces.append(f"{len(all_skills)} skill{'s' if len(all_skills) != 1 else ''}")
+    label = "Project context \u00b7 " + ", ".join(pieces)
+
+    with st.expander(label, icon=":material/menu_book:", expanded=False):
+        if eager:
+            st.markdown("**Eagerly loaded** (always sent to the model)")
+            for entry in eager:
+                marker = " :gray-badge[truncated]" if entry.get("truncated") else ""
+                st.markdown(f"- `{entry['path']}`{marker}")
+        if all_skills:
+            if eager:
+                st.divider()
+            st.markdown("**Conditionally loaded skills**")
+            st.caption(
+                "Auto-loaded when your message matches the keywords, or "
+                "force-loaded with `/<slug>` (type `/` in the chat input "
+                "for inline autocomplete)."
+            )
+            for skill in all_skills:
+                scope = skill.get("scope", "workspace")
+                badge = (
+                    ":blue-badge[workspace]" if scope == "workspace" else ":gray-badge[user]"
+                )
+                slug = skill.get("slug", "")
+                desc = skill.get("description", "")
+                st.markdown(f"- `/{slug}` {badge} \u2014 {desc}")
+                triggers = skill.get("triggers") or []
+                if triggers:
+                    preview = ", ".join(f"`{t}`" for t in triggers[:8])
+                    if len(triggers) > 8:
+                        preview += f", ... +{len(triggers) - 8} more"
+                    st.caption(f"Triggers: {preview}")
+        conflicts = summary.get("slug_conflicts") or []
+        if conflicts:
+            st.warning(
+                "User skills shadowed by workspace skills with the same slug: "
+                + ", ".join(f"`/{c}`" for c in conflicts),
+                icon=":material/warning:",
+            )
+
+
+def _render_skills_popover(working_dir: str) -> None:
+    """Render a popover next to the chat input listing every skill slug.
+
+    Complements the inline ``/`` autocomplete (rendered by
+    :func:`chat_input.mount_slash_autocomplete`) — the popover is the
+    "browse everything in one shot" affordance for users who want to see
+    the full skill catalog with descriptions before typing. Hidden when
+    no skills are detected.
+    """
+    summary = _scan_project_summary(working_dir or "")
+    all_skills: list[dict[str, Any]] = summary.get("all_skills", [])
+    if not all_skills:
+        return
+    with st.popover(
+        f":material/auto_fix_high: {len(all_skills)} skills",
+        help="Skills auto-load when your message matches their keywords. "
+        "Type `/` in the chat input for inline autocomplete, or pick from "
+        "the full list here.",
+    ):
+        st.caption(
+            "Type `/` in the chat input for inline autocomplete, or pick a "
+            "command below to see its description."
+        )
+        for skill in all_skills:
+            scope = skill.get("scope", "workspace")
+            badge = (
+                ":blue-badge[workspace]" if scope == "workspace" else ":gray-badge[user]"
+            )
+            slug = skill.get("slug", "")
+            desc = skill.get("description", "")
+            st.markdown(f"`/{slug}` {badge} \u2014 {desc}")
+
+
+def _render_workdir_controls() -> None:
+    """Render the working-directory selector + project-context indicator.
+
+    Renders *below* the chat input, immediately above
+    :func:`_render_model_controls`, so all session controls are docked at
+    the bottom of the page beneath the conversation history and chat
+    input. The working directory is still a precondition for chatting —
+    when it's invalid, the chat input itself is disabled and a warning
+    appears between this block and the model controls.
+
+    Layout (top to bottom):
 
     1. Working-directory dropdown (recents + free text) plus a folder-picker
        button that launches a native OS directory chooser.
-    2. Mode and Model dropdowns side by side.
-    3. Optional caption with the selected model's W&B docs description.
+    2. Project-context indicator showing detected guidance files / skills.
     """
     ss = st.session_state
 
@@ -671,13 +903,49 @@ def _render_chat_controls() -> None:
                 _record_recent_dir(chosen)
                 st.rerun()
 
-    cols = st.columns([1, 2], vertical_alignment="bottom")
+    _render_project_context_indicator(ss.working_dir)
+
+
+def _render_model_controls() -> None:
+    """Render the mode, model, and skills selectors at the very bottom.
+
+    These are the per-turn knobs the user reaches for occasionally: the
+    chat input is the primary affordance and stays directly below the
+    conversation history, with all session settings (workdir + these)
+    docked at the bottom of the page. Pairs with
+    :func:`_render_workdir_controls`, which renders directly above this
+    block.
+
+    Layout (top to bottom):
+
+    1. Mode + Model + Skills dropdowns side by side.
+    2. Optional "model card" caption that labels the selected model with
+       its name in bold, the context length and parameter count chipped
+       alongside, and the W&B docs description after an em-dash. The
+       label is what makes this block readable as info *about the chosen
+       model* instead of a stray sentence floating at the bottom of the
+       page.
+    """
+    ss = st.session_state
+
+    # Both selectboxes bind to session_state via ``key=`` rather than the
+    # ``ss.x = st.selectbox(..., index=...)`` pattern. Mixing an ``index=``
+    # computed from session state with a separate write-back to that same
+    # key is a documented Streamlit footgun: the user's selection can get
+    # silently dismissed when the widget's anonymous identity shifts
+    # between reruns (e.g. after a turn submit + ``st.rerun()``), causing
+    # the dropdown to "snap back" to the prior value. ``key=`` makes
+    # Streamlit the single owner of the value and is the canonical
+    # remedy. ``_init_state`` seeds defaults, and ``_connect`` re-seeds
+    # ``ss.model`` from inside its on_click callback (which runs before
+    # the next rerun, so the widget picks the new value up cleanly).
+    cols = st.columns([1, 2, 1], vertical_alignment="bottom")
     with cols[0]:
         mode_options = ["agent", "ask"]
-        ss.mode = st.selectbox(
+        st.selectbox(
             "Mode",
             options=mode_options,
-            index=mode_options.index(ss.mode) if ss.mode in mode_options else 0,
+            key="mode",
             format_func=lambda m: "Agent" if m == "agent" else "Ask only",
             help=(
                 "Agent can read, write, edit files (and run shell if enabled). "
@@ -687,10 +955,10 @@ def _render_chat_controls() -> None:
         )
     with cols[1]:
         if ss.models:
-            ss.model = st.selectbox(
+            st.selectbox(
                 "Model",
                 options=ss.models,
-                index=ss.models.index(ss.model) if ss.model in ss.models else 0,
+                key="model",
                 format_func=_model_label,
                 help="Switch which W&B Inference model handles the next turn.",
             )
@@ -700,9 +968,21 @@ def _render_chat_controls() -> None:
                 options=["Connect to load models"],
                 disabled=True,
             )
-    desc = _model_description(ss.model) if ss.model else None
-    if desc:
-        st.caption(desc)
+    with cols[2]:
+        _render_skills_popover(ss.working_dir)
+
+    meta = MODEL_METADATA.get(ss.model) if ss.model else None
+    if meta:
+        chips: list[str] = []
+        if meta.get("context"):
+            chips.append(f"{meta['context']} context")
+        if meta.get("params"):
+            chips.append(f"{meta['params']} params")
+        header = f":material/info: **{meta['label']}**"
+        if chips:
+            header += " \u00b7 " + " \u00b7 ".join(chips)
+        desc = meta.get("description", "")
+        st.caption(f"{header} \u2014 {desc}" if desc else header)
 
 
 def _count_diff_lines(diff: str) -> tuple[int, int]:
@@ -829,6 +1109,347 @@ def _render_file_changes() -> None:
                     st.code(diff, language="diff")
 
 
+def _parse_kv_lines(text: str) -> dict[str, str]:
+    """Parse ``KEY=value`` or ``Header: value`` lines into a dict.
+
+    Used by the Add MCP server dialog for env vars (stdio) and headers
+    (HTTP). Each line is split on the *first* ``=`` or ``:``, whichever
+    appears earlier, so bearer tokens with base64 ``=`` padding survive
+    intact: ``Authorization: Bearer eyJ...xyz==`` partitions on the ``:``
+    (position 13) before the ``=`` (position 30), yielding the correct
+    ``("Authorization", "Bearer eyJ...xyz==")`` pair instead of the
+    silently-corrupted ``("Authorization: Bearer eyJ...xyz", "=")`` you
+    get from a naive ``=``-first partition. Env var values like
+    ``PATH=/usr/bin:/bin`` still work because ``=`` comes first there.
+
+    Empty lines and lines with neither separator are ignored so the user
+    can write comments or blank lines without breaking validation.
+    """
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        eq_pos = line.find("=")
+        co_pos = line.find(":")
+        if eq_pos == -1 and co_pos == -1:
+            continue
+        if eq_pos == -1:
+            sep = ":"
+        elif co_pos == -1:
+            sep = "="
+        else:
+            sep = "=" if eq_pos < co_pos else ":"
+        k, _, v = line.partition(sep)
+        k = k.strip()
+        v = v.strip()
+        if k:
+            out[k] = v
+    return out
+
+
+def _format_kv_lines(items: dict[str, str], header_style: bool = False) -> str:
+    """Inverse of :func:`_parse_kv_lines` for pre-filling the edit form.
+
+    With ``header_style=True``, lines are written as ``Header: value`` so
+    the rendered text matches what the user pasted from MCP server
+    documentation (and the placeholder we show in the headers field).
+    Otherwise we use ``KEY=value`` for env vars.
+    """
+    sep = ": " if header_style else "="
+    return "\n".join(f"{k}{sep}{v}" for k, v in items.items())
+
+
+@st.dialog("MCP server", width="large")
+def _mcp_server_dialog() -> None:
+    """Add or edit an MCP server config.
+
+    Decided by ``st.session_state.mcp_dialog_editing``: ``None`` adds a new
+    server, otherwise it's the id of the server being edited (we look it
+    up in the registry to pre-fill the form). Save reconciles the live
+    sessions; Delete prompts an explicit confirm.
+    """
+    registry = _get_mcp_registry()
+    editing_id: str | None = st.session_state.mcp_dialog_editing
+
+    existing: ServerConfig | None = None
+    if editing_id is not None:
+        existing = next((c for c in registry.configs if c.id == editing_id), None)
+
+    title = "Edit MCP server" if existing else "Add MCP server"
+    st.markdown(f"### {title}")
+    st.caption(
+        "Connect an external Model Context Protocol server. Stdio servers "
+        "run as a local subprocess; HTTP servers are remote."
+    )
+
+    name = st.text_input(
+        "Name",
+        value=existing.name if existing else "",
+        placeholder="My filesystem",
+        help="Display label. We derive a sanitized id from this for the tool namespace.",
+    )
+
+    transport_options = ["stdio", "http"]
+    default_transport = existing.transport if existing else "stdio"
+    transport = st.segmented_control(
+        "Transport",
+        options=transport_options,
+        default=default_transport,
+        format_func=lambda t: "Stdio (local subprocess)" if t == "stdio" else "HTTP (remote)",
+    ) or default_transport
+
+    if transport == "stdio":
+        command = st.text_input(
+            "Command",
+            value=existing.command if existing and existing.transport == "stdio" else "",
+            placeholder="npx",
+            help="Executable to run.",
+        )
+        args_default = "\n".join(existing.args) if existing and existing.transport == "stdio" else ""
+        args_text = st.text_area(
+            "Arguments (one per line)",
+            value=args_default,
+            placeholder="-y\n@modelcontextprotocol/server-filesystem\n/Users/me/projects",
+            height=120,
+        )
+        env_default = (
+            _format_kv_lines(existing.env)
+            if existing and existing.transport == "stdio"
+            else ""
+        )
+        env_text = st.text_area(
+            "Environment variables (KEY=value, one per line)",
+            value=env_default,
+            placeholder="API_TOKEN=secret\nDEBUG=1",
+            height=80,
+        )
+        url = ""
+        headers_text = ""
+    else:
+        command = ""
+        args_text = ""
+        env_text = ""
+        url = st.text_input(
+            "URL",
+            value=existing.url if existing and existing.transport == "http" else "",
+            placeholder="https://example.com/mcp",
+        )
+        headers_default = (
+            _format_kv_lines(existing.headers, header_style=True)
+            if existing and existing.transport == "http"
+            else ""
+        )
+        headers_text = st.text_area(
+            "Headers (Header: value, one per line)",
+            value=headers_default,
+            placeholder="Authorization: Bearer ...",
+            height=100,
+            help="Auth headers stored on disk in plaintext (mode 0600).",
+        )
+
+    enabled = st.checkbox(
+        "Enabled",
+        value=existing.enabled if existing else True,
+        help="Disabled servers stay configured but aren't connected.",
+    )
+
+    cols = st.columns([1, 1, 2])
+    save_clicked = cols[0].button(
+        "Save",
+        icon=":material/save:",
+        type="primary",
+        width="stretch",
+    )
+    cancel_clicked = cols[1].button(
+        "Cancel",
+        icon=":material/close:",
+        width="stretch",
+    )
+    delete_clicked = False
+    if existing is not None:
+        delete_clicked = cols[2].button(
+            "Delete server",
+            icon=":material/delete:",
+            width="stretch",
+        )
+
+    if cancel_clicked:
+        st.session_state.mcp_dialog_open = False
+        st.session_state.mcp_dialog_editing = None
+        st.rerun()
+
+    if delete_clicked and existing is not None:
+        try:
+            registry.remove(existing.id)
+        except Exception as e:
+            st.error(f"Could not delete: {e}", icon=":material/error:")
+            return
+        st.session_state.mcp_dialog_open = False
+        st.session_state.mcp_dialog_editing = None
+        st.rerun()
+
+    if save_clicked:
+        if not name.strip():
+            st.error("Name is required.", icon=":material/error:")
+            return
+        if transport == "stdio" and not command.strip():
+            st.error("Command is required for stdio servers.", icon=":material/error:")
+            return
+        if transport == "http" and not url.strip():
+            st.error("URL is required for HTTP servers.", icon=":material/error:")
+            return
+
+        server_id = existing.id if existing else make_server_id(name)
+        config = ServerConfig(
+            id=server_id,
+            name=name.strip(),
+            transport=transport,
+            command=command.strip(),
+            args=[a.strip() for a in args_text.splitlines() if a.strip()],
+            env=_parse_kv_lines(env_text),
+            url=url.strip(),
+            headers=_parse_kv_lines(headers_text),
+            enabled=enabled,
+        )
+
+        try:
+            if existing is None:
+                registry.add(config)
+            else:
+                registry.update(config)
+        except Exception as e:
+            st.error(f"Could not save: {e}", icon=":material/error:")
+            return
+
+        # Toast the save outcome so the user actually sees feedback. We can't
+        # use ``st.warning``/``st.error`` here because ``st.rerun()`` below
+        # aborts the script before they paint; toasts survive the rerun.
+        status = registry.statuses.get(config.id)
+        if not config.enabled:
+            st.toast(f"Saved '{config.name}' (disabled)", icon=":material/save:")
+        elif status and status.connected:
+            n = len(status.tools)
+            st.toast(
+                f"Connected to '{config.name}' \u00b7 "
+                f"{n} tool{'s' if n != 1 else ''}",
+                icon=":material/check_circle:",
+            )
+        elif status and status.error:
+            st.toast(
+                f"'{config.name}' failed to connect \u2014 see sidebar.",
+                icon=":material/error:",
+            )
+        else:
+            st.toast(f"Saved '{config.name}'", icon=":material/save:")
+
+        st.session_state.mcp_dialog_open = False
+        st.session_state.mcp_dialog_editing = None
+        st.rerun()
+
+
+def _open_add_mcp_dialog() -> None:
+    st.session_state.mcp_dialog_editing = None
+    st.session_state.mcp_dialog_open = True
+
+
+def _open_edit_mcp_dialog(server_id: str) -> None:
+    st.session_state.mcp_dialog_editing = server_id
+    st.session_state.mcp_dialog_open = True
+
+
+def _toggle_mcp_enabled(server_id: str) -> None:
+    """Checkbox callback: persist the new ``enabled`` flag and reconcile."""
+    registry = _get_mcp_registry()
+    cfg = next((c for c in registry.configs if c.id == server_id), None)
+    if cfg is None:
+        return
+    new_enabled = bool(st.session_state.get(f"mcp_enabled_{server_id}", cfg.enabled))
+    if new_enabled == cfg.enabled:
+        return
+    cfg.enabled = new_enabled
+    registry.save()
+    registry.reconcile()
+
+
+def _render_mcp_panel() -> None:
+    """Render the sidebar MCP servers expander.
+
+    One row per configured server: name + transport badge + per-server
+    enable toggle + edit button + tool count (or error). An "Add server"
+    button at the bottom opens the modal. The expander is auto-expanded
+    only when the user has at least one server already, so first-time
+    users see the empty-state copy without an extra click.
+    """
+    registry = _get_mcp_registry()
+    configs = list(registry.configs)
+    label = (
+        f"MCP servers \u00b7 {len(configs)}"
+        if configs
+        else "MCP servers"
+    )
+
+    with st.expander(label, icon=":material/extension:", expanded=bool(configs)):
+        if not configs:
+            st.caption(
+                "Connect external Model Context Protocol servers to expose "
+                "their tools to the agent. Stdio servers run as a local "
+                "subprocess; HTTP servers are remote."
+            )
+        for cfg in configs:
+            status = registry.statuses.get(cfg.id)
+            row = st.container(border=True)
+            with row:
+                top = st.columns([5, 1, 1], vertical_alignment="center")
+                with top[0]:
+                    transport_badge = (
+                        ":blue-badge[stdio]" if cfg.transport == "stdio" else ":violet-badge[http]"
+                    )
+                    st.markdown(f"**{cfg.name}** {transport_badge}")
+                    if status is not None and status.connected:
+                        n = len(status.tools)
+                        st.caption(
+                            f":green[Connected] \u00b7 {n} tool{'s' if n != 1 else ''}"
+                        )
+                    elif status is not None and status.error:
+                        st.caption(f":red[Error] \u00b7 {status.error}")
+                    elif not cfg.enabled:
+                        st.caption("Disabled")
+                    else:
+                        st.caption("Not connected")
+                with top[1]:
+                    st.checkbox(
+                        "Enabled",
+                        value=cfg.enabled,
+                        key=f"mcp_enabled_{cfg.id}",
+                        on_change=_toggle_mcp_enabled,
+                        args=(cfg.id,),
+                        label_visibility="collapsed",
+                        help="Enable or disable this server.",
+                    )
+                with top[2]:
+                    st.button(
+                        "",
+                        icon=":material/edit:",
+                        key=f"mcp_edit_{cfg.id}",
+                        help="Edit this server.",
+                        on_click=_open_edit_mcp_dialog,
+                        args=(cfg.id,),
+                        width="stretch",
+                    )
+
+        st.button(
+            "Add server",
+            icon=":material/add:",
+            type="primary" if not configs else "secondary",
+            on_click=_open_add_mcp_dialog,
+            width="stretch",
+        )
+
+    if st.session_state.get("mcp_dialog_open"):
+        _mcp_server_dialog()
+
+
 def _render_sidebar() -> None:
     ss = st.session_state
     with st.sidebar:
@@ -895,6 +1516,8 @@ def _render_sidebar() -> None:
                         f"{ss.weave_error}"
                     )
 
+        _render_mcp_panel()
+
         _render_file_changes()
 
         st.button("Clear chat", icon=":material/delete:", width="stretch", on_click=_clear_chat)
@@ -909,7 +1532,7 @@ def main() -> None:
     st.title("Code editing agent")
     st.caption(
         "Powered by [W&B Inference](https://docs.wandb.ai/inference). "
-        "Point it at a working directory, pick a mode and model below the chat, "
+        "Point it at a working directory and pick a mode and model below the chat, "
         "and ask it to read or modify your code."
     )
 
@@ -922,20 +1545,71 @@ def main() -> None:
         )
         return
 
-    _render_history()
-    _render_chat_controls()
+    # Conversation area — forward-declared *before* the chat input so that
+    # both the replayed history and the live-streaming current turn render
+    # ABOVE the chat input + session controls, never below them. The
+    # ``with conversation_area:`` block below ``_run_turn`` is what keeps
+    # streaming tokens flowing into this container instead of getting
+    # appended at the very bottom of the page (under workdir / mode /
+    # model). All session controls (working dir + project context, mode,
+    # model, skills) sit *below* the chat input so the chat input itself
+    # is the divider between conversation and settings.
+    conversation_area = st.container()
+    with conversation_area:
+        _render_history()
 
+    # The chat input is wrapped in an explicit ``st.container()`` so
+    # Streamlit renders it inline rather than pinning it to the viewport
+    # bottom (its default behavior at the top level of an app). ``wd_ok``
+    # is computed *before* the chat input so we can disable submissions
+    # when the working directory is missing — that way the user gets a
+    # clear "this is why pressing enter does nothing" signal instead of
+    # silently dropped turns, and the validity warning that follows the
+    # workdir picker explains how to fix it.
     wd_ok = Path(ss.working_dir).expanduser().is_dir()
+
+    with st.container():
+        prompt = st.chat_input(
+            "Ask the agent to read or modify your code...",
+            disabled=not wd_ok,
+        )
+
+    # Mount the slash-command autocomplete enhancer immediately after the
+    # chat input. The component is invisible (zero-height host); its JS
+    # finds the chat input's textarea on the page and attaches a floating
+    # dropdown that filters as the user types after a "/". We only mount
+    # when there's at least one skill so empty workspaces don't pay for
+    # an unused component.
+    summary = _scan_project_summary(ss.working_dir or "")
+    autocomplete_skills = summary.get("all_skills", []) or []
+    if autocomplete_skills:
+        mount_slash_autocomplete(
+            autocomplete_skills,
+            placeholder_hint=(
+                "Try a different prefix, or open the Skills popover below "
+                "for the full list."
+            ),
+        )
+
+    _render_workdir_controls()
+
     if not wd_ok:
         st.warning(
-            "Choose a valid working directory from the picker above before chatting.",
+            "Choose a valid working directory above before chatting.",
             icon=":material/folder_off:",
         )
-        return
 
-    prompt = st.chat_input("Ask the agent to read or modify your code...")
-    if prompt:
-        _run_turn(prompt)
+    _render_model_controls()
+
+    if prompt and wd_ok:
+        # Run the turn *inside* ``conversation_area`` so the user message
+        # + the assistant ``st.chat_message`` that ``_run_turn`` opens for
+        # live streaming both render in the conversation pane above the
+        # chat input. Without the ``with`` block, both would be appended
+        # to the bottom of the page in document order (i.e. below the
+        # workdir / mode / model controls), which looks broken.
+        with conversation_area:
+            _run_turn(prompt)
         st.rerun()
 
 

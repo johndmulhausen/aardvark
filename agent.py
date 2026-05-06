@@ -2,6 +2,10 @@
 
 Exposes a generator, ``run_agent_turn``, that yields events the UI renders:
 
+- ``{"type": "skills_loaded", "selected": [...], "unknown_slash": [...]}`` —
+  emitted exactly once at the start of every turn so the UI can show which
+  ``.cursor/skills`` were sliced into the system prompt this turn (and any
+  ``/foo`` slash commands that didn't match a known skill).
 - ``{"type": "assistant_text_delta", "content": ...}`` — a partial chunk of
   assistant text streamed token-by-token. The UI appends these to a live
   placeholder; they are NOT persisted to ``ui_turns`` for replay.
@@ -42,6 +46,8 @@ from typing import Any, Iterator, Literal
 import weave
 from openai import OpenAI
 
+import mcp_servers
+import project_context
 from tools import ToolContext, dispatch, tools_for_mode
 
 
@@ -237,7 +243,10 @@ def run_agent_turn(
       ask-only system prompt; the model is told it cannot modify the project.
 
     The system message at index 0 is rewritten on every turn so a mid-chat
-    mode switch takes effect immediately.
+    mode switch takes effect immediately. The rewrite also folds in any
+    project-context guidance (AGENTS.md, .cursor/rules, plus any skills
+    matched by slash command or keyword in the latest user message); see
+    :mod:`project_context`.
 
     Each model call is streamed; the function yields ``assistant_text_delta``
     events as tokens arrive, followed by a single ``assistant_text`` event
@@ -245,16 +254,52 @@ def run_agent_turn(
     any ``tool_call``/``tool_result`` pairs. The loop runs until the model
     returns a final answer with no tool calls (or a single iteration produces
     neither content nor tool calls, which is treated as an error).
+
+    Before any of that, the function emits a single ``skills_loaded`` event
+    so the UI can show which skills (and via which trigger) were spliced
+    into the system prompt for this turn.
     """
     ctx = ToolContext(working_dir=working_dir)
 
-    system_content = SYSTEM_PROMPT_ASK if mode == "ask" else SYSTEM_PROMPT
+    proj_ctx = project_context.scan(working_dir)
+    last_user = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                last_user = content
+            break
+    selection = project_context.select_skills_for_turn(last_user, proj_ctx)
+
+    yield {
+        "type": "skills_loaded",
+        "selected": [
+            {
+                "slug": picked.skill.slug,
+                "name": picked.skill.name,
+                "scope": picked.skill.scope,
+                "trigger_reason": picked.trigger_reason,
+            }
+            for picked in selection.selected
+        ],
+        "unknown_slash": list(selection.unknown_slash),
+    }
+
+    base_prompt = SYSTEM_PROMPT_ASK if mode == "ask" else SYSTEM_PROMPT
+    addendum = project_context.build_system_addendum(proj_ctx, selection)
+    system_content = base_prompt + addendum
     if messages and messages[0].get("role") == "system":
         messages[0] = {"role": "system", "content": system_content}
     else:
         messages.insert(0, {"role": "system", "content": system_content})
 
-    tools = tools_for_mode(mode)
+    # Tool list per turn = local tools + every connected MCP server's
+    # tools. MCP tools are only exposed in Agent mode for v1: Ask mode's
+    # contract is "purely sandbox-read", and we have no per-tool read-only
+    # metadata yet.
+    tools = list(tools_for_mode(mode))
+    if mode != "ask":
+        tools.extend(mcp_servers.get_registry().openai_tool_schemas())
 
     while True:
         try:
@@ -291,12 +336,16 @@ def run_agent_turn(
             yield call_event
 
             raw_args = call_event.pop("raw_args", "{}")
-            result = dispatch(call_event["name"], raw_args, ctx)
+            tool_name = call_event["name"]
+            if tool_name.startswith(mcp_servers.TOOL_NAME_PREFIX):
+                result = mcp_servers.dispatch(tool_name, raw_args)
+            else:
+                result = dispatch(tool_name, raw_args, ctx)
 
             yield {
                 "type": "tool_result",
                 "id": call_event["id"],
-                "name": call_event["name"],
+                "name": tool_name,
                 "result": result,
             }
 

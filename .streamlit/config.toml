@@ -18,3 +18,20 @@ toolbarMode = "minimal"
 [browser]
 # This is a personal-use coding tool; do not phone home with telemetry.
 gatherUsageStats = false
+
+# Shrink the default 16px root size so body text, headings, captions, and
+# code blocks all render slightly smaller, freeing screen real estate for
+# the conversation pane. Streamlit's default heading sizes are defined in
+# rem units relative to this value, so they scale automatically.
+#
+# Streamlit only enables the in-app light/dark toggle when BOTH
+# ``[theme.light]`` and ``[theme.dark]`` sections are defined; defining a
+# single top-level ``[theme]`` table locks the app to one mode. So we
+# duplicate ``baseFontSize`` into each section instead of putting it in a
+# shared ``[theme]`` block, preserving the OS-follow / manual-toggle
+# behavior the user gets out of the box.
+[theme.light]
+baseFontSize = 14
+
+[theme.dark]
+baseFontSize = 14
