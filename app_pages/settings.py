@@ -1,4 +1,4 @@
-"""Settings page: GitHub identity, theme, W&B Inference, MCP servers.
+"""Settings page: GitHub identity, appearance, W&B Inference, MCP servers.
 
 Replaces the old sidebar settings popover and the MCP sidebar expander.
 Rendered in the main column via ``st.navigation`` so the user gets the
@@ -7,10 +7,16 @@ full page width for forms and help text. Layout:
 1. Page title with the circular avatar to the left.
 2. **GitHub identity** card — PAT verify-and-save flow when unauthenticated;
    identity card + sign-out when verified.
-3. **Theme** card — Light / Dark / System segmented control bound to
-   ``ss.theme_pref`` (callback :func:`actions.set_theme_pref`). The
-   actual at-runtime swap is done by :mod:`theme_switcher`, mounted from
-   the entry script; this card is purely the user-facing control.
+3. **Appearance** card — two segmented controls:
+   - Light / Dark / System for theme (bound to ``ss.theme_pref``,
+     callback :func:`actions.set_theme_pref`). The actual at-runtime
+     swap is done by :mod:`theme_switcher`, mounted from the entry
+     script.
+   - Extra small / Small / Medium / Large / Extra large for font size
+     (bound to ``ss.font_size_pref``, callback
+     :func:`actions.set_font_size_pref`).
+     The actual at-runtime CSS override is done by
+     :mod:`font_size_switcher`, also mounted from the entry script.
 4. **W&B Inference** card — API key + opt-in "Remember on this machine" +
    project + Connect / Disconnect / Forget.
 5. **MCP servers** card — list of configured MCP servers with per-server
@@ -35,10 +41,12 @@ from actions import (
     disconnect as _disconnect,
     forget_saved_wb_key as _forget_saved_wb_key,
     on_connect as _on_connect,
+    set_font_size_pref as _set_font_size_pref,
     set_theme_pref as _set_theme_pref,
     sign_out_github as _sign_out_github,
     verify_pat as _verify_pat,
 )
+from font_size_switcher import FONT_SIZE_OPTIONS
 from mcp_servers import MCPRegistry, ServerConfig, make_server_id
 
 
@@ -163,20 +171,33 @@ def _theme_label(value: str) -> str:
     }.get(value, value)
 
 
-def _render_theme_card() -> None:
-    """Render the theme card — Light / Dark / System segmented control.
+def _font_size_label(value: str) -> str:
+    """Format a font-size option with a glyph hint at the option's relative size.
 
-    The actual theme application is done by :mod:`theme_switcher`, which
-    is mounted from ``streamlit_app.main()``. This page just owns the
-    UI control and a one-line description of the contract; picking a
-    new option fires :func:`actions.set_theme_pref` (persisting the
-    choice to ``profile.theme``), the next rerun re-mounts the switcher
-    component with the new explicit preference, and the component's JS
-    writes to ``localStorage`` and reloads the page so Streamlit's boot
-    code picks up the new theme.
+    Streamlit's segmented control doesn't let us style individual
+    options by font-size directly, so we use a Material ``:material/text_fields:``
+    glyph to hint that the row controls type sizing without duplicating
+    the card's ``palette`` icon. Sentence case for the labels matches
+    the rest of the Settings page.
+    """
+    return f":material/text_fields: {value}"
+
+
+def _render_appearance_card() -> None:
+    """Render the appearance card — theme + font size controls.
+
+    Both controls follow the same pattern: bind the segmented control
+    to a canonical session-state key via ``key=``, and wire ``on_change``
+    to the matching callback in :mod:`actions`. The actual at-runtime
+    application happens elsewhere on the next rerun (theme via
+    :mod:`theme_switcher` writing to ``localStorage`` + a page reload;
+    font size via :mod:`font_size_switcher` injecting a CSS rule into
+    ``document.head``), so this card stays cleanly UI-only.
     """
     with st.container(border=True):
-        st.markdown("### :material/palette: Theme")
+        st.markdown("### :material/palette: Appearance")
+
+        st.markdown("**Theme**")
         st.segmented_control(
             "Theme",
             options=["System", "Light", "Dark"],
@@ -191,6 +212,22 @@ def _render_theme_card() -> None:
             "Switching reloads the page once so the new theme applies "
             "everywhere. **System** follows your operating system's "
             "light / dark setting."
+        )
+
+        st.markdown("**Font size**")
+        st.segmented_control(
+            "Font size",
+            options=list(FONT_SIZE_OPTIONS),
+            selection_mode="single",
+            format_func=_font_size_label,
+            key="font_size_pref",
+            on_change=_set_font_size_pref,
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        st.caption(
+            "Adjusts the root font size used for body text, headings, "
+            "captions, and code. **Small** matches the bundled default."
         )
 
 
@@ -263,6 +300,8 @@ def _render_inference_card() -> None:
         )
 
         is_connected = ss.client is not None and ss.connect_error is None
+        creds_on_disk = bool(account.load_credentials().get("wb_api_key"))
+
         if is_connected:
             n = len(ss.models)
             st.success(
@@ -270,40 +309,50 @@ def _render_inference_card() -> None:
                 icon=":material/check_circle:",
             )
             if ss.weave_project:
-                st.caption(
-                    f":material/sensors: Tracing turns to W&B Weave at "
-                    f"`{ss.weave_project}`."
-                )
+                if ss.weave_url:
+                    st.caption(
+                        f":material/sensors: Tracing turns to W&B Weave at "
+                        f"[`{ss.weave_project}`]({ss.weave_url})."
+                    )
+                else:
+                    st.caption(
+                        f":material/sensors: Tracing turns to W&B Weave at "
+                        f"`{ss.weave_project}`."
+                    )
             elif ss.weave_error:
                 st.caption(
                     f":material/sensors_off: Weave tracing disabled: "
                     f"{ss.weave_error}"
                 )
-            st.button(
-                "Disconnect",
-                icon=":material/link_off:",
-                on_click=_disconnect,
-            )
-        else:
-            st.button(
-                "Connect",
-                icon=":material/link:",
-                on_click=_on_connect,
-                type="primary",
-            )
-            if ss.connect_error:
-                st.error(ss.connect_error, icon=":material/error:")
 
-        creds_on_disk = bool(account.load_credentials().get("wb_api_key"))
-        if creds_on_disk:
-            st.caption(
-                ":material/save: API key currently saved on this machine."
-            )
-            st.button(
-                "Forget saved API key",
-                icon=":material/delete_sweep:",
-                on_click=_forget_saved_wb_key,
-            )
+        # Action buttons live in a single horizontal row so Disconnect /
+        # Connect sits next to Forget saved API key. The presence of a
+        # value in the API key field plus the Forget button itself is
+        # enough to convey "this key is saved on disk" without an extra
+        # caption.
+        with st.container(horizontal=True):
+            if is_connected:
+                st.button(
+                    "Disconnect",
+                    icon=":material/link_off:",
+                    on_click=_disconnect,
+                )
+            else:
+                st.button(
+                    "Connect",
+                    icon=":material/link:",
+                    on_click=_on_connect,
+                    type="primary",
+                )
+            if creds_on_disk:
+                st.button(
+                    "Forget saved API key",
+                    icon=":material/delete_sweep:",
+                    on_click=_forget_saved_wb_key,
+                )
+
+        if not is_connected and ss.connect_error:
+            st.error(ss.connect_error, icon=":material/error:")
 
 
 # ---------------------------------------------------------------------------
@@ -686,7 +735,7 @@ def render() -> None:
 
     _render_session_summary()
     _render_github_card(identity if identity else None)
-    _render_theme_card()
+    _render_appearance_card()
     _render_inference_card()
     _render_mcp_card()
 

@@ -55,11 +55,13 @@ BUNDLED_MODULES: tuple[str, ...] = (
     "project_context.py",
     "chat_input.py",
     "theme_switcher.py",
+    "font_size_switcher.py",
     "models.py",
     "account.py",
     "actions.py",
     "usage.py",
     "git_ops.py",
+    "chats.py",
     "app_pages/__init__.py",
     "app_pages/chat.py",
     "app_pages/usage.py",
@@ -102,7 +104,7 @@ STREAMLIT_OPTIONS: tuple[tuple[str, str], ...] = (
     # the framework's own menu. Mirror in ``.streamlit/config.toml``.
     ("client.toolbarMode", "minimal"),
     ("browser.gatherUsageStats", "false"),
-    ("theme.baseFontSize", "14"),
+    ("theme.baseFontSize", "12"),
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

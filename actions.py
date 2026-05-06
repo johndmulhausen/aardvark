@@ -18,6 +18,8 @@ Owns:
 - The GitHub PAT verify-and-save / sign-out callbacks.
 - The theme-switcher callbacks (segmented-control ``on_change`` +
   the migration-detection callback fired by ``theme_switcher``).
+- The font-size switcher callback (segmented-control ``on_change``)
+  fired from the Settings page's appearance card.
 
 Pages keep their own *rendering* code; they call into this module purely
 for state mutation.
@@ -151,11 +153,15 @@ def _connect(api_key: str, project: str) -> None:
         )
 
     try:
-        _, resolved_project = init_weave(api_key=api_key, project=project or None)
+        _, resolved_project, weave_url = init_weave(
+            api_key=api_key, project=project or None
+        )
         st.session_state.weave_project = resolved_project
+        st.session_state.weave_url = weave_url
         st.session_state.weave_error = None
     except Exception as e:
         st.session_state.weave_project = None
+        st.session_state.weave_url = None
         st.session_state.weave_error = str(e)
 
 
@@ -203,6 +209,7 @@ def disconnect() -> None:
     ss.models = []
     ss.model = None
     ss.weave_project = None
+    ss.weave_url = None
     ss.weave_error = None
     ss.connect_error = None
 
@@ -231,7 +238,9 @@ def _persist_profile_from_state() -> None:
     Includes the theme preference if (and only if) the user has explicitly
     picked one via the Settings page switcher; an unset preference stays
     empty on disk so :mod:`theme_switcher` can fall back to whatever's
-    already in browser ``localStorage``.
+    already in browser ``localStorage``. The font-size preference is
+    saved verbatim — it has no migration path and an empty string just
+    means "keep the bundled ``baseFontSize`` default".
     """
     ss = st.session_state
     identity = ss.github_identity or {}
@@ -240,12 +249,16 @@ def _persist_profile_from_state() -> None:
         theme = ""
     if not ss.get("theme_explicit"):
         theme = ""
+    font_size = str(ss.get("font_size_pref") or "")
+    if font_size not in ("Extra small", "Small", "Medium", "Large", "Extra large"):
+        font_size = ""
     profile = account.Profile(
         github_username=identity.get("login", ""),
         github_email=identity.get("email", ""),
         github_avatar_url=identity.get("avatar_url", ""),
         github_scopes=list(identity.get("scopes", [])),
         theme=theme,
+        font_size=font_size,
     )
     account.save_profile(profile)
 
@@ -327,4 +340,24 @@ def theme_detected() -> None:
         return
     ss.theme_pref = detected
     ss.theme_explicit = True
+    _persist_profile_from_state()
+
+
+# ---------------------------------------------------------------------------
+# Font size switcher
+# ---------------------------------------------------------------------------
+def set_font_size_pref() -> None:
+    """``on_change`` callback for the Settings page's font-size segmented control.
+
+    The widget binds to ``ss.font_size_pref`` via ``key=``, so by the
+    time this callback runs the new value is already in session state.
+    We just persist the choice so it survives across sessions; the
+    actual CSS injection happens on the next rerun, when
+    :mod:`font_size_switcher` is re-mounted from ``streamlit_app.main()``
+    with the new label.
+    """
+    ss = st.session_state
+    val = ss.get("font_size_pref")
+    if val not in ("Extra small", "Small", "Medium", "Large", "Extra large"):
+        return
     _persist_profile_from_state()

@@ -70,6 +70,15 @@ class Profile:
     Streamlit reads on app load (``stActiveTheme-${pathname}-v2``); we
     don't touch the DOM directly.
 
+    The ``font_size`` field is the user's explicit font-size choice from
+    the Settings page's appearance card — one of ``""`` (not chosen,
+    falls back to ``baseFontSize`` in ``.streamlit/config.toml``),
+    ``"Extra small"``, ``"Small"``, ``"Medium"``, ``"Large"``, or
+    ``"Extra large"``. The actual at-runtime CSS override is applied by
+    :mod:`font_size_switcher` injecting a ``<style>`` rule into
+    ``document.head``; we just persist the label here so the next
+    session re-applies it.
+
     Avatars are intentionally NOT a field here: the popover does not
     support uploading a custom avatar, and the GitHub avatar is fetched
     fresh into in-memory bytes on PAT verify.
@@ -80,6 +89,7 @@ class Profile:
     github_avatar_url: str = ""
     github_scopes: list[str] = field(default_factory=list)
     theme: str = ""
+    font_size: str = ""
 
 
 def _ensure_config_dir() -> None:
@@ -101,12 +111,16 @@ def load_profile() -> Profile:
     theme = str(raw.get("theme") or "")
     if theme not in ("", "System", "Light", "Dark"):
         theme = ""
+    font_size = str(raw.get("font_size") or "")
+    if font_size not in ("", "Extra small", "Small", "Medium", "Large", "Extra large"):
+        font_size = ""
     return Profile(
         github_username=str(raw.get("github_username") or ""),
         github_email=str(raw.get("github_email") or ""),
         github_avatar_url=str(raw.get("github_avatar_url") or ""),
         github_scopes=[str(s) for s in scopes],
         theme=theme,
+        font_size=font_size,
     )
 
 

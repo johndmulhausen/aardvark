@@ -1,6 +1,17 @@
 # W&B Inference Code Editing Agent
 
-A local Streamlit app that turns any [W&B Inference](https://docs.wandb.ai/inference) model into a code editing agent. The agent uses OpenAI-compatible tool calling to autonomously read, edit, and run shell commands inside a working directory you choose.
+A local Streamlit desktop application that transforms any model served by the [W&B Inference](https://docs.wandb.ai/inference) service into a powerful code editing agent. The agent uses OpenAI-compatible tool calling to autonomously read, edit, and run shell commands within a working directory of your choice, providing a seamless AI-assisted coding experience with full transparency and control.
+
+## Project Overview
+
+This application provides a sophisticated interface for AI-assisted coding with the following architecture:
+
+- **Multi-page Streamlit App**: Organized into Chat, Usage, and Settings pages with shared sidebar
+- **Real-time Agent System**: Tool-calling agent that streams responses and shows inline diffs
+- **Comprehensive Tool Suite**: File operations, shell execution, and MCP server integration
+- **Persistent State Management**: Chat history, usage tracking, and user preferences
+- **Git Integration**: Full git workflow support with conflict resolution and push capabilities
+- **W&B Ecosystem Integration**: Native tracing, model selection, and cost tracking
 
 ## Features
 
@@ -22,21 +33,45 @@ A local Streamlit app that turns any [W&B Inference](https://docs.wandb.ai/infer
 
 ## Setup
 
-Requires Python 3.11+.
+### Prerequisites
+
+- **Python 3.11+** (required for modern async/await patterns and type hints)
+- **W&B API Key** from [wandb.ai/settings](https://wandb.ai/settings)
+- **Git** (optional, for version control integration)
+
+### Installation
+
+#### Using uv (recommended)
 
 ```bash
+# Create and activate virtual environment
 uv venv
 source .venv/bin/activate
+
+# Install with development dependencies
 uv pip install -e .
 ```
 
-Or with plain pip:
+#### Using pip
 
 ```bash
+# Create and activate virtual environment
 python -m venv .venv
 source .venv/bin/activate
+
+# Install with development dependencies
 pip install -e .
 ```
+
+### Key Dependencies
+
+The application relies on several core packages:
+
+- **Streamlit (>=1.53.0)**: Web framework for the multi-page interface
+- **OpenAI (>=1.40.0)**: Client library for W&B Inference API compatibility
+- **Weave (>=0.52.24)**: W&B's tracing and observability framework
+- **MCP (>=1.19.0)**: Model Context Protocol for external tool integration
+- **Streamlit Desktop App (optional)**: For packaged desktop builds
 
 ## Run
 
@@ -147,6 +182,56 @@ To capture this data the app passes `stream_options={"include_usage": True}` on 
 - The GitHub PAT (when set) is also saved at `~/.wb_coding_agent/credentials.json` (mode 0600). The token is sent only to `https://api.github.com/user` for verification and is otherwise inert; the agent itself never makes GitHub API calls with it.
 - Always review the unified diffs the agent emits before relying on its edits.
 
+## Project Architecture
+
+### Module Structure
+
+The application is organized into several specialized modules with clear responsibilities:
+
+#### Core Application Modules
+- **`streamlit_app.py`** - Main entry point with shared sidebar and navigation
+- **`app_pages/chat.py`** - Chat interface with real-time agent interaction; also hosts the live working-tree diff in a "Changes" modal opened from above the chat input
+- **`app_pages/usage.py`** - Token usage and cost dashboard
+- **`app_pages/settings.py`** - User preferences and connection management
+
+#### Agent & Tool System
+- **`agent.py`** - Tool-calling loop with Weave tracing integration
+- **`tools.py`** - File operations and shell execution tools
+- **`mcp_servers.py`** - Model Context Protocol server management
+- **`project_context.py`** - Skill and guidance file auto-detection
+
+#### Service Integration
+- **`wb_client.py`** - W&B Inference API client with Weave initialization
+- **`git_ops.py`** - Git operations and repository management
+- **`account.py`** - GitHub authentication and credential management
+- **`models.py`** - Model metadata and pricing information
+
+#### UI Components
+- **`chat_input.py`** - Slash command autocomplete component
+- **`theme_switcher.py`** - Theme management component
+- **`actions.py`** - Cross-page callback handlers
+
+#### Data Management
+- **`chats.py`** - Multi-chat persistence and threading
+- **`usage.py`** - Token usage tracking and cost calculation
+
+### Data Flow
+
+1. **User Interaction** → Chat page captures input
+2. **Agent Processing** → Tool calls and model responses
+3. **Tool Execution** → File operations, shell commands, or MCP calls
+4. **Result Processing** → Updates to chat history and UI
+5. **Persistence** → Chat history, usage data, and preferences saved
+6. **Observability** → Weave tracing for all operations
+
+### Key Design Patterns
+
+- **Separation of Concerns**: Each module has a single responsibility
+- **Immutable State**: Chat objects are locked during background processing
+- **Streaming Architecture**: Real-time token streaming with event-based updates
+- **Persistent Storage**: All user data survives app restarts
+- **Cross-Platform**: Works in both web and packaged desktop modes
+
 ## Project layout
 
 - `streamlit_app.py` — Entry point. Page config, session-state init, shared sidebar (file changes), and `st.navigation` between the chat, usage, and settings pages.
@@ -168,3 +253,121 @@ To capture this data the app passes `stream_options={"include_usage": True}` on 
 - `scripts/build_desktop.sh` — Bootstrap wrapper that creates / re-syncs the build venv, then invokes `build_desktop.py`.
 - `.streamlit/config.toml` — Streamlit runtime options for local dev (mirrored in the build script for packaged builds).
 - `AGENTS.md` — Authoritative contract for AI agents working on this repo. Read it before contributing.
+
+## Troubleshooting & Common Issues
+
+### Connection Problems
+
+**"Failed to connect to W&B Inference"**
+- Verify your W&B API key is valid and has inference permissions
+- Check your internet connection
+- Ensure you're using a supported Python version (3.11+)
+
+**"Model list empty after connect"**
+- Your account may not have access to any inference models
+- Contact W&B support for model access
+
+### Performance Issues
+
+**Slow response times**
+- Large working directories can slow down file scanning
+- Complex MCP servers may add latency
+- Consider using smaller models for faster iteration
+
+**High memory usage**
+- The app maintains chat history and tool call context
+- Archive or delete old chats to reduce memory footprint
+
+### File System & Git Issues
+
+**"Path escapes working directory" errors**
+- The agent is restricted to the chosen working directory
+- Use absolute paths within the working directory only
+
+**Git operations failing**
+- Ensure git is installed and in your PATH
+- Verify you have appropriate permissions for the repository
+- Check for merge conflicts that need manual resolution
+
+### Theme & UI Issues
+
+**Theme not applying correctly**
+- The page reloads once after theme changes
+- Some browsers may require a hard refresh (Ctrl+F5)
+
+**Slash commands not working**
+- Ensure skills are placed in the correct directories
+- Check skill file formatting and trigger definitions
+
+### Desktop Build Issues
+
+**macOS Gatekeeper blocking app**
+- Right-click the app and select "Open" for first launch
+- Or run: `xattr -d com.apple.quarantine "dist/WB Coding Agent.app"`
+
+**Build failures**
+- Use Python 3.12 for desktop builds
+- Ensure all build dependencies are installed
+- Check the build script for specific error messages
+
+## Getting Help
+
+- **Documentation**: Refer to this README and `AGENTS.md`
+- **W&B Support**: Contact support for inference-related issues
+- **GitHub Issues**: Check for existing issues or create new ones
+- **Community**: Join W&B community forums for discussion
+
+## Contributing
+
+Before making changes to this repository:
+
+1. Read `AGENTS.md` thoroughly - it's the authoritative guide
+2. Follow the module boundaries and responsibilities outlined
+3. Test changes in both development and desktop build modes
+4. Update documentation (README, AGENTS.md) alongside code changes
+5. Ensure Weave tracing continues to work correctly
+
+## Development & Contribution
+
+### Development Practices
+
+#### Code Organization
+- Follow the module boundaries defined in `AGENTS.md`
+- Keep Streamlit imports isolated to UI modules
+- Use pure functions for business logic when possible
+- Maintain clear separation between frontend and background processing
+
+#### Testing Guidelines
+- Test changes in both development and desktop build modes
+- Verify Weave tracing continues to work correctly
+- Test with both Agent and Ask only modes
+- Validate MCP server integration when relevant
+
+#### Performance Considerations
+- Minimize blocking operations in the main thread
+- Use appropriate caching for expensive operations
+- Be mindful of token usage and cost implications
+- Optimize file scanning for large working directories
+
+### Building for Production
+
+#### Desktop App Packaging
+- Use the dedicated build environment (Python 3.12)
+- Follow the bootstrap script for reproducible builds
+- Test the packaged app on target platforms
+- Handle code signing and notarization for distribution
+
+#### Configuration Management
+- Keep `.streamlit/config.toml` and build script options synchronized
+- Maintain backward compatibility for user data files
+- Handle credential migration carefully between versions
+
+## License & Attribution
+
+This project is built on:
+- [Streamlit](https://streamlit.io/) for the web interface
+- [W&B Inference](https://docs.wandb.ai/inference) for model serving
+- [Weave](https://docs.wandb.ai/weave) for observability
+- [MCP](https://modelcontextprotocol.io/) for tool extensibility
+
+Refer to individual package licenses for specific terms.

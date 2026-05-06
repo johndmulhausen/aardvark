@@ -7,6 +7,11 @@ Exposes a generator, ``run_agent_turn``, that yields events the UI renders:
   ``SKILL.md`` files (under ``.cursor/skills`` or ``.claude/skills``, at
   workspace or user scope) were sliced into the system prompt this turn
   (and any ``/foo`` slash commands that didn't match a known skill).
+- ``{"type": "weave_trace", "url": ..., "call_id": ...}`` — emitted at most
+  once per turn, immediately after ``skills_loaded``, when Weave has been
+  initialized and we can read this turn's :class:`weave.trace.weave_client.Call`
+  via :func:`weave.get_current_call`. Carries the per-turn deep link the chat
+  UI surfaces in the per-turn footer caption alongside token use + cost.
 - ``{"type": "assistant_text_delta", "content": ...}`` — a partial chunk of
   assistant text streamed token-by-token. The UI appends these to a live
   placeholder; they are NOT persisted to ``ui_turns`` for replay.
@@ -152,6 +157,94 @@ def _short_model_name(model: str) -> str:
     return model.split("/")[-1]
 
 
+# Characters that may legally follow a backslash inside a JSON string.
+# ``u`` is included here but additionally requires four hex digits; the
+# repair helper validates that separately.
+_JSON_VALID_ESCAPE_CHARS = set('"\\/bfnrtu')
+_JSON_HEX_DIGITS = set("0123456789abcdefABCDEF")
+
+
+def _escape_lone_backslashes(s: str) -> str:
+    """Double any backslash in ``s`` that isn't part of a valid JSON escape.
+
+    Walks the string once and rewrites every ``\\X`` where ``X`` is not
+    one of ``"\\``, ``\\\\``, ``\\/``, ``\\b``, ``\\f``, ``\\n``, ``\\r``,
+    ``\\t``, or ``\\uXXXX`` (with four hex digits) into ``\\\\X``. Trailing
+    backslashes (no character after) are also doubled.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= n:
+            out.append("\\\\")
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt == "u":
+            if i + 6 <= n and all(c in _JSON_HEX_DIGITS for c in s[i + 2 : i + 6]):
+                out.append(s[i : i + 6])
+                i += 6
+                continue
+            out.append("\\\\")
+            i += 1
+            continue
+        if nxt in _JSON_VALID_ESCAPE_CHARS:
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+            continue
+        out.append("\\\\")
+        i += 1
+    return "".join(out)
+
+
+def _normalize_tool_call_arguments(raw: str) -> str:
+    """Return a canonical, server-parseable JSON string for ``raw``.
+
+    The W&B Inference server (like the OpenAI API) re-parses
+    ``tool_calls[].function.arguments`` as JSON when validating the
+    request body on the *next* round. Models occasionally emit invalid
+    JSON inside ``arguments`` — most commonly a lone backslash from a
+    regex (``\\d+``), shell glob (``find . -name \\*.py``), or Windows
+    path — which round-trips through :class:`str` concatenation just
+    fine but produces ``Error code: 400 - Invalid \\escape`` on the
+    next call once we send the conversation history back.
+
+    We canonicalize as follows:
+
+    1. Try :func:`json.loads` directly. On success, re-serialize via
+       :func:`json.dumps` so the output is always valid JSON (and any
+       benign whitespace / quoting quirks the model produced are
+       smoothed out).
+    2. If parsing fails, repair lone backslashes via
+       :func:`_escape_lone_backslashes` and try once more. The repair
+       preserves the model's intent for valid escape characters
+       (``\\n``, ``\\t``, ``\\uXXXX``, etc.) and only doubles backslashes
+       that would otherwise crash the server's parser.
+    3. If repair still fails, fall back to ``"{}"`` so the next round's
+       request stays well-formed and the model gets a chance to retry
+       (the local tool dispatch sees the empty-args case and surfaces
+       a useful error to the model). This is strictly better than
+       letting an unparseable string poison ``messages``.
+    """
+    if not raw:
+        return "{}"
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            parsed = json.loads(_escape_lone_backslashes(raw))
+        except json.JSONDecodeError:
+            return "{}"
+    return json.dumps(parsed, ensure_ascii=False)
+
+
 @_op(
     name="stream_one_call",
     kind="llm",
@@ -240,6 +333,18 @@ def _stream_one_call(
 
     full_content = "".join(content_parts)
     tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+
+    # Canonicalize each tool call's ``arguments`` *before* we both append
+    # the assistant message to ``messages`` (where the server re-parses
+    # it on the next round) and yield ``tool_call`` events (where the
+    # local dispatch path also json-loads it). Without this, a model
+    # that emits a regex / shell-glob / Windows-path argument with a
+    # lone backslash produces a 400 ``Invalid \escape`` on the next
+    # request. See :func:`_normalize_tool_call_arguments`.
+    for tc in tool_calls:
+        tc["function"]["arguments"] = _normalize_tool_call_arguments(
+            tc["function"]["arguments"]
+        )
 
     assistant_entry: dict[str, Any] = {"role": "assistant", "content": full_content}
     if tool_calls:
@@ -395,6 +500,26 @@ def run_agent_turn(
         ],
         "unknown_slash": list(selection.unknown_slash),
     }
+
+    # Emit the per-turn Weave trace URL exactly once, before the model
+    # call kicks off, so the UI can render the link as soon as the
+    # assistant message starts streaming. ``weave.get_current_call``
+    # returns ``None`` when ``weave.init`` was never called or the
+    # current frame isn't inside an active op (the latter shouldn't
+    # happen — we're inside ``run_agent_turn``, which is decorated —
+    # but we guard for it anyway). ``Call.ui_url`` raises ``ValueError``
+    # when the call has no id, so we wrap defensively: a missing trace
+    # link must never break the agent.
+    try:
+        current_call = weave.get_current_call()
+        if current_call is not None and getattr(current_call, "id", None):
+            yield {
+                "type": "weave_trace",
+                "url": current_call.ui_url,
+                "call_id": current_call.id,
+            }
+    except Exception:
+        pass
 
     base_prompt = SYSTEM_PROMPT_ASK if mode == "ask" else SYSTEM_PROMPT
     addendum = project_context.build_system_addendum(proj_ctx, selection)

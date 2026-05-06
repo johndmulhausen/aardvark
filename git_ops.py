@@ -176,6 +176,53 @@ def list_branches(working_dir: Path) -> list[str]:
     return sorted(branches)
 
 
+def list_remote_branches(working_dir: Path, remote: str = "origin") -> list[str]:
+    """Return remote-tracking branch names like ``origin/feature``.
+
+    Filters out the symbolic ``<remote>/HEAD`` ref so the chat-page
+    branch dropdown doesn't surface it as a duplicate of the actual
+    default branch.
+    """
+    proc = _run(
+        ["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{remote}/"],
+        cwd=working_dir,
+        check=False,
+        timeout=10,
+    )
+    out: list[str] = []
+    head_marker = f"{remote}/HEAD"
+    for line in proc.stdout.splitlines():
+        name = line.strip()
+        if not name or name == head_marker:
+            continue
+        out.append(name)
+    return sorted(out)
+
+
+def checkout(working_dir: Path, branch: str) -> None:
+    """Switch to ``branch`` (local or remote-tracking name).
+
+    A remote-tracking name like ``origin/feature`` resolves automatically
+    to a new local tracking branch named ``feature`` — that's plain git
+    behaviour, and it's how the chat-page branch dropdown turns a
+    remote-only entry into a local checkout in one click.
+    """
+    _run(["checkout", branch], cwd=working_dir, timeout=30)
+
+
+def create_branch(working_dir: Path, name: str, *, checkout: bool = True) -> None:
+    """Create a new branch off the current HEAD.
+
+    With ``checkout=True`` (the default) we use ``git checkout -b`` so any
+    uncommitted working-tree changes come along automatically — the
+    common "make a new branch for what I'm currently working on" path.
+    """
+    if checkout:
+        _run(["checkout", "-b", name], cwd=working_dir, timeout=15)
+    else:
+        _run(["branch", name], cwd=working_dir, timeout=15)
+
+
 def default_branch(working_dir: Path) -> str:
     """Best-effort detection of the repo's default branch.
 
@@ -327,6 +374,73 @@ def untracked_line_count(working_dir: Path, path: str) -> int:
             return sum(1 for _ in f)
     except OSError:
         return 0
+
+
+# Cap for the combined diff blob we feed DeepSeek for commit-message /
+# PR-body generation. Generous enough to cover most real changes
+# without blowing past the model's context.
+_COMBINED_DIFF_CAP = 200_000
+
+
+def combined_diff_for_paths(working_dir: Path, paths: list[str]) -> str:
+    """Build a single diff blob for ``paths`` (tracked + untracked).
+
+    Tracked files come from ``git diff HEAD --`` so renames + binary
+    handling match what GitHub shows. Untracked files (which
+    ``git diff`` ignores) are appended as synthesized
+    ``--- /dev/null / +++ b/<path>`` blocks so the model still sees
+    new-file additions. The result is capped at
+    :data:`_COMBINED_DIFF_CAP` characters so very large change sets
+    don't overflow the model context — callers (today: the chat
+    page's commit-message helper) can rely on this cap.
+    """
+    if not paths:
+        return ""
+    chunks: list[str] = []
+
+    # Pre-compute which paths are untracked so we can split tracked vs
+    # untracked in one walk without re-running ``git status``.
+    untracked_set: set[str] = set()
+    try:
+        for entry in status_entries(working_dir):
+            if entry.is_untracked:
+                untracked_set.add(entry.path)
+    except GitError:
+        pass
+
+    tracked = [p for p in paths if p not in untracked_set]
+    if tracked:
+        try:
+            proc = _run(
+                ["diff", "HEAD", "--no-color", "--no-renames", "--", *tracked],
+                cwd=working_dir,
+                check=False,
+                timeout=30,
+            )
+            if proc.stdout:
+                chunks.append(proc.stdout)
+        except (GitError, OSError):
+            pass
+
+    for p in paths:
+        if p not in untracked_set:
+            continue
+        target = working_dir / p
+        try:
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        chunks.append(f"\n--- /dev/null\n+++ b/{p}\n")
+        for line in text.splitlines():
+            chunks.append(f"+{line}\n")
+
+    blob = "".join(chunks)
+    if len(blob) > _COMBINED_DIFF_CAP:
+        blob = (
+            blob[:_COMBINED_DIFF_CAP]
+            + f"\n\n[truncated, {len(blob) - _COMBINED_DIFF_CAP} more chars]\n"
+        )
+    return blob
 
 
 def stage(working_dir: Path, paths: list[str]) -> None:
@@ -615,6 +729,7 @@ def scan(working_dir: Path) -> dict[str, Any]:
         "in_repo": False,
         "current_branch": None,
         "branches": [],
+        "remote_branches": [],
         "default_branch": "main",
         "status": [],
         "dirty": False,
@@ -632,6 +747,7 @@ def scan(working_dir: Path) -> dict[str, Any]:
     try:
         out["current_branch"] = current_branch(working_dir)
         out["branches"] = list_branches(working_dir)
+        out["remote_branches"] = list_remote_branches(working_dir)
         out["default_branch"] = default_branch(working_dir)
         out["status"] = status_entries(working_dir)
         out["dirty"] = bool(out["status"])

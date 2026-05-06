@@ -44,6 +44,7 @@ from typing import Any
 
 import weave
 from openai import OpenAI
+from weave.trace import urls as weave_urls
 from weave.trace.context import weave_client_context
 from weave.trace.weave_client import WeaveClient
 
@@ -244,7 +245,9 @@ def _patch_weave_openai_finish_reason() -> None:
     openai_sdk.openai_on_finish_post_processor = _patched
 
 
-def init_weave(api_key: str, project: str | None = None) -> tuple[WeaveClient, str]:
+def init_weave(
+    api_key: str, project: str | None = None
+) -> tuple[WeaveClient, str, str]:
     """Initialize W&B Weave so every OpenAI call gets traced.
 
     Sets ``WANDB_API_KEY`` from ``api_key`` so :func:`weave.init` can
@@ -259,8 +262,15 @@ def init_weave(api_key: str, project: str | None = None) -> tuple[WeaveClient, s
     falls back to :data:`DEFAULT_WEAVE_PROJECT` under the user's default
     entity.
 
-    Returns a ``(client, project)`` pair where ``project`` is the resolved
-    project string the UI can display to the user.
+    Returns a ``(client, label, url)`` triple where:
+
+    - ``label`` is the resolved ``entity/project`` string the UI displays
+      (built from :attr:`WeaveClient.entity` / :attr:`WeaveClient.project`,
+      so we get back whatever Weave's project-name slug-fixup actually used
+      rather than echoing the user's input).
+    - ``url`` is a deep link to the project's Weave traces page, built via
+      :func:`weave.trace.urls.project_weave_root_url` so private W&B
+      deployments and projects with URL-unsafe characters both work.
     """
     os.environ["WANDB_API_KEY"] = api_key
     target = project.strip() if project and project.strip() else DEFAULT_WEAVE_PROJECT
@@ -272,7 +282,9 @@ def init_weave(api_key: str, project: str | None = None) -> tuple[WeaveClient, s
     # listener so any subsequent upload failure with a quota-shaped message
     # flips the prune flag. Idempotent across reconnects.
     _ensure_storage_handler_attached()
-    return client, target
+    label = f"{client.entity}/{client.project}"
+    url = weave_urls.project_weave_root_url(client.entity, client.project)
+    return client, label, url
 
 
 def prune_oldest_calls(

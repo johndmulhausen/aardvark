@@ -30,10 +30,14 @@ gatherUsageStats = false
 # ``baseFontSize`` is one of the handful of options Streamlit explicitly
 # rejects per-mode (see the "Theme" section of the config.toml docs at
 # https://docs.streamlit.io/develop/api-reference/configuration/config.toml ),
-# so it lives at the top level. Mirror in ``STREAMLIT_OPTIONS`` in
+# so it lives at the top level. 12px is the bundled default; the in-app
+# Settings page lets the user pick a different size at runtime via
+# ``font_size_switcher`` (which injects a CSS override). The label that
+# matches *this* value is **Small** in that switcher — keep the two in
+# sync if you change either. Mirror in ``STREAMLIT_OPTIONS`` in
 # ``scripts/build_desktop.py``.
 [theme]
-baseFontSize = 14
+baseFontSize = 12
 
 # Define both ``[theme.light]`` and ``[theme.dark]`` so Streamlit treats
 # the app as multi-mode — that's what makes the in-app theme switcher's

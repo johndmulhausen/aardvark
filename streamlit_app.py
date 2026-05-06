@@ -1,6 +1,6 @@
 """Streamlit entry point for the W&B Inference code editing agent.
 
-Runs as a multi-page app via ``st.navigation``: ``Chat`` (the existing
+Runs as a multi-page app via ``st.navigation``: ``Agent`` (the existing
 chat experience), ``Usage`` (the token-and-cost dashboard), and
 ``Settings`` (GitHub identity + W&B Inference connection + theme info).
 The sidebar is shared chrome (MCP servers panel + file-changes panel)
@@ -23,23 +23,22 @@ producing duplicate-widget-key errors.
 """
 from __future__ import annotations
 
-import json
 import os
-import webbrowser
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
 import account
+import chats
 import git_ops
 from actions import (
     load_recent_dirs as _load_recent_dirs,
     on_connect as _auto_on_connect,
     theme_detected as _theme_detected,
 )
-from agent import DEEPSEEK_MODEL, generate_text
-from git_ops import GitError
+from agent import DEEPSEEK_MODEL
+from font_size_switcher import mount_font_size_switcher as _mount_font_size_switcher
 from theme_switcher import mount_theme_switcher as _mount_theme_switcher
 
 st.set_page_config(
@@ -76,10 +75,44 @@ def _init_state() -> None:
     ss.setdefault("recent_dirs", _load_recent_dirs())
     default_wd = ss.recent_dirs[0] if ss.recent_dirs else os.getcwd()
     ss.setdefault("working_dir", default_wd)
-    ss.setdefault("messages", [])
-    ss.setdefault("ui_turns", [])
+    # Multi-chat session state. ``chats`` is the dict of all persisted
+    # conversations (loaded from ``~/.wb_coding_agent/chats/`` once per
+    # session); ``active_chat_id`` tracks which one the chat page is
+    # currently rendering. We seed a fresh empty chat if the user has
+    # none yet so the chat page always has something to render against.
+    # The active id is sourced from a tiny on-disk pointer
+    # (``chats.load_active_chat_id``) so reloading the app lands on the
+    # chat the user was last *looking at* rather than whichever chat
+    # happens to have the freshest ``updated_at`` (which is often a
+    # placeholder ``+ New chat`` that was never used). When the pointer
+    # is absent or stale, ``chats.best_default_chat_id`` prefers a
+    # chat with actual content over an empty placeholder.
+    # ``delete_chat_confirm_id`` gates the @st.dialog confirm for
+    # destructive deletes.
+    if "chats" not in ss:
+        ss.chats = chats.load_all_chats()
+    if not ss.chats:
+        seed = chats.new_chat(
+            model=ss.model or "",
+            mode=ss.mode,
+            working_dir=ss.working_dir,
+        )
+        ss.chats[seed.id] = seed
+    if "active_chat_id" not in ss or ss.active_chat_id not in ss.chats:
+        ss.active_chat_id = (
+            chats.best_default_chat_id(ss.chats) or next(iter(ss.chats))
+        )
+        # Persist the resolved id so subsequent reloads agree on it.
+        chats.save_active_chat_id(ss.active_chat_id)
+    ss.setdefault("delete_chat_confirm_id", None)
+    # Gates the @st.dialog("Changes") modal mounted at the bottom of
+    # ``app_pages/chat.py.render()``. Set to True by the "Changes"
+    # button on the chat page (the only entry point); cleared by the
+    # dialog's Close handler.
+    ss.setdefault("diff_dialog_open", False)
     ss.setdefault("connect_error", None)
     ss.setdefault("weave_project", None)
+    ss.setdefault("weave_url", None)
     ss.setdefault("weave_error", None)
     ss.setdefault("conn_open", False)
     # Tracks whether we've already attempted the one-shot auto-connect at
@@ -108,6 +141,14 @@ def _init_state() -> None:
     # Dark via Streamlit's pre-app toolbar menu keep their preference.
     ss.setdefault("theme_pref", profile.theme or "")
     ss.setdefault("theme_explicit", bool(profile.theme))
+    # Font-size preference. ``font_size_pref`` carries the user's
+    # explicit choice (one of "Extra small" / "Small" / "Medium" /
+    # "Large" / "Extra large") or ``""`` when the user has never
+    # picked. The font size switcher component reads this value on
+    # every mount; an empty string is treated as "no override" so the
+    # page renders at whatever ``baseFontSize``
+    # ``.streamlit/config.toml`` ships with.
+    ss.setdefault("font_size_pref", profile.font_size or "")
     ss.setdefault("github_pat", creds.get("github_pat", ""))
     ss.setdefault("github_identity", _identity_from_profile(profile))
     ss.setdefault("github_pat_error", None)
@@ -120,8 +161,13 @@ def _init_state() -> None:
 
     # Git integration state. ``git_state_nonce`` is bumped after every
     # mutating git op (checkout, commit, push, conflict resolution) so the
-    # cached repo scan refreshes on the next rerun. ``push_dialog_open``
-    # gates the push modal. ``merge_conflict`` is set to
+    # cached repo scan refreshes on the next rerun. The bottom-of-chat
+    # git row owns the new-branch / publish-branch modals (gated by
+    # ``new_branch_dialog_open`` / ``first_push_dialog_open``) and queues
+    # the push pipeline through ``pending_push_request`` so the actual
+    # network + LLM work runs inside ``app_pages/chat.py.render()`` (where
+    # ``st.toast`` / ``st.rerun`` work normally) rather than inside an
+    # on-click callback. ``merge_conflict`` is set to
     # ``{"files": [...], "operation": "rebase"|"merge"}`` after a conflict
     # during the push flow's ``pull --rebase`` and drives the sidebar
     # warning + "Resolve with DeepSeek" button. ``pending_conflict_resolution``
@@ -129,8 +175,9 @@ def _init_state() -> None:
     # chat page (in ``app_pages/chat.py``) drains it and runs an agent turn
     # with ``override_model=DEEPSEEK_MODEL``.
     ss.setdefault("git_state_nonce", 0)
-    ss.setdefault("push_dialog_open", False)
-    ss.setdefault("push_dialog_state", {})
+    ss.setdefault("new_branch_dialog_open", False)
+    ss.setdefault("first_push_dialog_open", False)
+    ss.setdefault("pending_push_request", None)
     ss.setdefault("merge_conflict", None)
     ss.setdefault("pending_conflict_resolution", None)
 
@@ -183,114 +230,6 @@ def _maybe_auto_connect() -> None:
 
 
 # ---------------------------------------------------------------------------
-# File changes panel
-# ---------------------------------------------------------------------------
-# Two render paths share the panel: when the working directory is a git
-# working tree we drive the panel from ``git diff HEAD`` so the user sees
-# the live filesystem state regardless of which agent turn produced each
-# change (or whether the change came from outside the agent at all). When
-# the workdir is not a git repo we fall back to aggregating successful
-# ``write_file``/``edit_file`` tool results from the chat history — the
-# legacy behavior, which gives at least *some* visibility on non-git
-# workdirs.
-def _count_diff_lines(diff: str) -> tuple[int, int]:
-    """Count ``+`` and ``-`` lines in a unified diff (excluding headers)."""
-    if not diff or diff in ("(no change)", "(new file)"):
-        return 0, 0
-    additions = 0
-    deletions = 0
-    for line in diff.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
-            continue
-        if line.startswith("+"):
-            additions += 1
-        elif line.startswith("-"):
-            deletions += 1
-    return additions, deletions
-
-
-def _collect_file_changes(ui_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    summaries: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for turn in ui_turns:
-        if turn.get("role") != "assistant":
-            continue
-        for ev in turn.get("events", []):
-            if ev.get("type") != "tool_result":
-                continue
-            if ev.get("name") not in ("write_file", "edit_file"):
-                continue
-            result = ev.get("result") or {}
-            if not result.get("ok"):
-                continue
-            path = result.get("path")
-            if not path:
-                continue
-            diff = result.get("diff") or ""
-            adds, dels = _count_diff_lines(diff)
-            entry = summaries.get(path)
-            if entry is None:
-                entry = {
-                    "path": path,
-                    "additions": 0,
-                    "deletions": 0,
-                    "created": False,
-                    "edits": 0,
-                    "latest_diff": "",
-                }
-                summaries[path] = entry
-            entry["additions"] += adds
-            entry["deletions"] += dels
-            entry["edits"] += 1
-            if result.get("created") or diff == "(new file)":
-                entry["created"] = True
-            entry["latest_diff"] = diff
-            if path in order:
-                order.remove(path)
-            order.append(path)
-    return [summaries[p] for p in reversed(order)]
-
-
-def _render_tool_result_changes() -> None:
-    """Legacy non-git fallback for the file-changes panel.
-
-    Aggregates successful ``write_file`` / ``edit_file`` tool results into
-    one entry per path, so users on non-git workdirs still see what the
-    agent touched and can review the diff inline.
-    """
-    changes = _collect_file_changes(st.session_state.ui_turns)
-    if not changes:
-        return
-
-    label = f"File changes \u00b7 {len(changes)} file{'s' if len(changes) != 1 else ''}"
-    with st.expander(label, icon=":material/edit_note:", expanded=True):
-        for i, entry in enumerate(changes):
-            if i > 0:
-                st.divider()
-            icon = (
-                ":material/add_circle:" if entry["created"] else ":material/edit_note:"
-            )
-            st.markdown(f"{icon} `{entry['path']}`")
-
-            caption_parts: list[str] = []
-            if entry["created"]:
-                caption_parts.append(":green[New file]")
-            if entry["additions"] or entry["deletions"]:
-                caption_parts.append(
-                    f":green[+{entry['additions']}] :red[\u2212{entry['deletions']}]"
-                )
-            if entry["edits"] > 1:
-                caption_parts.append(f"{entry['edits']} edits")
-            if caption_parts:
-                st.caption(" \u00b7 ".join(caption_parts))
-
-            diff = entry["latest_diff"]
-            if diff and diff not in ("(no change)", "(new file)"):
-                with st.expander("Diff", expanded=False):
-                    st.code(diff, language="diff")
-
-
-# ---------------------------------------------------------------------------
 # Git scan: cached, nonce-busted on every mutating op
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3, show_spinner=False)
@@ -316,6 +255,7 @@ def _cached_git_scan(working_dir: str, _nonce: int) -> dict[str, Any]:
             "in_repo": False,
             "current_branch": None,
             "branches": [],
+            "remote_branches": [],
             "default_branch": "main",
             "status": [],
             "dirty": False,
@@ -347,159 +287,19 @@ def _bump_git_nonce() -> None:
     )
 
 
-def _entry_icon(entry: git_ops.StatusEntry) -> str:
-    """Material icon name for a :class:`git_ops.StatusEntry` row."""
-    if entry.is_untracked:
-        return ":material/add_circle:"
-    if entry.is_deleted:
-        return ":material/remove_circle:"
-    if entry.is_renamed:
-        return ":material/swap_horiz:"
-    if entry.staged_status == "A":
-        return ":material/add_circle:"
-    return ":material/edit_note:"
-
-
-def _entry_state_label(entry: git_ops.StatusEntry) -> str:
-    """Compact ``[staged|...]`` label hint shown alongside +/- counts."""
-    if entry.is_untracked:
-        return ":green[Untracked]"
-    if entry.is_deleted:
-        return ":red[Deleted]"
-    if entry.is_renamed:
-        return ":blue[Renamed]"
-    parts: list[str] = []
-    if entry.staged_status not in (" ", "?"):
-        parts.append("staged")
-    if entry.unstaged_status not in (" ", "?"):
-        parts.append("unstaged")
-    return ":gray[" + ", ".join(parts) + "]" if parts else ""
-
-
-def _git_diff_for_entry(working_dir: Path, entry: git_ops.StatusEntry) -> str:
-    """Return a unified diff string for a status entry, robust to errors."""
-    try:
-        return git_ops.diff_for_path(working_dir, entry.path, untracked=entry.is_untracked)
-    except GitError as e:
-        return f"(git diff failed: {e.stderr})"
-
-
-def _render_git_file_changes(state: dict[str, Any]) -> None:
-    """Render the git-driven file-changes panel.
-
-    Uses ``git status`` + ``git diff HEAD`` as the source of truth so the
-    panel reflects the actual filesystem regardless of which agent turn
-    (or external tool) produced each change. The footer hosts the
-    primary **Push changes** button — it's only enabled when the working
-    tree is dirty *and* the repo isn't mid-rebase/merge (the merge-
-    conflict warning takes over in that state).
-    """
-    entries: list[git_ops.StatusEntry] = list(state.get("status") or [])
-    branch = state.get("current_branch") or "(detached HEAD)"
-    in_progress = bool(state.get("in_merge_or_rebase"))
-
-    if not entries:
-        # Quiet repo. We still surface a tiny header so the user can see
-        # the branch context (and so the panel doesn't disappear right
-        # after they commit + push, leaving no breadcrumb).
-        with st.expander(
-            f"File changes \u00b7 clean on `{branch}`",
-            icon=":material/check_circle:",
-            expanded=False,
-        ):
-            st.caption("Working tree clean. Nothing to push.")
-        return
-
-    working_dir = Path(st.session_state.working_dir).expanduser().resolve()
-    counts = git_ops.summary_diff_counts(working_dir, [e.path for e in entries if not e.is_untracked])
-
-    label = (
-        f"File changes \u00b7 {len(entries)} file"
-        f"{'s' if len(entries) != 1 else ''} on `{branch}`"
-    )
-    with st.expander(label, icon=":material/edit_note:", expanded=True):
-        for i, entry in enumerate(entries):
-            if i > 0:
-                st.divider()
-            adds, dels = counts.get(entry.path, (0, 0))
-            if entry.is_untracked and adds == 0:
-                # ``git diff`` can't see untracked files; approximate the +
-                # count from the file's current line count so the chip is
-                # never blank for a brand-new file.
-                adds = git_ops.untracked_line_count(working_dir, entry.path)
-
-            st.markdown(f"{_entry_icon(entry)} `{entry.path}`")
-            caption_parts: list[str] = []
-            if adds or dels:
-                caption_parts.append(f":green[+{adds}] :red[\u2212{dels}]")
-            state_label = _entry_state_label(entry)
-            if state_label:
-                caption_parts.append(state_label)
-            if entry.is_renamed and entry.orig_path:
-                caption_parts.append(f"from `{entry.orig_path}`")
-            if caption_parts:
-                st.caption(" \u00b7 ".join(caption_parts))
-
-            with st.expander("Diff", expanded=False):
-                diff = _git_diff_for_entry(working_dir, entry)
-                if diff.strip():
-                    st.code(diff, language="diff")
-                else:
-                    st.caption("(no textual diff — likely a binary file)")
-
-        if in_progress:
-            # Push is unsafe while a merge/rebase is mid-flight; the
-            # warning panel above handles the resolution affordance.
-            st.caption(
-                ":material/warning: Resolve the in-progress "
-                f"{state.get('operation') or 'merge'} before pushing."
-            )
-        else:
-            st.button(
-                "Push changes",
-                icon=":material/upload:",
-                type="primary",
-                width="stretch",
-                key="open_push_dialog_btn",
-                on_click=_open_push_dialog,
-            )
-
-
-def _render_file_changes() -> None:
-    """Top-level dispatch: pick the git or tool-result panel.
-
-    The git path is preferred whenever the working directory is a real
-    git repo. We fall back to the legacy tool-result aggregation only
-    when git isn't available — that way users on non-git scratch dirs
-    still see what the agent did, while git users get the full
-    filesystem-truth picture (including changes outside the chat).
-    """
-    state = _git_state()
-    if state.get("in_repo"):
-        _render_git_file_changes(state)
-    else:
-        _render_tool_result_changes()
+# Per-file diff rendering and the push flow both live on the chat page
+# (``app_pages/chat.py``): the unified-diff modal is opened by the
+# "Changes" button just above the chat input, and the new bottom-of-chat
+# git row owns branch switching, new-branch creation, fetch, and the
+# one-click "generate commit message + commit + push" pipeline. This
+# module is responsible only for the cross-page sidebar warning when
+# the working tree is mid-merge/rebase (so users see it from any page);
+# everything else moved into the chat page.
 
 
 # ---------------------------------------------------------------------------
 # Git warnings (sidebar)
 # ---------------------------------------------------------------------------
-def _open_push_dialog() -> None:
-    """Reset transient dialog state, then flip the dialog flag.
-
-    Resetting clears any cached commit message / PR description from a
-    prior open so the dialog regenerates fresh against the current diff.
-    The set of checked-by-default files is recomputed from
-    ``git status`` on first render.
-    """
-    st.session_state.push_dialog_state = {}
-    st.session_state.push_dialog_open = True
-
-
-def _close_push_dialog() -> None:
-    st.session_state.push_dialog_open = False
-
-
 def _request_conflict_resolution() -> None:
     """Sidebar callback: hand a synthesized prompt off to the chat page.
 
@@ -595,497 +395,372 @@ def _render_git_warnings() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Push dialog
+# Multi-chat sidebar
 # ---------------------------------------------------------------------------
-COMMIT_MSG_SYSTEM = (
-    "You are a senior engineer writing a git commit message.\n"
-    "Output a single conventional-commit message:\n"
-    "- First line: `<type>: <subject>` (<= 72 chars), where <type> is one of "
-    "feat, fix, refactor, docs, test, chore, perf, style, build, ci.\n"
-    "- Blank line.\n"
-    "- 1-4 bullet body explaining the *why* of the change.\n"
-    "Output the message text only. No code fences, no preamble, no quotes."
-)
+# The sidebar is the "chat history" panel: every persisted conversation
+# is rendered as a row with [activate, archive, delete] icon controls.
+# Branch switching, new-branch creation, fetch, and the push pipeline
+# all moved into the bottom-of-chat git row in ``app_pages/chat.py``;
+# the file-by-file diff list lives on the chat page in the Changes
+# modal. A collapsed "Archive" expander hosts archived chats. Every
+# callback below mutates ``ss.chats`` / ``ss.active_chat_id`` and
+# delegates persistence to :mod:`chats`.
 
-PR_DESC_SYSTEM = (
-    "You are a senior engineer writing a pull-request description.\n"
-    "Reply with strictly valid JSON of the shape "
-    '`{"title": "...", "body": "..."}`.\n'
-    "- title: <= 80 chars, no trailing period.\n"
-    "- body: GitHub-flavored markdown with three sections (in order):\n"
-    "  `## Summary` (1-3 bullets describing what and why),\n"
-    "  `## Changes` (per-file or per-area bullets),\n"
-    "  `## Test plan` (a checklist with `- [ ]` items).\n"
-    "Do not wrap the JSON in code fences. Do not include any text before or "
-    "after the JSON object."
-)
+# Material icon for each chat status. Lookup is forgiving: an unknown
+# status falls back to the "new" icon so a future status (e.g.
+# "queued") doesn't render as nothing while we add UI for it.
+_STATUS_ICON: dict[str, str] = {
+    chats.STATUS_NEW: ":material/chat_bubble_outline:",
+    chats.STATUS_RUNNING: ":material/progress_activity:",
+    chats.STATUS_IDLE: ":material/check_circle:",
+    chats.STATUS_ERROR: ":material/cancel:",
+}
 
 
-def _diff_for_paths(working_dir: Path, paths: list[str]) -> str:
-    """Build the prompt context we feed DeepSeek for commit/PR generation.
-
-    ``git diff HEAD`` is preferred (works for tracked changes); for
-    untracked files we append a synthesized "(new file: <path>)" header
-    plus the file body so the model still sees them. Caps the total at a
-    generous 200 KB so very large diffs don't blow past V4-Flash's
-    context.
-    """
-    chunks: list[str] = []
-    tracked = [p for p in paths if (working_dir / p).exists()]
-    if tracked:
-        try:
-            proc = git_ops._run(
-                ["diff", "HEAD", "--no-color", "--no-renames", "--", *tracked],
-                cwd=working_dir,
-                check=False,
-                timeout=30,
-            )
-            if proc.stdout:
-                chunks.append(proc.stdout)
-        except (GitError, OSError):
-            pass
-
-    state = _git_state()
-    untracked_paths = {
-        e.path for e in (state.get("status") or []) if e.is_untracked
-    }
-    for p in paths:
-        if p not in untracked_paths:
-            continue
-        target = working_dir / p
-        try:
-            text = target.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        chunks.append(f"\n--- /dev/null\n+++ b/{p}\n")
-        for line in text.splitlines():
-            chunks.append(f"+{line}\n")
-
-    blob = "".join(chunks)
-    cap = 200_000
-    if len(blob) > cap:
-        blob = blob[:cap] + f"\n\n[truncated, {len(blob) - cap} more chars]\n"
-    return blob
-
-
-def _generate_commit_message(working_dir: Path, paths: list[str]) -> str:
-    """Ask DeepSeek for a commit message describing the staged changes."""
-    client = st.session_state.get("client")
-    if client is None:
-        return ""
-    diff = _diff_for_paths(working_dir, paths)
-    if not diff.strip():
-        return ""
-    user = (
-        "Write a conventional-commit message for the following diff:\n\n"
-        "```diff\n" + diff + "\n```"
-    )
-    return generate_text(
-        client=client,
-        model=DEEPSEEK_MODEL,
-        system=COMMIT_MSG_SYSTEM,
-        user=user,
-        max_tokens=500,
+def _sorted_chats(*, archived: bool) -> list[chats.Chat]:
+    """Return chats matching ``archived`` flag, most-recent-first."""
+    return sorted(
+        (c for c in st.session_state.chats.values() if bool(c.archived) == archived),
+        key=lambda c: c.updated_at,
+        reverse=True,
     )
 
 
-def _generate_pr_description(
-    working_dir: Path,
-    paths: list[str],
-    branch: str,
-    base: str,
-) -> tuple[str, str]:
-    """Ask DeepSeek for a PR title + body. Returns ``(title, body)``.
-
-    Parses the JSON response with a tolerant fallback: if parsing fails
-    we treat the entire response as the body and synthesize a title from
-    its first non-empty line. That way we never block the user on a
-    malformed model output — they can edit either field before
-    submitting.
-    """
-    client = st.session_state.get("client")
-    if client is None:
-        return "", ""
-    diff = _diff_for_paths(working_dir, paths)
-    if not diff.strip():
-        return "", ""
-    user = (
-        f"Branch: `{branch}` -> `{base}`\n\n"
-        "Summarize the following diff into a pull-request title and body:\n\n"
-        "```diff\n" + diff + "\n```"
-    )
-    raw = generate_text(
-        client=client,
-        model=DEEPSEEK_MODEL,
-        system=PR_DESC_SYSTEM,
-        user=user,
-        max_tokens=1500,
-    )
-    if not raw:
-        return "", ""
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return str(parsed.get("title") or "").strip(), str(parsed.get("body") or "").strip()
-    except json.JSONDecodeError:
-        pass
-    # Fallback: best-effort title from the first non-empty line.
-    lines = [ln for ln in raw.splitlines() if ln.strip()]
-    title = lines[0][:80] if lines else "Untitled change"
-    return title, raw
+def _activate_chat(chat_id: str) -> None:
+    """Sidebar row callback: mark this chat as the active one."""
+    if chat_id in st.session_state.chats:
+        st.session_state.active_chat_id = chat_id
+        chats.save_active_chat_id(chat_id)
+        # Forget the dropdown-sync sentinel so the next chat-page render
+        # re-copies the chat's model / mode / working_dir into the flat
+        # ss.* keys driving the dropdowns. See app_pages/chat.py.
+        st.session_state.pop("_last_active_chat_id", None)
 
 
-def _ensure_deepseek_available() -> tuple[bool, str | None]:
-    """Verify ``DEEPSEEK_MODEL`` is in the connected account's model list."""
-    models = st.session_state.get("models") or []
-    if not models:
-        return False, "Connect to W&B Inference first (Settings tab)."
-    if DEEPSEEK_MODEL not in models:
-        return False, (
-            f"Model `{DEEPSEEK_MODEL}` is not available on this W&B "
-            "Inference account. Commit messages and PR descriptions need "
-            "DeepSeek; the rest of the push flow (commit/push) still works "
-            "if you fill in the message yourself."
-        )
-    return True, None
+def _new_chat() -> None:
+    """`+ New chat` button callback.
 
+    If a blank ``+ New chat`` placeholder already exists (default title,
+    no user / assistant turns, not archived), activates that chat instead
+    of minting another empty row — clicking the button repeatedly should
+    never accumulate a pile of identical placeholders. The reused chat
+    has its model / mode / working_dir refreshed to the user's current
+    dropdown picks so it behaves like a freshly seeded chat.
 
-@st.dialog("Push changes", width="large")
-def _push_dialog() -> None:
-    """Modal that stages, commits, and pushes the user's selected changes.
-
-    Layout (top to bottom):
-    1. Per-file checkboxes — sticky-defaulted to True so the dialog
-       opens with everything checked, matching the user's mental model
-       of "push my changes".
-    2. AI-generated commit message with a regenerate button.
-    3. Mode segmented control: push to branch vs. open a pull request.
-    4. PR-mode-only: target branch + AI-generated title and body.
-    5. Live status pane (the dialog stays open through the multi-step
-       push so the user sees progress).
-    6. Cancel + primary action button.
-
-    The push handler runs in this same function (after the primary
-    button is clicked) so we can update the status pane in place between
-    steps. On a ``pull --rebase`` conflict we close the dialog and let
-    the sidebar's merge-conflict warning take over.
+    Otherwise creates a new chat seeded with the current dropdown values.
     """
     ss = st.session_state
-    state = _git_state()
+    blank_id = chats.find_blank_chat(ss.chats)
+    if blank_id is not None:
+        existing = ss.chats[blank_id]
+        with existing._lock:
+            existing.model = ss.model or ""
+            existing.mode = ss.mode or "agent"
+            existing.working_dir = ss.working_dir or ""
+        chats.save_chat(existing)
+        ss.active_chat_id = blank_id
+        chats.save_active_chat_id(blank_id)
+        ss.pop("_last_active_chat_id", None)
+        return
+    chat = chats.new_chat(
+        model=ss.model or "",
+        mode=ss.mode or "agent",
+        working_dir=ss.working_dir or "",
+    )
+    ss.chats[chat.id] = chat
+    ss.active_chat_id = chat.id
+    chats.save_active_chat_id(chat.id)
+    ss.pop("_last_active_chat_id", None)
 
-    if not state.get("in_repo"):
-        st.error("Working directory is not a git repository.", icon=":material/error:")
-        if st.button("Close", key="push_close_not_repo"):
-            _close_push_dialog()
-            st.rerun()
+
+def _seed_default_chat() -> str:
+    """Mint a fresh chat (used when delete drains the sidebar empty).
+
+    Returns the new chat's id so the caller can immediately activate it.
+    """
+    ss = st.session_state
+    chat = chats.new_chat(
+        model=ss.model or "",
+        mode=ss.mode or "agent",
+        working_dir=ss.working_dir or "",
+    )
+    ss.chats[chat.id] = chat
+    return chat.id
+
+
+def _archive_chat(chat_id: str) -> None:
+    """Archive icon callback: flip ``archived=True``, persist, re-pick active."""
+    ss = st.session_state
+    chat = ss.chats.get(chat_id)
+    if chat is None:
+        return
+    chats.archive_chat(chat)
+    if ss.active_chat_id == chat_id:
+        # Pick the most recent non-archived survivor; if there are none
+        # left, mint a fresh chat so the chat page always has something
+        # to render against.
+        successors = _sorted_chats(archived=False)
+        if successors:
+            ss.active_chat_id = successors[0].id
+        else:
+            ss.active_chat_id = _seed_default_chat()
+        chats.save_active_chat_id(ss.active_chat_id)
+        ss.pop("_last_active_chat_id", None)
+
+
+def _unarchive_chat(chat_id: str) -> None:
+    """Unarchive icon callback: flip ``archived=False`` and surface in the live list."""
+    ss = st.session_state
+    chat = ss.chats.get(chat_id)
+    if chat is None:
+        return
+    chats.unarchive_chat(chat)
+
+
+def _open_delete_confirm(chat_id: str) -> None:
+    """Delete icon callback: stash the target id; the dialog renders next pass."""
+    st.session_state.delete_chat_confirm_id = chat_id
+
+
+@st.dialog("Delete chat?", width="small")
+def _delete_chat_dialog() -> None:
+    """Confirm modal for the per-chat delete icon.
+
+    Refuses to delete a running chat (the background thread is still
+    holding the chat's lock + its on-disk file is its only persistence
+    handle). Otherwise removes the chat from the session dict + its
+    JSON file, picks a successor active chat, and reruns.
+    """
+    ss = st.session_state
+    chat_id = ss.delete_chat_confirm_id
+    chat = ss.chats.get(chat_id) if chat_id else None
+    if chat is None:
+        ss.delete_chat_confirm_id = None
         return
 
-    branch = state.get("current_branch")
-    if not branch:
-        st.error(
-            "Cannot push from a detached HEAD. Check out a branch first.",
-            icon=":material/error:",
+    if chat.status == chats.STATUS_RUNNING:
+        st.warning(
+            "This chat is still running a turn. Wait for it to finish "
+            "before deleting.",
+            icon=":material/hourglass:",
         )
-        if st.button("Close", key="push_close_detached"):
-            _close_push_dialog()
+        if st.button("OK", width="stretch", key="delete_chat_running_ok"):
+            ss.delete_chat_confirm_id = None
             st.rerun()
         return
 
-    entries: list[git_ops.StatusEntry] = list(state.get("status") or [])
-    if not entries:
-        st.caption("Working tree is clean. Nothing to push.")
-        if st.button("Close", key="push_close_clean"):
-            _close_push_dialog()
-            st.rerun()
-        return
-
-    working_dir = Path(ss.working_dir).expanduser().resolve()
-    deepseek_ok, deepseek_msg = _ensure_deepseek_available()
-    if not deepseek_ok:
-        st.warning(deepseek_msg, icon=":material/warning:")
-
-    dlg = ss.push_dialog_state
-    dlg.setdefault("mode", "branch")
-    files_state: dict[str, bool] = dlg.setdefault("files", {})
-    for e in entries:
-        files_state.setdefault(e.path, True)
-
-    st.markdown("**Files to include**")
-    st.caption(
-        "Check the files you want to commit. Untracked files are "
-        "available to add too."
-    )
-    counts = git_ops.summary_diff_counts(
-        working_dir, [e.path for e in entries if not e.is_untracked]
-    )
-    for e in entries:
-        adds, dels = counts.get(e.path, (0, 0))
-        if e.is_untracked and adds == 0:
-            adds = git_ops.untracked_line_count(working_dir, e.path)
-        chip = f":green[+{adds}] :red[\u2212{dels}]" if (adds or dels) else ""
-        label = f"`{e.path}` {chip}".strip()
-        files_state[e.path] = st.checkbox(
-            label,
-            value=files_state.get(e.path, True),
-            key=f"push_file_chk_{e.path}",
-        )
-    checked_paths = [p for p, v in files_state.items() if v]
-
-    st.divider()
-
-    st.markdown("**Commit message**")
-    if "commit_msg" not in dlg and deepseek_ok and checked_paths:
-        with st.spinner("Asking DeepSeek for a commit message...", show_time=True):
-            try:
-                dlg["commit_msg"] = _generate_commit_message(working_dir, checked_paths)
-            except Exception as e:
-                dlg["commit_msg"] = ""
-                dlg["commit_msg_error"] = f"{type(e).__name__}: {e}"
-    msg_value = dlg.get("commit_msg") or ""
-    new_msg = st.text_area(
-        "Commit message",
-        value=msg_value,
-        key="push_commit_msg_input",
-        height=140,
-        label_visibility="collapsed",
-    )
-    dlg["commit_msg"] = new_msg
-    if dlg.get("commit_msg_error"):
-        st.caption(f":red[{dlg['commit_msg_error']}]")
-    msg_cols = st.columns([1, 4])
-    if msg_cols[0].button(
-        "Regenerate",
-        icon=":material/refresh:",
-        key="push_regen_msg_btn",
-        disabled=not (deepseek_ok and checked_paths),
+    title = chat.title or "(untitled)"
+    st.markdown(f"Delete **{title}**?")
+    st.caption("This permanently removes the chat from disk. It cannot be undone.")
+    cols = st.columns([1, 1])
+    if cols[0].button(
+        "Cancel",
         width="stretch",
+        key="delete_chat_cancel_btn",
+        icon=":material/close:",
     ):
-        with st.spinner("Asking DeepSeek for a commit message...", show_time=True):
-            try:
-                dlg["commit_msg"] = _generate_commit_message(working_dir, checked_paths)
-                dlg.pop("commit_msg_error", None)
-            except Exception as e:
-                dlg["commit_msg_error"] = f"{type(e).__name__}: {e}"
+        ss.delete_chat_confirm_id = None
+        st.rerun()
+    if cols[1].button(
+        "Delete",
+        icon=":material/delete:",
+        type="primary",
+        width="stretch",
+        key="delete_chat_confirm_btn",
+    ):
+        was_active = ss.active_chat_id == chat_id
+        try:
+            chats.delete_chat(ss.chats, chat_id)
+        except RuntimeError as e:
+            st.error(str(e), icon=":material/error:")
+            return
+        if was_active:
+            successors = _sorted_chats(archived=False)
+            if successors:
+                ss.active_chat_id = successors[0].id
+            else:
+                ss.active_chat_id = _seed_default_chat()
+            chats.save_active_chat_id(ss.active_chat_id)
+            ss.pop("_last_active_chat_id", None)
+        ss.delete_chat_confirm_id = None
         st.rerun()
 
-    st.divider()
 
-    mode_label = st.segmented_control(
-        "Mode",
-        options=["Push to branch", "Create pull request"],
-        default="Push to branch" if dlg.get("mode", "branch") == "branch" else "Create pull request",
-        key="push_mode_seg",
-    ) or "Push to branch"
-    dlg["mode"] = "pr" if mode_label == "Create pull request" else "branch"
+def _truncate(text: str, limit: int) -> str:
+    """Tail-truncate ``text`` to ``limit`` characters with a unicode ellipsis."""
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "\u2026"
 
-    if dlg["mode"] == "pr":
-        default_target = state.get("default_branch") or "main"
-        dlg.setdefault("target_branch", default_target)
-        dlg["target_branch"] = st.text_input(
-            "Target branch",
-            value=dlg.get("target_branch") or default_target,
-            key="push_pr_target_input",
+
+def _render_active_chat_body(chat: chats.Chat) -> None:
+    """The body block rendered directly under the active chat's row.
+
+    Contents (in order): the AI-generated description, and a status
+    caption when the chat is running or last-errored. The archive +
+    delete icons used to render here as a separate row but moved
+    inline into the chat row itself (see :func:`_render_chat_row`),
+    so this body now stays focused on read-only context. Branch
+    switching, fetch, new branch, and push all live in the
+    bottom-of-chat git row in ``app_pages/chat.py`` — the sidebar just
+    has to track which chat is active so the chat page points at the
+    right working directory.
+
+    Only ever called for the **active** chat; inactive live rows render
+    just the header row so a long chat list collapses cleanly.
+    """
+    description = (chat.description or "").strip()
+    if description:
+        st.caption(description)
+
+    if chat.status == chats.STATUS_ERROR and chat.error_message:
+        st.caption(f":red[:material/error: {chat.error_message}]")
+    elif chat.status == chats.STATUS_RUNNING:
+        st.caption(":material/progress_activity: Running a turn...")
+
+
+def _render_chat_row(chat: chats.Chat, *, archived: bool) -> None:
+    """One sidebar row.
+
+    Both live and archived rows share the same 3-column layout:
+    ``[main control | archive/unarchive icon | delete icon]``. Putting
+    the destructive icons inline with the main control means they're
+    reachable from any chat without first activating it, and keeps the
+    active chat's body focused on read-only context (description +
+    status caption) instead of repeating action buttons.
+
+    For **live** rows the main control is a stretched ``st.button``;
+    clicking it activates the chat (which loads its history into the
+    chat page) and, since the body only renders for the active chat,
+    simultaneously expands the row. The active row's main button is
+    rendered as ``type="primary"`` so the user can see at a glance which
+    chat the chat page is showing.
+
+    For **archived** rows the main control is plain markdown (no
+    activate affordance) — archived chats are intentionally minimized;
+    the user can unarchive to inspect detail.
+    """
+    ss = st.session_state
+    icon = _STATUS_ICON.get(chat.status, _STATUS_ICON[chats.STATUS_NEW])
+    # Cap shorter than the historic 40 chars because the title now sits
+    # in a ~75%-wide column (the icons take the other 25%) and a longer
+    # title wraps onto a second line inside the narrower button box.
+    title = _truncate(chat.title or "(untitled)", 30)
+
+    cols = st.columns([6, 1, 1], vertical_alignment="center")
+
+    if archived:
+        with cols[0]:
+            st.markdown(f"{icon} {title}")
+        with cols[1]:
+            st.button(
+                "",
+                icon=":material/unarchive:",
+                key=f"chat_unarchive_{chat.id}",
+                help="Unarchive",
+                on_click=_unarchive_chat,
+                args=(chat.id,),
+            )
+        with cols[2]:
+            st.button(
+                "",
+                icon=":material/delete:",
+                key=f"chat_delete_{chat.id}",
+                help="Delete",
+                on_click=_open_delete_confirm,
+                args=(chat.id,),
+            )
+        return
+
+    is_active = ss.active_chat_id == chat.id
+    with cols[0]:
+        st.button(
+            title,
+            icon=icon,
+            key=f"chat_row_{chat.id}",
+            type="primary" if is_active else "tertiary",
+            width="stretch",
+            on_click=_activate_chat,
+            args=(chat.id,),
             help=(
-                "Branch the pull request will merge *into*. Defaults to "
-                "the repo's detected default branch."
+                f"Status: {chat.status}"
+                + (f" · {chat.error_message}" if chat.error_message else "")
+                + ("" if is_active else " — click to load this chat's history.")
             ),
         )
-
-        if "pr_title" not in dlg and deepseek_ok and checked_paths:
-            with st.spinner("Asking DeepSeek for a PR title and body...", show_time=True):
-                try:
-                    title, body = _generate_pr_description(
-                        working_dir,
-                        checked_paths,
-                        branch,
-                        dlg["target_branch"],
-                    )
-                    dlg["pr_title"] = title
-                    dlg["pr_body"] = body
-                except Exception as e:
-                    dlg["pr_title"] = ""
-                    dlg["pr_body"] = ""
-                    dlg["pr_error"] = f"{type(e).__name__}: {e}"
-
-        dlg["pr_title"] = st.text_input(
-            "PR title",
-            value=dlg.get("pr_title") or "",
-            key="push_pr_title_input",
+    with cols[1]:
+        st.button(
+            "",
+            icon=":material/archive:",
+            key=f"chat_archive_{chat.id}",
+            help="Archive",
+            on_click=_archive_chat,
+            args=(chat.id,),
         )
-        dlg["pr_body"] = st.text_area(
-            "PR body",
-            value=dlg.get("pr_body") or "",
-            key="push_pr_body_input",
-            height=240,
+    with cols[2]:
+        st.button(
+            "",
+            icon=":material/delete:",
+            key=f"chat_delete_{chat.id}",
+            help="Delete",
+            on_click=_open_delete_confirm,
+            args=(chat.id,),
         )
-        if dlg.get("pr_error"):
-            st.caption(f":red[{dlg['pr_error']}]")
-        if st.button(
-            "Regenerate title and body",
-            icon=":material/refresh:",
-            key="push_regen_pr_btn",
-            disabled=not (deepseek_ok and checked_paths),
-        ):
-            with st.spinner("Asking DeepSeek for a PR title and body...", show_time=True):
-                try:
-                    title, body = _generate_pr_description(
-                        working_dir,
-                        checked_paths,
-                        branch,
-                        dlg["target_branch"],
-                    )
-                    dlg["pr_title"] = title
-                    dlg["pr_body"] = body
-                    dlg.pop("pr_error", None)
-                except Exception as e:
-                    dlg["pr_error"] = f"{type(e).__name__}: {e}"
-            st.rerun()
+    if is_active:
+        _render_active_chat_body(chat)
 
-    status_box = st.container(border=False)
-    last_status = dlg.get("status") or []
-    if last_status:
-        with status_box:
-            for line in last_status:
-                st.caption(line)
 
-    st.divider()
-    btn_cols = st.columns([1, 1, 2])
-    cancel_clicked = btn_cols[0].button(
-        "Cancel",
-        icon=":material/close:",
-        key="push_cancel_btn",
-        width="stretch",
-    )
-    primary_label = "Create PR" if dlg["mode"] == "pr" else "Commit and push"
-    primary_clicked = btn_cols[1].button(
-        primary_label,
-        icon=":material/upload:",
+# CSS scoped to the chat-row buttons in the sidebar. Streamlit centers
+# button labels by default (and there's no built-in alignment param —
+# tracked at https://github.com/streamlit/streamlit/issues/10770), so we
+# left-align via the documented ``st-key-<key>`` class Streamlit attaches
+# to keyed widgets. Scoped to ``[data-testid="stSidebar"]`` + the
+# ``chat_row_`` key prefix so the "New chat" action button + the
+# icon-only archive / delete / unarchive buttons keep their default
+# centering — only the chat history rows themselves shift left, which
+# is what reads naturally for a list of titles.
+_CHAT_LIST_BUTTON_CSS = (
+    "<style>"
+    '[data-testid="stSidebar"] [class*="st-key-chat_row_"] button{'
+    "justify-content:flex-start;text-align:left;"
+    "}"
+    "</style>"
+)
+
+
+def _render_chat_list_panel() -> None:
+    """The whole chat-history block: New button + live rows + Archive expander."""
+    ss = st.session_state
+    live = _sorted_chats(archived=False)
+    archived = _sorted_chats(archived=True)
+
+    st.html(_CHAT_LIST_BUTTON_CSS)
+
+    st.button(
+        "New chat",
+        icon=":material/add:",
+        key="new_chat_btn",
         type="primary",
-        key="push_primary_btn",
         width="stretch",
-        disabled=not checked_paths or not (dlg.get("commit_msg") or "").strip(),
+        on_click=_new_chat,
+        help="Start a fresh conversation. The current chat is preserved.",
     )
 
-    if cancel_clicked:
-        _close_push_dialog()
-        st.rerun()
+    for chat in live:
+        _render_chat_row(chat, archived=False)
 
-    if not primary_clicked:
-        return
-
-    status_lines: list[str] = []
-
-    def status(line: str) -> None:
-        status_lines.append(line)
-        with status_box:
-            st.caption(line)
-
-    try:
-        status(":material/playlist_add_check: Resetting staging area...")
-        git_ops.unstage_all(working_dir)
-
-        status(f":material/add: Staging {len(checked_paths)} file(s)...")
-        git_ops.stage(working_dir, checked_paths)
-
-        status(":material/save: Creating commit...")
-        git_ops.commit(working_dir, dlg["commit_msg"].strip())
-        _bump_git_nonce()
-
-        if git_ops.has_upstream(working_dir, branch):
-            status(":material/sync: Fetching upstream...")
-            try:
-                git_ops.fetch(working_dir)
-            except GitError as e:
-                # No-remote / auth failures shouldn't block push (push
-                # itself will report the same problem with a clearer
-                # message); just note it.
-                status(f":material/warning: fetch warning: {e.stderr}")
-
-            if git_ops.is_behind_upstream(working_dir):
-                status(":material/sync_alt: Branch is behind; rebasing on upstream...")
-                pull = git_ops.pull_rebase(working_dir)
-                _bump_git_nonce()
-                if not pull.ok and pull.conflict:
-                    ss.merge_conflict = {
-                        "files": pull.files,
-                        "operation": pull.operation,
-                    }
-                    status(
-                        ":material/error: Rebase produced merge conflicts. "
-                        "Closing this dialog so you can resolve them with "
-                        "DeepSeek from the sidebar warning."
-                    )
-                    dlg["status"] = status_lines
-                    _close_push_dialog()
-                    st.rerun()
-
-        status(":material/cloud_upload: Pushing to origin...")
-        push_result = git_ops.push(working_dir, branch=branch)
-        _bump_git_nonce()
-        if not push_result.ok:
-            status(f":material/error: push failed: {push_result.stderr.strip()}")
-            dlg["status"] = status_lines
-            return
-
-        if dlg["mode"] == "pr":
-            target = (dlg.get("target_branch") or "").strip() or state.get("default_branch") or "main"
-            url = git_ops.remote_compare_url(
-                working_dir,
-                branch,
-                target,
-                title=dlg.get("pr_title") or "",
-                body=dlg.get("pr_body") or "",
+    if archived:
+        with st.expander(
+            f"Archive \u00b7 {len(archived)}",
+            icon=":material/inventory_2:",
+            expanded=False,
+        ):
+            st.caption(
+                "Archived chats stay on disk but are out of the way. "
+                "Click the unarchive icon to bring one back."
             )
-            if url is None:
-                # Unknown host (self-hosted). Try to surface whatever the
-                # remote returned in stderr; otherwise tell the user to
-                # open the PR by hand.
-                fallback = git_ops.extract_pr_link_from_stderr(push_result.stderr)
-                if fallback:
-                    url = fallback
-            if url:
-                status(f":material/link: Opening PR draft: {url}")
-                try:
-                    webbrowser.open(url)
-                except Exception:
-                    pass
-                with status_box:
-                    st.success(
-                        f"Pushed `{branch}`. [Open PR draft]({url}).",
-                        icon=":material/check_circle:",
-                    )
-            else:
-                with status_box:
-                    st.success(
-                        f"Pushed `{branch}` to origin. The remote did not "
-                        "return a recognized PR-creation URL — open one "
-                        "manually on your hosting platform.",
-                        icon=":material/check_circle:",
-                    )
-            st.toast(f"Pushed `{branch}` and opened PR draft", icon=":material/check_circle:")
-        else:
-            with status_box:
-                st.success(
-                    f"Pushed `{branch}` to origin.",
-                    icon=":material/check_circle:",
-                )
-            st.toast(f"Pushed `{branch}`", icon=":material/check_circle:")
-
-    except GitError as e:
-        status(f":material/error: {e.stderr or e}")
-        dlg["status"] = status_lines
-        return
-    except Exception as e:
-        status(f":material/error: {type(e).__name__}: {e}")
-        dlg["status"] = status_lines
-        return
-
-    # Success — drop the cached state and close the dialog on the next
-    # rerun so the file-changes panel re-scans the (now-clean) tree.
-    dlg["status"] = status_lines
-    ss.push_dialog_state = {}
-    _close_push_dialog()
-    st.rerun()
+            for chat in archived:
+                _render_chat_row(chat, archived=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1094,20 +769,21 @@ def _push_dialog() -> None:
 def _render_sidebar() -> None:
     """Render the per-page sidebar chrome.
 
-    Both Settings (GitHub, theme, W&B Inference, MCP) and the chat-time
-    controls (workdir, model, mode) live on their own pages. The sidebar
-    keeps app branding and the file-changes summary — small, persistent
-    affordances that are useful from any page.
+    The sidebar is the chat-history panel plus the merge-conflict
+    warning (which is small and useful on every page). Settings,
+    workdir / model / mode controls, and per-file diffs all live on
+    their own pages — the sidebar exists to let users navigate between
+    chats without leaving whatever page they're on.
     """
     with st.sidebar:
         st.markdown("### :material/smart_toy: W&B Coding Agent")
         st.caption("A code editing agent powered by W&B Inference.")
 
+        _render_chat_list_panel()
         _render_git_warnings()
-        _render_file_changes()
 
-    if st.session_state.get("push_dialog_open"):
-        _push_dialog()
+    if st.session_state.get("delete_chat_confirm_id"):
+        _delete_chat_dialog()
 
 
 # ---------------------------------------------------------------------------
@@ -1116,6 +792,23 @@ def _render_sidebar() -> None:
 def main() -> None:
     _init_state()
     _maybe_auto_connect()
+
+    # Tighten the default ~6rem top padding Streamlit reserves above the
+    # main block container so the page title sits directly below the top
+    # navigation bar instead of being separated by a wide empty band.
+    # Applied globally (via ``main()``, not from any single page) so the
+    # rule is in effect on Chat / Diff / Usage / Settings — each page's
+    # title was visually orphaned from the nav at the default padding.
+    # Targets the documented ``[data-testid="stMainBlockContainer"]``
+    # selector so a Streamlit upgrade that changes internal class names
+    # doesn't silently regress the rule. ``app_pages/chat.py`` adds its
+    # own chat-page-specific flex/height rules on top of this; those use
+    # ``!important`` and don't conflict with this padding-only override.
+    st.html(
+        "<style>"
+        '[data-testid="stMainBlockContainer"]{padding-top:1.5rem;}'
+        "</style>"
+    )
 
     # Mount the in-app theme switcher before any page content renders. The
     # component is zero-height (``display: none``) so it doesn't affect
@@ -1130,12 +823,21 @@ def main() -> None:
     pref = st.session_state.theme_pref if st.session_state.theme_explicit else ""
     _mount_theme_switcher(pref, on_detected=_theme_detected)
 
+    # Mount the in-app font-size switcher right after the theme one. It
+    # injects a ``<style>`` tag into ``document.head`` overriding the
+    # root ``html`` font size whenever the user has picked a non-empty
+    # preference; an empty preference clears any prior override so the
+    # bundled ``baseFontSize`` config value applies. Mounted from the
+    # entry script (rather than from the Settings page) so the override
+    # is in effect on every page in the multi-page app.
+    _mount_font_size_switcher(st.session_state.font_size_pref or "")
+
     _render_sidebar()
 
     chat_page = st.Page(
         "app_pages/chat.py",
-        title="Chat",
-        icon=":material/chat:",
+        title="Agent",
+        icon=":material/auto_awesome:",
         default=True,
     )
     usage_page = st.Page(
