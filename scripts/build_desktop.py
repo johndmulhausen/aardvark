@@ -66,6 +66,7 @@ BUNDLED_MODULES: tuple[str, ...] = (
     "app_pages/chat.py",
     "app_pages/usage.py",
     "app_pages/settings.py",
+    "app_pages/docs.py",
 )
 
 # Third-party packages imported by ``BUNDLED_MODULES`` (not by

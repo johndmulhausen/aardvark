@@ -30,6 +30,7 @@ This application provides a sophisticated interface for AI-assisted coding with 
 - Sidebar **File changes** panel summarizes every successful `write_file` / `edit_file` from the conversation with cumulative +/− line counts and a per-file diff expander, so you can audit what the agent touched without scrolling back through chat history.
 - The model's reply streams in token-by-token, so you see the agent's reasoning as it's produced instead of waiting for a full response — a "Thinking..." indicator only appears between tool calls while the model is still working.
 - Every turn is automatically traced to [W&B Weave](https://docs.wandb.ai/weave/) so you get a structured timeline of inference calls, tool dispatches, latency, and token usage in your W&B workspace. Tracing uses the same API key and `team/project` you enter on Connect; if you leave the project blank, traces go to a `wandb-coding-agent` project under your default entity. The sidebar shows where traces are being written.
+- **In-app Docs tab** in the top nav (next to **Agent**, **Usage**, and **Settings**) — a plain-English user guide that walks through the Agent page, multi-chat sidebar, git push pipeline, Settings cards, and Usage dashboard. Defines every term inline at first use, so it's friendly even to users who've never touched a coding agent before. The chat page's not-yet-connected zero state links into it as the on-ramp for first-run users.
 
 ## Setup
 
@@ -87,6 +88,7 @@ Then in the app:
 4. Click **Connect** to fetch the model list.
 5. Switch to the **Chat** tab. Below the chat input, pick a **Working directory** (use the folder icon to browse, or pick a recent), a **Mode** (Agent or Ask only), and a **Model** — then start chatting.
 6. Switch to the **Usage** tab any time to see token use and dollar cost across every turn you've run.
+7. Open the **Docs** tab for an in-app reference — every screen and setting is explained in plain English, with technical terms defined inline.
 
 ## Desktop build (optional)
 
@@ -193,6 +195,7 @@ The application is organized into several specialized modules with clear respons
 - **`app_pages/chat.py`** - Chat interface with real-time agent interaction; also hosts the live working-tree diff in a "Changes" modal opened from above the chat input
 - **`app_pages/usage.py`** - Token usage and cost dashboard
 - **`app_pages/settings.py`** - User preferences and connection management
+- **`app_pages/docs.py`** - In-app user guide (the user-facing companion to `AGENTS.md`)
 
 #### Agent & Tool System
 - **`agent.py`** - Tool-calling loop with Weave tracing integration
@@ -234,10 +237,11 @@ The application is organized into several specialized modules with clear respons
 
 ## Project layout
 
-- `streamlit_app.py` — Entry point. Page config, session-state init, shared sidebar (file changes), and `st.navigation` between the chat, usage, and settings pages.
+- `streamlit_app.py` — Entry point. Page config, session-state init, shared sidebar (file changes), and `st.navigation` between the chat, usage, settings, and docs pages.
 - `app_pages/chat.py` — The chat page (history + chat input + workdir + mode/model controls). Captures token usage from each turn and persists it.
 - `app_pages/usage.py` — The usage and cost dashboard.
 - `app_pages/settings.py` — GitHub PAT verify-and-save, theme info, W&B Inference Connect / Disconnect / Forget, and the MCP servers card + add/edit dialog.
+- `app_pages/docs.py` — In-app user guide. Six tabs (Overview / Agent page / Chats / Git / Settings / Usage) written in plain English with terms defined inline at first use; the user-facing companion to `AGENTS.md`.
 - `actions.py` — Cross-page callbacks (recents, folder picker, Connect, GitHub PAT) imported by every page.
 - `chat_input.py` — Slash-command autocomplete enhancer. CCv2 component that attaches a floating dropdown to `st.chat_input` while typing `/`.
 - `theme_switcher.py` — In-app Light / Dark / System theme switcher. CCv2 component that reads/writes the `localStorage` key Streamlit's frontend reads on app boot, so the segmented control on the Settings page applies new themes via a single page reload (Streamlit has no programmatic theme API as of 1.57).

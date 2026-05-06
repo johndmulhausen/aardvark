@@ -850,8 +850,13 @@ def main() -> None:
         title="Settings",
         icon=":material/settings:",
     )
+    docs_page = st.Page(
+        "app_pages/docs.py",
+        title="Docs",
+        icon=":material/menu_book:",
+    )
     page = st.navigation(
-        [chat_page, usage_page, settings_page],
+        [chat_page, usage_page, settings_page, docs_page],
         position="top",
     )
     page.run()

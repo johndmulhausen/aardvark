@@ -1990,6 +1990,37 @@ def _sync_active_chat_settings(chat: chats.Chat) -> None:
     ss._last_active_chat_id = chat.id
 
 
+def _render_welcome_steps() -> None:
+    """The "Get started in 3 steps" three-card row.
+
+    Shared visual building block for the chat-page zero state. The
+    Docs page renders an equivalent block (see
+    :func:`app_pages.docs._render_get_started`); the two are kept
+    separate copies — they're each four lines of code, and avoiding
+    a cross-page import keeps the page module a leaf in the import
+    graph.
+    """
+    cols = st.columns(3, border=True)
+    with cols[0]:
+        st.markdown(":material/key: **1. Add your W&B API key**")
+        st.caption(
+            "Open the **Settings** tab in the top nav and paste a key "
+            "from [wandb.ai/settings](https://wandb.ai/settings)."
+        )
+    with cols[1]:
+        st.markdown(":material/folder_open: **2. Pick a folder**")
+        st.caption(
+            "Below the chat box, choose a project folder on your "
+            "computer. The agent only touches files inside that folder."
+        )
+    with cols[2]:
+        st.markdown(":material/chat: **3. Send your first message**")
+        st.caption(
+            "Ask the agent to read your code, fix a bug, or write a "
+            "new feature. You'll see every step it takes."
+        )
+
+
 def _render_not_ready(ss: Any) -> None:
     """Zero-state UI when ``ss.client`` / ``ss.model`` aren't populated.
 
@@ -2000,6 +2031,12 @@ def _render_not_ready(ss: Any) -> None:
     - The startup auto-connect ran but failed (expired key, network
       blip). Surface the error and offer a one-click **Reconnect**
       button so the user can retry without leaving this page.
+
+    The visual is a single bordered welcome card with a friendly
+    headline, a one-paragraph plain-English pitch, a three-card "Get
+    started" row, and (only when relevant) a status banner + Reconnect
+    button. Copy throughout follows the same plain-language voice as
+    the in-app **Docs** tab.
 
     Note: this branch should NOT fire just because the user navigated
     away from the chat page and back — the chat page's model/mode
@@ -2012,35 +2049,52 @@ def _render_not_ready(ss: Any) -> None:
     has_saved_key = bool((ss.api_key or "").strip())
     error = ss.get("connect_error")
 
-    if not has_saved_key:
-        st.info(
-            "Open the **Settings** tab in the top nav, paste your W&B API key, "
-            "and click **Connect** to get started.",
-            icon=":material/settings:",
+    with st.container(border=True):
+        st.markdown(":material/smart_toy: ### Welcome to the W&B Coding Agent")
+        st.markdown(
+            "This is a coding assistant powered by AI models you choose. "
+            "Point it at a folder on your computer, ask a question, and "
+            "it will read your code, suggest changes, run commands, and "
+            "show you exactly what it did."
         )
-        return
 
-    if error:
-        st.warning(
-            f"Auto-connect failed: {error}",
-            icon=":material/sync_problem:",
+        st.markdown("**Get started in 3 steps**")
+        _render_welcome_steps()
+
+        if not has_saved_key:
+            st.markdown(
+                "Open the **Settings** tab in the top nav, paste your "
+                "W&B API key, and click **Connect** to get going. New to "
+                "the app? The **Docs** tab walks through every screen in "
+                "plain English."
+            )
+            return
+
+        # Past this point the user has a saved key — either auto-connect
+        # is still in flight, or it ran and hit an error. Surface
+        # whichever applies and offer a one-click Reconnect.
+        if error:
+            st.warning(
+                f"We couldn't connect with your saved API key. {error} "
+                "Try **Reconnect**, or update your key in the Settings tab.",
+                icon=":material/sync_problem:",
+            )
+        else:
+            st.info(
+                "Connecting to W&B Inference with your saved API key...",
+                icon=":material/sensors:",
+            )
+        st.button(
+            "Reconnect",
+            icon=":material/link:",
+            type="primary",
+            on_click=actions.on_connect,
+            help="Retry the W&B Inference connection from this page.",
         )
-    else:
-        st.info(
-            "Connecting to W&B Inference with your saved API key...",
-            icon=":material/sensors:",
+        st.caption(
+            "Or open the **Settings** tab to update your API key, switch "
+            "projects, or sign out. The **Docs** tab has more help."
         )
-    st.button(
-        "Reconnect",
-        icon=":material/link:",
-        type="primary",
-        on_click=actions.on_connect,
-        help="Retry the W&B Inference connection from this page.",
-    )
-    st.caption(
-        "Or open the **Settings** tab to update your API key, switch projects, "
-        "or sign out."
-    )
 
 
 def _render_empty_chat_hint(chat: chats.Chat) -> None:
