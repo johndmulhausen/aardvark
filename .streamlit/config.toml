@@ -1,0 +1,20 @@
+# Streamlit configuration for the W&B Coding Agent.
+#
+# This file is loaded automatically by Streamlit when it is launched from the
+# project root (i.e. `streamlit run streamlit_app.py`). It is the source of
+# truth for the local-dev experience.
+#
+# The packaged desktop build does NOT read this file (the bundled app's cwd at
+# launch is the user's home / `/`, not this directory), so the same options
+# are also passed via `--streamlit-options` from `scripts/build_desktop.py`.
+# Keep the two lists in sync.
+
+[client]
+# Hide the hamburger menu and "Deploy" button so the app looks like a desktop
+# tool rather than a hosted Streamlit instance. Options: "auto", "developer",
+# "viewer", "minimal".
+toolbarMode = "minimal"
+
+[browser]
+# This is a personal-use coding tool; do not phone home with telemetry.
+gatherUsageStats = false

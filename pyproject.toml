@@ -8,6 +8,14 @@ dependencies = [
     "openai>=1.40.0",
 ]
 
+[project.optional-dependencies]
+# Build-time-only dependencies for `scripts/build_desktop.py`. Install via
+# `pip install -e '.[desktop]'` (or the uv equivalent) into a separate
+# Python 3.12 venv: streamlit-desktop-app 0.3.4 caps Python at 3.12.
+desktop = [
+    "streamlit-desktop-app>=0.3.4",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -6,9 +6,11 @@ Authoritative guide for AI coding agents working in this repository. Read this f
 
 A locally-run Streamlit desktop app that turns any model served by the [W&B Inference](https://docs.wandb.ai/inference) service into a tool-calling code editing agent. The user supplies their W&B API key, picks a model from the live `/v1/models` list, points the agent at a working directory on disk, and chats with it. The agent autonomously calls a small set of tools (`list_files`, `read_file`, `write_file`, `edit_file`, optional `run_shell`) to read and modify code, with arguments and unified diffs shown inline in the chat for full transparency.
 
+The app ships in two equivalent forms: directly via `streamlit run streamlit_app.py` for development, and as a packaged desktop application built by [`scripts/build_desktop.py`](scripts/build_desktop.py) (a `.app` on macOS, an "onedir" launcher on Linux/Windows). Both render through the same `streamlit_app.py` entry point.
+
 ## Module map - read this before adding files
 
-There are exactly four Python modules. Each has a single responsibility. **Do not create new top-level modules without first re-reading this section and confirming the change does not duplicate existing functionality. If you add a module, document it here in the same edit.**
+There are exactly four runtime Python modules (`streamlit_app.py`, `agent.py`, `tools.py`, `wb_client.py`), plus the build script and the Streamlit config file. Each row below has a single responsibility. **Do not create new top-level modules without first re-reading this section and confirming the change does not duplicate existing functionality. If you add a module, document it here in the same edit.**
 
 | File | Responsibility | Do NOT |
 | --- | --- | --- |
@@ -16,6 +18,8 @@ There are exactly four Python modules. Each has a single responsibility. **Do no
 | [`agent.py`](agent.py) | The tool-calling loop. Exports `run_agent_turn(...)`, a generator that yields `tool_call`, `tool_result`, `assistant_text`, and `error` events. Owns the system prompt and conversation-message bookkeeping. | Call `st.*` from here. Add Streamlit imports. Touch the filesystem directly. |
 | [`tools.py`](tools.py) | OpenAI-format tool schemas (`TOOL_SCHEMAS`) and their sandboxed executors. Owns the `ToolContext` dataclass and the `dispatch(name, args_json, ctx)` entry point. All path containment checks live here. | Call the LLM. Import `streamlit`. |
 | [`wb_client.py`](wb_client.py) | Thin wrapper around the OpenAI SDK pointed at `https://api.inference.wandb.ai/v1`. Exports `make_client(api_key, project=None)` and `list_models(client)`. | Add caching, retries, or any product logic. Keep it boring. |
+| [`scripts/build_desktop.py`](scripts/build_desktop.py) | Build entry point for the packaged desktop app. Wraps `streamlit-desktop-app build` with our pinned PyInstaller options (`--windowed`, bundled-module `--add-data` flags, `--collect-all openai`) and the runtime Streamlit options that match `.streamlit/config.toml`. | Add product logic. Import the app modules. |
+| [`.streamlit/config.toml`](.streamlit/config.toml) | Streamlit options for the local-dev workflow (`streamlit run streamlit_app.py`). Hides the toolbar / Deploy button and disables telemetry. **Mirror in `STREAMLIT_OPTIONS` in `scripts/build_desktop.py`** because the bundled `.app`'s cwd at launch is `/`, not the project root, so this file is not read at runtime in packaged builds. | Drift from the build script. |
 
 The constant `WB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"` lives in `wb_client.py`. **Do not hard-code that URL anywhere else.**
 
@@ -126,6 +130,8 @@ Before creating any new file or function, verify:
 - [ ] Am I about to read or write the user's filesystem outside `tools.py`? Stop. Add a tool instead.
 - [ ] Am I about to call `client.chat.completions.create` outside `agent.py`? Stop. Extend `run_agent_turn` instead.
 - [ ] Am I creating a new state key in `st.session_state`? Update `_init_state` **and** the session-state table above.
+- [ ] Am I changing a Streamlit runtime option? Update **both** `.streamlit/config.toml` and `STREAMLIT_OPTIONS` in `scripts/build_desktop.py`.
+- [ ] Am I adding a new top-level Python module or third-party package? Update `BUNDLED_MODULES` / `COLLECT_ALL_PACKAGES` in `scripts/build_desktop.py` so the packaged build still imports it.
 
 ## Running and verifying
 
@@ -149,6 +155,36 @@ To exercise write/edit/read end-to-end against a temp directory, see the verific
 
 When testing the live UI, the browser MCP can be used to render the running app at `http://localhost:8501` and inspect the snapshot. The empty-state path ("Enter your W&B API key and click Connect") is the canonical first-render check.
 
+## Desktop build
+
+The repo ships a packaged desktop app on top of [`streamlit-desktop-app`](https://pypi.org/project/streamlit-desktop-app/). The build pipeline is owned by [`scripts/build_desktop.py`](scripts/build_desktop.py); do not invoke `streamlit-desktop-app build` directly. Architecture at runtime:
+
+- The packaged binary spawns Streamlit on a random localhost port (headless).
+- `pywebview` opens a native window pointed at that URL (WKWebView on macOS).
+- The user-visible window is therefore the same Streamlit UI, with the toolbar suppressed via `client.toolbarMode = "minimal"`.
+
+Build prerequisites:
+
+- Use a CPython 3.12 interpreter; `streamlit-desktop-app` 0.3.4 caps Python at 3.12.
+- Install the build extras into a separate venv (e.g. `uv venv --python 3.12 .venv-build && uv pip install -e '.[desktop]'`).
+
+Build invocation (from repo root, with the build venv active):
+
+```bash
+python scripts/build_desktop.py
+```
+
+Output:
+
+- macOS: `dist/WB Coding Agent.app` (real `.app` bundle; drag to `/Applications`). Unsigned, so first launch needs right-click → Open or `xattr -d com.apple.quarantine`.
+- Linux / Windows: `dist/WB Coding Agent/` (PyInstaller onedir layout). Distribute as a zip.
+
+When adding a new top-level Python module imported by `streamlit_app.py`, append it to `BUNDLED_MODULES` in `scripts/build_desktop.py`. When adding a new third-party dependency that is only imported transitively from a bundled module, append it to `COLLECT_ALL_PACKAGES`. PyInstaller's static import graph cannot see imports inside files added via `--add-data`, so this manual step is unavoidable.
+
+When changing any Streamlit runtime option, update **both** `.streamlit/config.toml` (for local dev) **and** `STREAMLIT_OPTIONS` in `scripts/build_desktop.py` (for packaged builds). The two are not auto-synced because the bundled app cannot read the config file at runtime.
+
+Out of scope for the desktop build today: code signing, notarization, auto-update. The artifact is intended for the user's own machine; if you ship it externally, expect Gatekeeper friction.
+
 ## Out of scope (intentional)
 
 These are explicitly **not** part of v1. If a future request asks for one of these, treat it as a new feature, design it deliberately, and update this section once it lands:
@@ -157,7 +193,8 @@ These are explicitly **not** part of v1. If a future request asks for one of the
 - Multi-tab or multi-project sessions.
 - Streaming the final assistant message via `st.write_stream` (the loop is non-streaming because partial-tool-call parsing is fragile across providers).
 - Per-tool click-to-approve UI. Current safety model: file ops auto-approve and show diffs; shell is opt-in via toggle.
-- Packaging as a true desktop binary (e.g. via `pywebview` or `streamlit-desktop-app`). Today the "desktop" experience is `streamlit run streamlit_app.py`.
+- Code signing, notarization, and auto-update for the desktop build (see "Desktop build" above for the current unsigned-distribution caveats).
+- Hosted multi-tenant deployment (Streamlit Community Cloud, etc.). The agent's tools mutate the working directory; on a hosted server that directory is shared between visitors. Designing this safely would require per-session sandboxes and is intentionally not v1.
 
 ## Updating this file
 

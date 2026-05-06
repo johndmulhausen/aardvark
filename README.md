@@ -41,6 +41,26 @@ Then in the app:
 3. Click **Connect** to fetch the model list.
 4. Pick a model, set your working directory, and start chatting.
 
+## Desktop build (optional)
+
+If you'd rather launch the agent as a real desktop app instead of typing `streamlit run` every time, you can build a packaged binary that wraps the same Streamlit UI in a native window via [`streamlit-desktop-app`](https://pypi.org/project/streamlit-desktop-app/) + `pywebview`.
+
+Use a separate Python 3.12 build environment — the packager only supports CPython 3.9–3.12:
+
+```bash
+uv venv --python 3.12 .venv-build
+source .venv-build/bin/activate
+uv pip install -e '.[desktop]'
+python scripts/build_desktop.py
+```
+
+Output by platform:
+
+- **macOS**: `dist/WB Coding Agent.app` (real `.app` bundle). Drag it to `/Applications`. The build is unsigned, so the first launch will be blocked by Gatekeeper — right-click → **Open**, or run `xattr -d com.apple.quarantine "dist/WB Coding Agent.app"` once.
+- **Linux / Windows**: `dist/WB Coding Agent/` (a folder with the launcher binary inside). Zip and ship.
+
+The packaged app hides Streamlit's hamburger menu and "Deploy" button so it looks like a desktop tool, not a hosted web app. The same options live in [`.streamlit/config.toml`](.streamlit/config.toml) for the `streamlit run` workflow.
+
 ## Safety
 
 - All file paths are resolved against the working directory; paths that escape the directory are rejected.
@@ -54,3 +74,5 @@ Then in the app:
 - `agent.py` — Tool-calling agent loop.
 - `tools.py` — Tool schemas and sandboxed executors.
 - `wb_client.py` — OpenAI-client wrapper for W&B Inference.
+- `scripts/build_desktop.py` — Packaged-desktop-app build script.
+- `.streamlit/config.toml` — Streamlit runtime options for local dev (mirrored in the build script for packaged builds).
