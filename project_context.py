@@ -1,9 +1,9 @@
-"""Auto-detect AGENTS.md, .cursor/rules, and .cursor/skills in the working dir.
+"""Auto-detect AGENTS.md, ``.cursor/rules``, and ``SKILL.md`` files.
 
 This module is the single source of truth for "what guidance does this
-project expose to the agent?". It scans the working directory (and the
-user's ``~/.cursor/skills``) for known guidance files, decides which to
-inject into the system prompt for a given turn, and produces both:
+project expose to the agent?". It scans the working directory (plus the
+user's home for global skills) for known guidance files, decides which
+to inject into the system prompt for a given turn, and produces both:
 
 - a system-prompt addendum string (for ``agent.py``), and
 - a UI-friendly summary dict (for ``streamlit_app.py``).
@@ -15,9 +15,11 @@ Two categories of guidance:
    ``.cursor/rules/*.mdc``. Their full content (capped) is appended to the
    system prompt on every turn.
 
-2. **Conditionally loaded.** Workspace ``.cursor/skills/**/SKILL.md`` and
-   user ``~/.cursor/skills/**/SKILL.md``. Only loaded when one of two
-   triggers fires:
+2. **Conditionally loaded.** ``SKILL.md`` files under any of the recognized
+   skill directories — :data:`SKILL_ROOT_SUBPATHS` covers both Cursor's
+   ``.cursor/skills`` convention and Anthropic's ``.claude/skills``
+   convention, scanned at both workspace (``<wd>/<sub>``) and user
+   (``~/<sub>``) scope. Only loaded when one of two triggers fires:
    - **Slash command** — the user typed ``/<slug>`` anywhere in their
      message. Always wins, never gated by the per-turn cap.
    - **Keyword match** — the user's message contains a phrase mined from
@@ -62,6 +64,19 @@ AGENT_GUIDE_FILENAMES: tuple[str, ...] = (
     "AGENTS.md",
     "CLAUDE.md",
     "CONVENTIONS.md",
+)
+
+# Subpaths under both the working directory and ``~`` we scan for
+# ``SKILL.md`` files. ``.cursor/skills`` is Cursor's convention;
+# ``.claude/skills`` is the matching path Anthropic's Claude Code / Claude
+# Skills documentation uses. Supporting both at workspace and user scope
+# means a project that was set up against either tool "just works"
+# without renaming. Iteration order also defines collision precedence
+# within a scope (first-occurrence wins), so ``.cursor/skills`` takes
+# priority over ``.claude/skills`` if a project has both.
+SKILL_ROOT_SUBPATHS: tuple[Path, ...] = (
+    Path(".cursor") / "skills",
+    Path(".claude") / "skills",
 )
 
 # Slash-command regex. A slug must start with a letter or digit, may
@@ -336,6 +351,28 @@ def _scan_cursor_rules(working_dir: Path) -> list[GuidanceFile]:
     return out
 
 
+def _scan_skills_in_base(
+    base: Path,
+    scope: Literal["workspace", "user"],
+) -> list[Skill]:
+    """Scan every :data:`SKILL_ROOT_SUBPATHS` directory under ``base``.
+
+    Returns a single de-duplicated list (first-occurrence wins on slug
+    collisions, matching ``SKILL_ROOT_SUBPATHS`` order). This is what
+    lets a project drop SKILL.md files into either ``.cursor/skills`` or
+    ``.claude/skills`` (or both) and have them all surface to the agent.
+    """
+    out: list[Skill] = []
+    seen: set[str] = set()
+    for sub in SKILL_ROOT_SUBPATHS:
+        for skill in _scan_skills(base / sub, scope):
+            if skill.slug in seen:
+                continue
+            seen.add(skill.slug)
+            out.append(skill)
+    return out
+
+
 def _scan_skills(root: Path, scope: Literal["workspace", "user"]) -> list[Skill]:
     """Find every ``SKILL.md`` under ``root``.
 
@@ -398,8 +435,8 @@ def scan(working_dir: Path) -> ProjectContext:
 
     ctx.agents_md = _scan_agent_guides(working_dir)
     ctx.cursor_rules = _scan_cursor_rules(working_dir)
-    ctx.workspace_skills = _scan_skills(working_dir / ".cursor" / "skills", "workspace")
-    user_skills = _scan_skills(Path.home() / ".cursor" / "skills", "user")
+    ctx.workspace_skills = _scan_skills_in_base(working_dir, "workspace")
+    user_skills = _scan_skills_in_base(Path.home(), "user")
 
     slug_index: dict[str, Skill] = {}
     for skill in ctx.workspace_skills:

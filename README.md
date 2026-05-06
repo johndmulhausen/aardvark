@@ -5,7 +5,7 @@ A local Streamlit app that turns any [W&B Inference](https://docs.wandb.ai/infer
 ## Features
 
 - Bring your own W&B API key. By default it's session-only; tick **Remember on this machine** in the settings popover and it persists to `~/.wb_coding_agent/credentials.json` (mode 0600) so future launches connect automatically.
-- **Settings tab in the top nav** — verify a GitHub Personal Access Token (your GitHub avatar then renders in the page header and the agent commits as you), see the active theme + a pointer to Streamlit's built-in light/dark/system toggle, and connect to W&B Inference with optional opt-in API-key persistence.
+- **Settings tab in the top nav** — verify a GitHub Personal Access Token (your GitHub avatar then renders in the page header and the agent commits as you), pick the app theme from a **System / Light / Dark** segmented control (the page reloads once to apply your choice; the preference persists across sessions), and connect to W&B Inference with optional opt-in API-key persistence.
 - **Usage and cost dashboard** as a separate page — KPI cards for today / 7-day token use and dollar cost, daily token volume + cost line charts, cost-by-model bar chart, and a recent-turns table. Driven by live `usage` chunks the W&B Inference service emits during each streamed completion, priced via the per-model rates published at [wandb.ai/site/pricing/inference](https://wandb.ai/site/pricing/inference). Persisted to `~/.wb_coding_agent/usage.jsonl` so the data survives restarts.
 - Live-fetched model list from `https://api.inference.wandb.ai/v1/models`, with descriptions from the W&B docs — pick whichever model you want to code with from the dropdown below the chat input.
 - Two modes: **Agent** (full read/write/edit, plus optional shell) and **Ask only** (read-only — the model can list and read files but cannot modify the project).
@@ -13,7 +13,7 @@ A local Streamlit app that turns any [W&B Inference](https://docs.wandb.ai/infer
 - File tools: `list_files`, `read_file`, `write_file`, `edit_file`.
 - `run_shell` tool runs commands inside the working directory with a 30-second timeout (Agent mode only).
 - **MCP server support** — connect any number of [Model Context Protocol](https://modelcontextprotocol.io/) servers (stdio subprocesses or remote streamable-HTTP URLs) via the sidebar. Their tools are namespaced as `mcp__<server>__<tool>` and joined to the local tool list, so the model sees one combined toolbox. Configs persist to `~/.wb_coding_agent/mcp.json` (mode 0600).
-- **Project context auto-injection** — at the start of every turn we scan the working directory for `AGENTS.md` / `CLAUDE.md` / `CONVENTIONS.md` and `.cursor/rules/*.mdc` and splice them into the system prompt; we also detect `.cursor/skills/**/SKILL.md` (workspace) and `~/.cursor/skills/**/SKILL.md` (user-level), surface them as `/<slug>` slash commands, and auto-load any whose trigger keywords match the user's message. A popover next to the Mode/Model selectors (below the chat input) lists every available slash command.
+- **Project context auto-injection** — at the start of every turn we scan the working directory for `AGENTS.md` / `CLAUDE.md` / `CONVENTIONS.md` and `.cursor/rules/*.mdc` and splice them into the system prompt; we also detect `SKILL.md` files under either `.cursor/skills/**/` or `.claude/skills/**/` (workspace) and `~/.cursor/skills/**/` or `~/.claude/skills/**/` (user-level), surface them as `/<slug>` slash commands, and auto-load any whose trigger keywords match the user's message. A popover next to the Mode/Model selectors (below the chat input) lists every available slash command.
 - **Slash-command autocomplete** — type `/` in the chat input and a floating, keyboard-navigable dropdown of available skills appears; arrow keys to navigate, Tab/Enter to insert, Escape to dismiss. The dropdown filters as you type and inherits your Streamlit theme.
 - Every tool call is shown inline with arguments and a unified diff for writes/edits.
 - Sidebar **File changes** panel summarizes every successful `write_file` / `edit_file` from the conversation with cumulative +/− line counts and a per-file diff expander, so you can audit what the agent touched without scrolling back through chat history.
@@ -77,7 +77,7 @@ Output by platform:
 - **macOS**: `dist/WB Coding Agent.app` (real `.app` bundle). Drag it to `/Applications`. The build is unsigned, so the first launch will be blocked by Gatekeeper — right-click → **Open**, or run `xattr -d com.apple.quarantine "dist/WB Coding Agent.app"` once.
 - **Linux / Windows**: `dist/WB Coding Agent/` (a folder with the launcher binary inside). Zip and ship.
 
-The packaged app hides Streamlit's hamburger menu and "Deploy" button so it looks like a desktop tool, not a hosted web app. The same options live in [`.streamlit/config.toml`](.streamlit/config.toml) for the `streamlit run` workflow.
+The packaged app hides Streamlit's toolbar entirely (hamburger menu, Settings, Deploy button) so it reads as a self-contained desktop tool rather than a hosted web app. The Light / Dark / System toggle lives on the in-app **Settings** tab instead. The same options live in [`.streamlit/config.toml`](.streamlit/config.toml) for the `streamlit run` workflow.
 
 ## MCP servers
 
@@ -106,7 +106,7 @@ To make the agent more reliable in your project, drop guidance files where it ex
 
 - `AGENTS.md`, `CLAUDE.md`, or `CONVENTIONS.md` at the working-directory root — fully injected into the system prompt on every turn (capped at 12k chars each).
 - `.cursor/rules/*.mdc` — fully injected on every turn (capped at 4k chars each).
-- `.cursor/skills/**/SKILL.md` (workspace) and `~/.cursor/skills/**/SKILL.md` (user-level) — **conditionally loaded** based on either:
+- `.cursor/skills/**/SKILL.md` or `.claude/skills/**/SKILL.md` (workspace) and `~/.cursor/skills/**/SKILL.md` or `~/.claude/skills/**/SKILL.md` (user-level) — **conditionally loaded** based on either:
   - **Slash command**: type `/<skill-slug>` anywhere in your message to force-load the skill for that turn (e.g. `/building-streamlit-chat-ui can you wire this up?`). Typing `/` opens the autocomplete dropdown directly over the chat input, or open the **Skills popover** below the chat input for the full list.
   - **Keyword match**: each SKILL.md's frontmatter `description` is mined for trigger phrases (or you can add a `Triggers: a, b, c` line). When your message contains a trigger, the skill auto-loads. Up to 5 keyword-matched skills load per turn (each capped at 6k chars).
 
@@ -122,7 +122,7 @@ The **Settings** tab in the top nav manages everything per-user. The flow:
   - `repo` — only if you want to grant the agent push access to repositories under your control. This isn't required for verification or for stamping commit authorship.
 
   Paste the PAT, click **Verify and save**, and the app calls GitHub's `/user` endpoint to confirm the token + pull your username, email, and avatar. The PAT is stored in `~/.wb_coding_agent/credentials.json` (mode 0600), the non-secret identity fields in `~/.wb_coding_agent/preferences.json`. When you chat in a directory that's a git repo, the agent runs `git config --local user.name`/`user.email` so commits it makes via `run_shell` are authored as you.
-- **Theme.** The Settings page surfaces the active theme (read via `st.context.theme.base`) and points at the toolbar's Settings menu (the **⋮** at the top-right of the page) for the actual Light / Dark / System toggle, since that's the only place Streamlit lets the theme change at runtime. Your choice is persisted by Streamlit itself across sessions.
+- **Theme.** A **System / Light / Dark** segmented control on the Settings page is the canonical theme toggle for this app. Picking a value writes the preference to `~/.wb_coding_agent/preferences.json` and reloads the page once so the new theme applies. **System** follows your operating system's light / dark setting. Streamlit's own toolbar Settings menu is hidden in this app — the in-app switcher is the only theme control you'll see.
 - **W&B Inference connection.** API key + optional `team/project` + Connect button. Tick **Remember on this machine** to persist the API key (mode 0600); leave it unchecked for the original session-only behavior.
 
 ## Usage and cost
@@ -149,19 +149,20 @@ To capture this data the app passes `stream_options={"include_usage": True}` on 
 
 ## Project layout
 
-- `streamlit_app.py` — Entry point. Page config, session-state init, shared sidebar (file changes + clear chat), and `st.navigation` between the chat, usage, and settings pages.
+- `streamlit_app.py` — Entry point. Page config, session-state init, shared sidebar (file changes), and `st.navigation` between the chat, usage, and settings pages.
 - `app_pages/chat.py` — The chat page (history + chat input + workdir + mode/model controls). Captures token usage from each turn and persists it.
 - `app_pages/usage.py` — The usage and cost dashboard.
 - `app_pages/settings.py` — GitHub PAT verify-and-save, theme info, W&B Inference Connect / Disconnect / Forget, and the MCP servers card + add/edit dialog.
 - `actions.py` — Cross-page callbacks (recents, folder picker, Connect, GitHub PAT) imported by every page.
 - `chat_input.py` — Slash-command autocomplete enhancer. CCv2 component that attaches a floating dropdown to `st.chat_input` while typing `/`.
+- `theme_switcher.py` — In-app Light / Dark / System theme switcher. CCv2 component that reads/writes the `localStorage` key Streamlit's frontend reads on app boot, so the segmented control on the Settings page applies new themes via a single page reload (Streamlit has no programmatic theme API as of 1.57).
 - `agent.py` — Tool-calling agent loop. Decorated with `@weave.op` so each turn is a single Weave trace. Streams with `stream_options={"include_usage": True}` so the dashboard has token counts to render.
 - `tools.py` — Tool schemas and sandboxed executors. `dispatch` is decorated with `@weave.op(kind="tool")`.
 - `wb_client.py` — OpenAI-client wrapper for W&B Inference, plus the Weave bootstrap (`init_weave`).
 - `mcp_servers.py` — MCP runtime: `ServerConfig`, the registry singleton, the daemon-thread asyncio loop that owns every live MCP session, and the on-disk config at `~/.wb_coding_agent/mcp.json`. `dispatch` is decorated with `@weave.op(kind="tool")`.
-- `project_context.py` — Auto-detects `AGENTS.md` / `CLAUDE.md` / `CONVENTIONS.md`, `.cursor/rules`, and `.cursor/skills` and selects which guidance to splice into each turn's system prompt.
+- `project_context.py` — Auto-detects `AGENTS.md` / `CLAUDE.md` / `CONVENTIONS.md`, `.cursor/rules`, and `SKILL.md` files under both `.cursor/skills/` and `.claude/skills/`, and selects which guidance to splice into each turn's system prompt.
 - `models.py` — Single source of truth for model display labels, descriptions, context windows, parameter counts, and per-million-token pricing.
-- `account.py` — GitHub PAT verification, opt-in W&B API key persistence, theme/avatar preferences. Pure stdlib.
+- `account.py` — GitHub PAT verification, opt-in W&B API key persistence, theme + avatar preferences. Pure stdlib.
 - `usage.py` — Token-usage capture, cost compute, and aggregation. Owns `~/.wb_coding_agent/usage.jsonl`.
 - `scripts/build_desktop.py` — Packaged-desktop-app build script.
 - `scripts/build_desktop.sh` — Bootstrap wrapper that creates / re-syncs the build venv, then invokes `build_desktop.py`.

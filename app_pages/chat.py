@@ -35,11 +35,13 @@ from typing import Any
 import streamlit as st
 
 import account
+import git_ops
 import mcp_servers
 import project_context
 import usage as usage_log
 from agent import run_agent_turn
 from chat_input import mount_slash_autocomplete
+from git_ops import GitError
 from models import MODEL_METADATA, model_label
 
 TOOL_ICONS = {
@@ -287,8 +289,14 @@ def _maybe_apply_git_identity(working_dir: Path) -> None:
         applied.add(key)
 
 
-def _run_turn(prompt: str) -> None:
-    """Drive one chat turn: stream events, render live, persist usage."""
+def _run_turn(prompt: str, *, override_model: str | None = None) -> None:
+    """Drive one chat turn: stream events, render live, persist usage.
+
+    ``override_model`` lets callers (notably the merge-conflict
+    resolution handoff from ``streamlit_app.py``) pin a specific model
+    for this turn without having to mutate ``ss.model``. When ``None``
+    we use the user's selected model from the model dropdown as before.
+    """
     ss = st.session_state
     ss.messages.append({"role": "user", "content": prompt})
     ss.ui_turns.append({"role": "user", "content": prompt})
@@ -300,7 +308,8 @@ def _run_turn(prompt: str) -> None:
 
     working_dir = Path(ss.working_dir).expanduser().resolve()
     _maybe_apply_git_identity(working_dir)
-    short_model = ss.model.split("/")[-1] if ss.model else ""
+    turn_model = override_model or ss.model
+    short_model = turn_model.split("/")[-1] if turn_model else ""
 
     # Per-turn usage accumulator. The agent yields one ``usage`` event per
     # inference round (a turn with N tool-calling rounds has N rounds); we
@@ -342,7 +351,7 @@ def _run_turn(prompt: str) -> None:
         try:
             events_iter = run_agent_turn(
                 client=ss.client,
-                model=ss.model,
+                model=turn_model,
                 messages=ss.messages,
                 working_dir=working_dir,
                 mode=ss.mode,
@@ -422,10 +431,10 @@ def _run_turn(prompt: str) -> None:
         # Persist + render the per-turn usage summary if any inference call
         # produced token counts. Skip when zero (means the turn errored
         # before any model call landed).
-        if turn_usage["total_tokens"] > 0 and ss.model:
+        if turn_usage["total_tokens"] > 0 and turn_model:
             duration = time.monotonic() - turn_started
             entry = usage_log.build_entry(
-                model=ss.model,
+                model=turn_model,
                 prompt_tokens=turn_usage["prompt_tokens"],
                 completion_tokens=turn_usage["completion_tokens"],
                 total_tokens=turn_usage["total_tokens"],
@@ -564,6 +573,38 @@ def _render_skills_popover(working_dir: str) -> None:
             st.markdown(f"`/{slug}` {badge} \u2014 {desc}")
 
 
+def _on_branch_change() -> None:
+    """Selectbox callback: ``git checkout`` to the chosen branch.
+
+    Refuses (with a toast + revert) when the working tree is dirty —
+    silent loss of in-flight work would be the opposite of what the
+    branch switcher is for. Bumps the git-state nonce so the file
+    changes panel re-scans against the new branch on the next rerun.
+    """
+    ss = st.session_state
+    chosen = ss.get("git_branch_select")
+    if not chosen or chosen == ss.get("_git_active_branch"):
+        return
+    working_dir = Path(ss.working_dir).expanduser().resolve()
+    try:
+        if git_ops.working_tree_dirty(working_dir):
+            st.toast(
+                "Cannot switch branches with uncommitted changes. "
+                "Commit or stash first.",
+                icon=":material/warning:",
+            )
+            ss.git_branch_select = ss.get("_git_active_branch")
+            return
+        git_ops.checkout(working_dir, chosen)
+    except GitError as e:
+        st.toast(f"git checkout failed: {e.stderr}", icon=":material/error:")
+        ss.git_branch_select = ss.get("_git_active_branch")
+        return
+    ss._git_active_branch = chosen
+    ss.git_state_nonce = int(ss.get("git_state_nonce") or 0) + 1
+    st.toast(f"Switched to `{chosen}`", icon=":material/check_circle:")
+
+
 def _render_workdir_controls() -> None:
     ss = st.session_state
 
@@ -574,11 +615,23 @@ def _render_workdir_controls() -> None:
         if d not in wd_options:
             wd_options.append(d)
 
-    # Three-up row: workdir selectbox + "Browse" + "Start a new project". The
-    # last button opens a modal that creates a directory, runs ``git init``,
-    # and optionally wires an upstream remote (paste / clone / create on
-    # GitHub) — see ``_new_project_dialog`` below.
-    wd_cols = st.columns([10, 1, 1], vertical_alignment="bottom")
+    # Probe the working dir for git state once per render. When it's a
+    # repo we widen the row to include a branch switcher; otherwise we
+    # keep the prior 3-column layout (workdir + browse + new-project).
+    working_dir_path = (
+        Path(ss.working_dir).expanduser() if ss.working_dir else None
+    )
+    git_repo = bool(
+        working_dir_path
+        and working_dir_path.is_dir()
+        and git_ops.is_git_repo(working_dir_path)
+    )
+
+    if git_repo:
+        wd_cols = st.columns([6, 4, 1, 1], vertical_alignment="bottom")
+    else:
+        wd_cols = st.columns([10, 1, 1], vertical_alignment="bottom")
+
     with wd_cols[0]:
         st.selectbox(
             "Working directory",
@@ -595,7 +648,48 @@ def _render_workdir_controls() -> None:
                 "icon to start a new project."
             ),
         )
-    with wd_cols[1]:
+
+    if git_repo:
+        with wd_cols[1]:
+            try:
+                branches = git_ops.list_branches(working_dir_path)
+                current = git_ops.current_branch(working_dir_path)
+            except GitError:
+                branches = []
+                current = None
+            options = list(branches)
+            if current and current not in options:
+                options.insert(0, current)
+            if not options:
+                st.selectbox(
+                    "Branch",
+                    options=["(detached HEAD)"],
+                    disabled=True,
+                )
+            else:
+                idx = options.index(current) if current in options else 0
+                # Track the active branch so ``_on_branch_change`` can
+                # detect the actual delta (and revert on dirty-tree).
+                ss._git_active_branch = current
+                st.selectbox(
+                    "Branch",
+                    options=options,
+                    index=idx,
+                    key="git_branch_select",
+                    on_change=_on_branch_change,
+                    help=(
+                        "Switch the local branch checked out in the "
+                        "working directory. Refuses with a toast if "
+                        "there are uncommitted changes."
+                    ),
+                )
+        browse_col = wd_cols[2]
+        new_proj_col = wd_cols[3]
+    else:
+        browse_col = wd_cols[1]
+        new_proj_col = wd_cols[2]
+
+    with browse_col:
         if st.button(
             "",
             icon=":material/folder_open:",
@@ -609,7 +703,7 @@ def _render_workdir_controls() -> None:
                 ss.working_dir = chosen
                 actions.record_recent_dir(chosen)
                 st.rerun()
-    with wd_cols[2]:
+    with new_proj_col:
         st.button(
             "",
             icon=":material/create_new_folder:",
@@ -1025,6 +1119,19 @@ def render() -> None:
         )
 
     _render_model_controls()
+
+    # Handoff from the sidebar's "Resolve with DeepSeek" button: the
+    # payload (synthesized prompt + override model) is set in
+    # ``streamlit_app._request_conflict_resolution`` and consumed here so
+    # the merge-conflict resolution turn renders into the same chat
+    # transcript as everything else. We drain the key before running the
+    # turn so a transient script-runner error can't loop on the same
+    # payload forever.
+    pending = st.session_state.pop("pending_conflict_resolution", None)
+    if pending and wd_ok and not prompt:
+        with conversation_area:
+            _run_turn(pending["prompt"], override_model=pending.get("model"))
+        st.rerun()
 
     if prompt and wd_ok:
         with conversation_area:

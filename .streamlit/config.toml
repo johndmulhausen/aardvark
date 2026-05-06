@@ -10,14 +10,14 @@
 # Keep the two lists in sync.
 
 [client]
-# We render this app as a local-only desktop-style tool, so we don't want the
-# "Deploy" button or developer-mode hamburger menu, but we DO want the
-# Settings menu's built-in light/dark/system toggle to stay reachable —
-# otherwise users have no way to switch theme at runtime (Streamlit doesn't
-# expose a programmatic theme switch). Options: "auto", "developer",
-# "viewer", "minimal". "viewer" hides the Deploy button and developer
-# tooling but keeps Settings.
-toolbarMode = "viewer"
+# Hide Streamlit's hamburger / Settings / Deploy chrome entirely — this
+# is a local-only desktop-style tool, and exposing the framework's own
+# menu would leak that the app is built with Streamlit. The in-app
+# theme switcher on the Settings page (theme_switcher.py) writes the
+# same ``localStorage`` key Streamlit reads on app boot, so users keep
+# control of Light / Dark / System without ever seeing the toolbar.
+# Options: "auto", "developer", "viewer", "minimal".
+toolbarMode = "minimal"
 
 [browser]
 # This is a personal-use coding tool; do not phone home with telemetry.
@@ -27,15 +27,24 @@ gatherUsageStats = false
 # code blocks all render slightly smaller, freeing screen real estate for
 # the conversation pane. Streamlit's default heading sizes are defined in
 # rem units relative to this value, so they scale automatically.
-#
-# Streamlit only enables the in-app light/dark toggle when BOTH
-# ``[theme.light]`` and ``[theme.dark]`` sections are defined; defining a
-# single top-level ``[theme]`` table locks the app to one mode. So we
-# duplicate ``baseFontSize`` into each section instead of putting it in a
-# shared ``[theme]`` block, preserving the OS-follow / manual-toggle
-# behavior the user gets out of the box.
-[theme.light]
+# ``baseFontSize`` is one of the handful of options Streamlit explicitly
+# rejects per-mode (see the "Theme" section of the config.toml docs at
+# https://docs.streamlit.io/develop/api-reference/configuration/config.toml ),
+# so it lives at the top level. Mirror in ``STREAMLIT_OPTIONS`` in
+# ``scripts/build_desktop.py``.
+[theme]
 baseFontSize = 14
 
+# Define both ``[theme.light]`` and ``[theme.dark]`` so Streamlit treats
+# the app as multi-mode — that's what makes the in-app theme switcher's
+# ``localStorage`` writes actually drive the rendered theme on boot. The
+# frontend's ``id(e)`` check (in ``streamlit/static/static/js/utils.*.js``)
+# requires each per-mode table to have at least one valid value, so we
+# pin ``primaryColor`` to Streamlit's well-known default red. This
+# preserves the visual identity exactly while enabling Light / Dark /
+# System switching via ``theme_switcher.py``.
+[theme.light]
+primaryColor = "#FF4B4B"
+
 [theme.dark]
-baseFontSize = 14
+primaryColor = "#FF4B4B"

@@ -4,8 +4,9 @@ Exposes a generator, ``run_agent_turn``, that yields events the UI renders:
 
 - ``{"type": "skills_loaded", "selected": [...], "unknown_slash": [...]}`` —
   emitted exactly once at the start of every turn so the UI can show which
-  ``.cursor/skills`` were sliced into the system prompt this turn (and any
-  ``/foo`` slash commands that didn't match a known skill).
+  ``SKILL.md`` files (under ``.cursor/skills`` or ``.claude/skills``, at
+  workspace or user scope) were sliced into the system prompt this turn
+  (and any ``/foo`` slash commands that didn't match a known skill).
 - ``{"type": "assistant_text_delta", "content": ...}`` — a partial chunk of
   assistant text streamed token-by-token. The UI appends these to a live
   placeholder; they are NOT persisted to ``ui_turns`` for replay.
@@ -78,6 +79,15 @@ def _op(*args: Any, **kwargs: Any) -> Any:
         kwargs.pop(k, None)
     return weave.op(*args, **kwargs)
 from tools import ToolContext, dispatch, tools_for_mode
+
+
+# DeepSeek model used by the git push flow for commit messages, PR
+# titles/bodies, and merge-conflict resolution. Hard-coded to V4-Flash
+# because its 1M context comfortably fits multi-file diffs and the
+# multi-file conflict-resolution turn. The UI verifies this id is
+# present in the user's ``/v1/models`` list before invoking it; if not,
+# it surfaces a clear "model unavailable" error and disables generation.
+DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 
 
 def _strip_client(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -272,6 +282,49 @@ def _stream_one_call(
             "args": parsed_args,
             "raw_args": raw_args,
         }
+
+
+@_op(
+    name="generate_text",
+    kind="llm",
+    color="blue",
+    postprocess_inputs=_strip_client,
+)
+def generate_text(
+    *,
+    client: OpenAI,
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int = 1200,
+    temperature: float = 0.2,
+) -> str:
+    """One-shot, non-streamed chat completion.
+
+    Used by the git push flow for commit messages and PR titles/bodies
+    where streaming and tool calling are unnecessary. Lives here (rather
+    than in ``streamlit_app.py``) so the architectural rule of "every
+    chat-completion call goes through ``agent.py``" stays intact and the
+    call appears in W&B Weave traces alongside agent turns.
+
+    Returns the trimmed assistant content. Empty string if the model
+    produced no text (which the caller should treat as an error and
+    surface to the user).
+    """
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        stream=False,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    if not response.choices:
+        return ""
+    content = response.choices[0].message.content or ""
+    return content.strip()
 
 
 @_op(

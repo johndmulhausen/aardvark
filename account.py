@@ -60,21 +60,26 @@ class Profile:
     are loaded via :func:`load_credentials`; everything in this dataclass is
     safe to write at default file permissions.
 
-    Theme is intentionally NOT a field here: Streamlit owns the theme
-    toggle (in its toolbar Settings menu) and persists the user's choice
-    in browser storage, so layering our own preference file on top would
-    be redundant — and there's no programmatic way for the app to apply
-    such a preference at startup anyway.
+    The ``theme`` field is the user's explicit Light / Dark / System choice
+    from the Settings page's theme switcher. Empty string means the user
+    has not yet chosen — in that case the app falls back to whatever
+    Streamlit already has in browser storage (so users who set Dark via
+    Streamlit's old toolbar menu before this app shipped its own switcher
+    keep their preference). The actual at-runtime theme application is
+    done by :mod:`theme_switcher` writing to the same ``localStorage`` key
+    Streamlit reads on app load (``stActiveTheme-${pathname}-v2``); we
+    don't touch the DOM directly.
 
-    Avatars are intentionally NOT a field here either: the popover does
-    not support uploading a custom avatar, and the GitHub avatar is
-    fetched fresh into in-memory bytes on PAT verify.
+    Avatars are intentionally NOT a field here: the popover does not
+    support uploading a custom avatar, and the GitHub avatar is fetched
+    fresh into in-memory bytes on PAT verify.
     """
 
     github_username: str = ""
     github_email: str = ""
     github_avatar_url: str = ""
     github_scopes: list[str] = field(default_factory=list)
+    theme: str = ""
 
 
 def _ensure_config_dir() -> None:
@@ -93,11 +98,15 @@ def load_profile() -> Profile:
     scopes = raw.get("github_scopes")
     if not isinstance(scopes, list):
         scopes = []
+    theme = str(raw.get("theme") or "")
+    if theme not in ("", "System", "Light", "Dark"):
+        theme = ""
     return Profile(
         github_username=str(raw.get("github_username") or ""),
         github_email=str(raw.get("github_email") or ""),
         github_avatar_url=str(raw.get("github_avatar_url") or ""),
         github_scopes=[str(s) for s in scopes],
+        theme=theme,
     )
 
 

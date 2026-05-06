@@ -16,6 +16,8 @@ Owns:
 - The W&B Inference Connect / Disconnect / Forget callbacks (which build
   the OpenAI client, list models, and bootstrap Weave).
 - The GitHub PAT verify-and-save / sign-out callbacks.
+- The theme-switcher callbacks (segmented-control ``on_change`` +
+  the migration-detection callback fired by ``theme_switcher``).
 
 Pages keep their own *rendering* code; they call into this module purely
 for state mutation.
@@ -157,9 +159,32 @@ def _connect(api_key: str, project: str) -> None:
         st.session_state.weave_error = str(e)
 
 
+def _sync_inference_inputs() -> None:
+    """Pull the latest values from the settings widget keys into the canonical
+    state keys.
+
+    The settings page uses the dual-key pattern (canonical state in
+    ``api_key`` / ``project`` / ``remember_wb_key``; widget instances in
+    ``_api_key_input`` / ``_project_input`` / ``_remember_input``) so the
+    canonical values survive page navigation. Each widget has an
+    ``on_change`` sync callback, but we re-sync defensively here so a
+    Connect click that fires *without* a prior on_change (e.g. when the
+    user clicks Connect immediately after typing without blurring) still
+    sees the latest typed value.
+    """
+    ss = st.session_state
+    if "_api_key_input" in ss:
+        ss.api_key = ss._api_key_input
+    if "_project_input" in ss:
+        ss.project = ss._project_input
+    if "_remember_input" in ss:
+        ss.remember_wb_key = bool(ss._remember_input)
+
+
 def on_connect() -> None:
     """Connect button callback. Honors the ``Remember on this machine`` toggle."""
     ss = st.session_state
+    _sync_inference_inputs()
     _connect(ss.api_key, ss.project)
     if ss.client is not None and ss.connect_error is None:
         ss.conn_open = False
@@ -185,22 +210,42 @@ def disconnect() -> None:
 def forget_saved_wb_key() -> None:
     """Remove the persisted W&B API key from disk and clear the session value."""
     account.clear_credentials(wb=True)
-    st.session_state.api_key = ""
-    st.session_state.remember_wb_key = False
+    ss = st.session_state
+    ss.api_key = ""
+    ss.remember_wb_key = False
+    # Drop the underlying widget keys so the visible form clears on rerun
+    # (without this, the text input would still show the previously typed
+    # value because Streamlit keeps the widget key as the source of truth
+    # once it has been instantiated).
+    for k in ("_api_key_input", "_remember_input"):
+        if k in ss:
+            del ss[k]
 
 
 # ---------------------------------------------------------------------------
 # GitHub identity
 # ---------------------------------------------------------------------------
 def _persist_profile_from_state() -> None:
-    """Snapshot the relevant ``ss.*`` keys into a Profile and save it."""
+    """Snapshot the relevant ``ss.*`` keys into a Profile and save it.
+
+    Includes the theme preference if (and only if) the user has explicitly
+    picked one via the Settings page switcher; an unset preference stays
+    empty on disk so :mod:`theme_switcher` can fall back to whatever's
+    already in browser ``localStorage``.
+    """
     ss = st.session_state
     identity = ss.github_identity or {}
+    theme = str(ss.get("theme_pref") or "")
+    if theme not in ("System", "Light", "Dark"):
+        theme = ""
+    if not ss.get("theme_explicit"):
+        theme = ""
     profile = account.Profile(
         github_username=identity.get("login", ""),
         github_email=identity.get("email", ""),
         github_avatar_url=identity.get("avatar_url", ""),
         github_scopes=list(identity.get("scopes", [])),
+        theme=theme,
     )
     account.save_profile(profile)
 
@@ -238,4 +283,48 @@ def sign_out_github() -> None:
     ss.github_pat_error = None
     ss.avatar_bytes = None
     ss.git_identity_applied = set()
+    _persist_profile_from_state()
+
+
+# ---------------------------------------------------------------------------
+# Theme switcher
+# ---------------------------------------------------------------------------
+def set_theme_pref() -> None:
+    """``on_change`` callback for the Settings page's theme segmented control.
+
+    The widget binds to ``ss.theme_pref`` via ``key=``, so by the time this
+    callback runs the new value is already in session state. We mark the
+    choice as explicit so :mod:`theme_switcher` switches into write-and-
+    reload mode on the next rerun, and we persist the preference to disk
+    so it survives across sessions. The actual ``localStorage`` write +
+    page reload happens inside the component on the next mount.
+    """
+    ss = st.session_state
+    val = ss.get("theme_pref")
+    if val not in ("System", "Light", "Dark"):
+        return
+    ss.theme_explicit = True
+    _persist_profile_from_state()
+
+
+def theme_detected() -> None:
+    """``on_detected_change`` callback for :mod:`theme_switcher`.
+
+    Fires when the component detects a pre-existing localStorage value
+    (e.g. from Streamlit's legacy toolbar toggle) that differs from the
+    Python-side preference. We adopt the detected value as the user's
+    explicit choice so the next render's segmented control reflects what
+    the page is actually painted as, and persist it. Streamlit only fires
+    this callback when the trigger value actually changes, so it runs at
+    most once per browser-session migration — there's no rerun storm.
+    """
+    ss = st.session_state
+    state = ss.get("wb_theme_switcher") or {}
+    detected = getattr(state, "detected", None) or (
+        state.get("detected") if isinstance(state, dict) else None
+    )
+    if detected not in ("System", "Light", "Dark"):
+        return
+    ss.theme_pref = detected
+    ss.theme_explicit = True
     _persist_profile_from_state()

@@ -54,10 +54,12 @@ BUNDLED_MODULES: tuple[str, ...] = (
     "mcp_servers.py",
     "project_context.py",
     "chat_input.py",
+    "theme_switcher.py",
     "models.py",
     "account.py",
     "actions.py",
     "usage.py",
+    "git_ops.py",
     "app_pages/__init__.py",
     "app_pages/chat.py",
     "app_pages/usage.py",
@@ -82,21 +84,23 @@ COLLECT_ALL_PACKAGES: tuple[str, ...] = (
 # from inside the .app bundle (cwd at launch is /, not the project root).
 # Keep this list in sync with .streamlit/config.toml.
 # Note on ``theme.baseFontSize``: in ``.streamlit/config.toml`` we duplicate
-# this into both ``[theme.light]`` and ``[theme.dark]`` so the in-app
-# light/dark toggle stays available. Streamlit's CLI does not expose
-# per-mode variants for ``baseFontSize`` (only color options have
-# ``--theme.light.X`` / ``--theme.dark.X`` flags), so the packaged build
-# uses the top-level form. That would normally lock the mode, but the
-# packaged app also runs with ``toolbarMode = minimal``, which hides the
-# Settings UI used to switch modes — so there is nothing to toggle in the
-# packaged build anyway and no asymmetry the user can observe.
+# this into both ``[theme.light]`` and ``[theme.dark]`` so the app stays
+# multi-mode (which is what makes the in-app theme switcher's
+# ``localStorage`` writes actually take effect on boot). Streamlit's CLI
+# does not expose per-mode variants for ``baseFontSize`` (only color
+# options have ``--theme.light.X`` / ``--theme.dark.X`` flags), so the
+# packaged build uses the top-level form. The in-app switcher on the
+# Settings page still works because Streamlit's theme-mode selection
+# logic still respects the localStorage key when both a top-level
+# ``baseFontSize`` and the absence of color overrides leaves Light/Dark
+# resolution to the user.
 STREAMLIT_OPTIONS: tuple[tuple[str, str], ...] = (
-    # "viewer" (rather than "minimal") so the Settings menu's built-in
-    # light/dark/system theme toggle stays reachable inside the packaged
-    # app — Streamlit has no programmatic theme switch, so without
-    # Settings the user is locked to whichever theme matches their OS at
-    # launch. Mirror in .streamlit/config.toml for the local-dev workflow.
-    ("client.toolbarMode", "viewer"),
+    # ``"minimal"`` hides Streamlit's hamburger / Settings / Deploy chrome
+    # entirely. The app's own Settings page exposes a Light / Dark /
+    # System switcher that drives the same ``localStorage`` key Streamlit
+    # reads on app boot, so users still control the theme without seeing
+    # the framework's own menu. Mirror in ``.streamlit/config.toml``.
+    ("client.toolbarMode", "minimal"),
     ("browser.gatherUsageStats", "false"),
     ("theme.baseFontSize", "14"),
 )

@@ -7,9 +7,10 @@ full page width for forms and help text. Layout:
 1. Page title with the circular avatar to the left.
 2. **GitHub identity** card — PAT verify-and-save flow when unauthenticated;
    identity card + sign-out when verified.
-3. **Theme** card — active theme caption + a clear pointer to Streamlit's
-   built-in toggle in the toolbar Settings menu (the only place at-runtime
-   theme switching is exposed; Streamlit doesn't ship a programmatic API).
+3. **Theme** card — Light / Dark / System segmented control bound to
+   ``ss.theme_pref`` (callback :func:`actions.set_theme_pref`). The
+   actual at-runtime swap is done by :mod:`theme_switcher`, mounted from
+   the entry script; this card is purely the user-facing control.
 4. **W&B Inference** card — API key + opt-in "Remember on this machine" +
    project + Connect / Disconnect / Forget.
 5. **MCP servers** card — list of configured MCP servers with per-server
@@ -34,6 +35,7 @@ from actions import (
     disconnect as _disconnect,
     forget_saved_wb_key as _forget_saved_wb_key,
     on_connect as _on_connect,
+    set_theme_pref as _set_theme_pref,
     sign_out_github as _sign_out_github,
     verify_pat as _verify_pat,
 )
@@ -87,13 +89,18 @@ def _render_github_card(identity: dict[str, Any] | None) -> None:
         if not identity:
             st.caption(
                 "The agent uses this as the author when it makes commits via "
-                "`run_shell`. Generate a fine-grained personal access token at "
-                f"[{account.GITHUB_PAT_CREATE_URL}]({account.GITHUB_PAT_CREATE_URL})."
+                "`run_shell`. Generate a fine-grained personal access token on "
+                "GitHub, then paste it below."
             )
             st.caption(
                 "Recommended permissions: " + ", ".join(
                     f"`{s}`" for s in account.RECOMMENDED_SCOPES
                 )
+            )
+            st.link_button(
+                "Generate a PAT on GitHub",
+                account.GITHUB_PAT_CREATE_URL,
+                icon=":material/open_in_new:",
             )
             st.text_input(
                 "Personal access token",
@@ -141,31 +148,81 @@ def _render_github_card(identity: dict[str, Any] | None) -> None:
             )
 
 
+def _theme_label(value: str) -> str:
+    """Format a theme option for the segmented control with a Material icon.
+
+    The ``:material/...:`` token renders inline inside widget option
+    labels just like it does in plain markdown, which keeps the switcher
+    visually consistent with the other Settings cards (palette /
+    code / sensors / extension icons).
+    """
+    return {
+        "System": ":material/contrast: System",
+        "Light": ":material/light_mode: Light",
+        "Dark": ":material/dark_mode: Dark",
+    }.get(value, value)
+
+
 def _render_theme_card() -> None:
-    """Render the theme card — active theme + pointer to the toolbar toggle."""
+    """Render the theme card — Light / Dark / System segmented control.
+
+    The actual theme application is done by :mod:`theme_switcher`, which
+    is mounted from ``streamlit_app.main()``. This page just owns the
+    UI control and a one-line description of the contract; picking a
+    new option fires :func:`actions.set_theme_pref` (persisting the
+    choice to ``profile.theme``), the next rerun re-mounts the switcher
+    component with the new explicit preference, and the component's JS
+    writes to ``localStorage`` and reloads the page so Streamlit's boot
+    code picks up the new theme.
+    """
     with st.container(border=True):
         st.markdown("### :material/palette: Theme")
-        try:
-            theme_base = st.context.theme.base or "system"
-        except Exception:
-            theme_base = "system"
-        icon_for_theme = {
-            "light": ":material/light_mode:",
-            "dark": ":material/dark_mode:",
-            "system": ":material/contrast:",
-        }.get(theme_base, ":material/contrast:")
-        st.markdown(
-            f"{icon_for_theme} Active theme: **{theme_base.capitalize()}**"
+        st.segmented_control(
+            "Theme",
+            options=["System", "Light", "Dark"],
+            selection_mode="single",
+            format_func=_theme_label,
+            key="theme_pref",
+            on_change=_set_theme_pref,
+            label_visibility="collapsed",
+            width="stretch",
         )
         st.caption(
-            "Change with the **menu (\u22ee) at the top-right of the page** "
-            "\u2192 **Light** / **Dark** / **System**. Streamlit owns the theme "
-            "toggle and persists your choice across sessions."
+            "Switching reloads the page once so the new theme applies "
+            "everywhere. **System** follows your operating system's "
+            "light / dark setting."
         )
+
+
+def _sync_api_key_input() -> None:
+    """Mirror the API-key text input back to the canonical ``ss.api_key``."""
+    st.session_state.api_key = st.session_state.get("_api_key_input", "")
+
+
+def _sync_project_input() -> None:
+    """Mirror the project text input back to the canonical ``ss.project``."""
+    st.session_state.project = st.session_state.get("_project_input", "")
+
+
+def _sync_remember_input() -> None:
+    """Mirror the remember checkbox back to the canonical ``ss.remember_wb_key``."""
+    st.session_state.remember_wb_key = bool(
+        st.session_state.get("_remember_input", False)
+    )
 
 
 def _render_inference_card() -> None:
-    """Render the W&B Inference connection card."""
+    """Render the W&B Inference connection card.
+
+    The API key / project / remember widgets each use an internal widget
+    key (``_api_key_input`` etc.) and seed their value from the canonical
+    session-state key (``api_key`` etc.) via the ``value=`` parameter,
+    syncing back via ``on_change``. The canonical keys are non-widget
+    keys, so they survive Streamlit's "strip unused widget keys on
+    unmount" behavior when the user navigates between pages — without
+    this dance, going Settings -> Chat -> Settings would clear the
+    visible API key field even while ``ss.client`` was still connected.
+    """
     ss = st.session_state
     with st.container(border=True):
         st.markdown("### :material/sensors: W&B Inference")
@@ -174,8 +231,10 @@ def _render_inference_card() -> None:
         with cols[0]:
             st.text_input(
                 "API key",
-                key="api_key",
+                value=ss.api_key,
+                key="_api_key_input",
                 type="password",
+                on_change=_sync_api_key_input,
                 help=(
                     "Get one at [wandb.ai/settings](https://wandb.ai/settings). "
                     "Held only in session memory unless you tick **Remember on "
@@ -185,14 +244,18 @@ def _render_inference_card() -> None:
         with cols[1]:
             st.text_input(
                 "Project (optional)",
-                key="project",
+                value=ss.project,
+                key="_project_input",
                 placeholder="team/project",
+                on_change=_sync_project_input,
                 help="Used for usage attribution and Weave tracing.",
             )
 
         st.checkbox(
             "Remember on this machine",
-            key="remember_wb_key",
+            value=ss.remember_wb_key,
+            key="_remember_input",
+            on_change=_sync_remember_input,
             help=(
                 "Saves to `~/.wb_coding_agent/credentials.json` (mode 0600). "
                 "Anyone with read access to your home directory could read it."
@@ -216,13 +279,7 @@ def _render_inference_card() -> None:
                     f":material/sensors_off: Weave tracing disabled: "
                     f"{ss.weave_error}"
                 )
-            btn_cols = st.columns([1, 1, 4])
-            btn_cols[0].button(
-                "Reconnect",
-                icon=":material/refresh:",
-                on_click=_on_connect,
-            )
-            btn_cols[1].button(
+            st.button(
                 "Disconnect",
                 icon=":material/link_off:",
                 on_click=_disconnect,
@@ -598,26 +655,34 @@ def _render_session_summary() -> None:
 
 
 def render() -> None:
-    """Page body."""
+    """Page body.
+
+    When the user is signed in to GitHub, the page header is a two-column
+    avatar + identity strip (avatar to the left, login + email stacked to
+    the right). When they're not signed in, the avatar is a generic
+    placeholder and rendering it next to the title leaves a visible gutter
+    between the title and the cards below it — so the signed-out path
+    falls back to a full-width title that lines up with the card column.
+    """
     ss = st.session_state
     identity = ss.github_identity or {}
+    login = identity.get("login")
 
-    header = st.columns([1, 6], vertical_alignment="center")
-    with header[0]:
-        _render_avatar(size=72)
-    with header[1]:
-        login = identity.get("login")
-        if login:
+    if login:
+        header = st.columns([1, 6], vertical_alignment="center")
+        with header[0]:
+            _render_avatar(size=72)
+        with header[1]:
             st.title(login)
             email = identity.get("email")
             if email:
                 st.caption(f":material/mail: {email}")
-        else:
-            st.title("Settings")
-            st.caption(
-                "Configure your GitHub identity, theme, and W&B Inference "
-                "connection. Settings persist on this machine when you opt in."
-            )
+    else:
+        st.title("Settings")
+        st.caption(
+            "Configure your GitHub identity, theme, and W&B Inference "
+            "connection. Settings persist on this machine when you opt in."
+        )
 
     _render_session_summary()
     _render_github_card(identity if identity else None)

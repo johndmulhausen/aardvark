@@ -25,8 +25,8 @@ the slash-command palette - through a small, scoped piece of JS that:
    anywhere on the page without z-index battles.
 
 The skill list is delivered every run via ``data={"skills": [...]}`` so
-edits to ``AGENTS.md`` or new ``.cursor/skills/`` directories show up on
-the next rerun without a page refresh.
+edits to ``AGENTS.md`` or new ``.cursor/skills/`` / ``.claude/skills/``
+directories show up on the next rerun without a page refresh.
 """
 from __future__ import annotations
 
