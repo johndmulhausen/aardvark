@@ -4,6 +4,14 @@ All tools are sandboxed to a `working_dir` provided at dispatch time. Paths that
 escape the working directory are rejected. The schemas follow the OpenAI
 function-calling format and are passed to the W&B Inference chat completions
 endpoint via the `tools` parameter.
+
+Tracing
+-------
+:func:`dispatch` is decorated with ``@weave.op(kind="tool")`` so each tool
+invocation appears as a child of the surrounding ``run_agent_turn`` op in
+W&B Weave, sitting between the inference calls that produced and consumed
+it. When ``weave.init`` has not been called (no API key, init failed) the
+decorator is a no-op and dispatch behaves identically.
 """
 from __future__ import annotations
 
@@ -14,7 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import weave
+
 SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build", ".next"}
+
+READONLY_TOOL_NAMES: set[str] = {"list_files", "read_file"}
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -113,8 +125,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "run_shell",
             "description": (
                 "Run a shell command inside the working directory. Returns "
-                "stdout, stderr, and the exit code. Disabled unless the user "
-                "has enabled shell commands."
+                "stdout, stderr, and the exit code."
             ),
             "parameters": {
                 "type": "object",
@@ -134,8 +145,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 @dataclass
 class ToolContext:
+    """Per-turn execution context for tool dispatch.
+
+    Currently only carries the working directory; the ``_resolve_inside``
+    sandbox check uses it to keep filesystem operations contained to the
+    project the user picked. Shell commands run with this directory as their
+    cwd.
+    """
     working_dir: Path
-    shell_enabled: bool
+
+
+def tools_for_mode(mode: str) -> list[dict[str, Any]]:
+    """Return the OpenAI tool schemas exposed to the model for a given UI mode.
+
+    - ``"agent"`` exposes every tool in :data:`TOOL_SCHEMAS`.
+    - ``"ask"`` exposes only read-only tools (``list_files``, ``read_file``).
+
+    Mode enforcement happens at the API boundary by simply withholding the
+    schemas the model is not allowed to call.
+    """
+    if mode == "ask":
+        return [t for t in TOOL_SCHEMAS if t["function"]["name"] in READONLY_TOOL_NAMES]
+    return TOOL_SCHEMAS
 
 
 def _resolve_inside(working_dir: Path, rel_path: str) -> Path:
@@ -273,8 +304,6 @@ def _edit_file(
 
 
 def _run_shell(ctx: ToolContext, command: str, timeout: int = 30) -> dict[str, Any]:
-    if not ctx.shell_enabled:
-        return {"error": "Shell commands are disabled. Ask the user to enable them in the sidebar."}
     try:
         proc = subprocess.run(
             command,
@@ -311,6 +340,7 @@ _DISPATCH: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 
+@weave.op(name="dispatch_tool", kind="tool", color="green")
 def dispatch(name: str, arguments_json: str, ctx: ToolContext) -> dict[str, Any]:
     """Run a tool call by name with JSON-encoded arguments.
 

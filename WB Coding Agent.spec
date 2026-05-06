@@ -4,16 +4,18 @@ from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('/Users/john/streamlit-inference/streamlit_app.py', '.'), ('/Users/john/streamlit-inference/agent.py', '.'), ('/Users/john/streamlit-inference/tools.py', '.'), ('/Users/john/streamlit-inference/wb_client.py', '.')]
 binaries = []
-hiddenimports = ['__future__.annotations', 'agent.run_agent_turn', 'json', 'os', 'pathlib.Path', 'streamlit', 'typing.Any', 'wb_client.list_models', 'wb_client.make_client']
+hiddenimports = ['__future__.annotations', 'agent.run_agent_turn', 'json', 'os', 'pathlib.Path', 'streamlit', 'subprocess', 'sys', 'typing.Any', 'wb_client.init_weave', 'wb_client.list_models', 'wb_client.make_client']
 datas += copy_metadata('streamlit')
 tmp_ret = collect_all('streamlit')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('openai')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('weave')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['/var/folders/9_/0cjkgxsx73181gc97v4v7b280000gp/T/tmp_r909y_6.py'],
+    ['/var/folders/9_/0cjkgxsx73181gc97v4v7b280000gp/T/tmpfmerio9i.py'],
     pathex=['.'],
     binaries=binaries,
     datas=datas,

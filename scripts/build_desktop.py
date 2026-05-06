@@ -57,6 +57,7 @@ BUNDLED_MODULES: tuple[str, ...] = (
 # data files, and dynamic libraries.
 COLLECT_ALL_PACKAGES: tuple[str, ...] = (
     "openai",
+    "weave",
 )
 
 # Streamlit CLI options forwarded to the bundled app at launch. These mirror
