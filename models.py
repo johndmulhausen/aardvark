@@ -23,6 +23,13 @@ Adding a new model
    ``cache_hit_price_per_1m``) from the pricing page. If the model is not yet
    listed (e.g. an experimental preview), leave the prices as ``None`` — the
    usage dashboard renders ``-`` for cost on those turns.
+4. Set ``"weak_tool_calling": True`` only when the model is documented (or
+   reliably observed) to emit tool-call intentions as plain text instead of
+   structured ``tool_calls`` deltas — the chat page uses this flag to surface
+   a one-line warning caption under the model card, so the user can see at a
+   glance that "I'll write the file..." replies that don't actually edit are
+   the model's fault, not ours. Default-omit the field for every other model:
+   the absence of the key means "no warning".
 """
 from __future__ import annotations
 
@@ -69,6 +76,10 @@ MODEL_METADATA: dict[str, dict[str, Any]] = {
         "params": "70B (Total)",
         "input_price_per_1m": 0.71,
         "output_price_per_1m": 0.71,
+        # Documented multi-step tool-calling regression on this endpoint
+        # (ai-dynamo/dynamo#8732, April 2026): the model returns unfilled
+        # template placeholders instead of structured ``tool_calls`` deltas.
+        "weak_tool_calling": True,
     },
     "meta-llama/Llama-3.1-70B-Instruct": {
         "label": "Meta Llama 3.1 70B",
@@ -77,6 +88,9 @@ MODEL_METADATA: dict[str, dict[str, Any]] = {
         "params": "70B (Total)",
         "input_price_per_1m": 0.80,
         "output_price_per_1m": 0.80,
+        # Same Llama-3 family failure mode as 3.3-70B above; positioned by
+        # W&B as "conversational" rather than agentic.
+        "weak_tool_calling": True,
     },
     "meta-llama/Llama-3.1-8B-Instruct": {
         "label": "Meta Llama 3.1 8B",
@@ -85,6 +99,9 @@ MODEL_METADATA: dict[str, dict[str, Any]] = {
         "params": "8B (Total)",
         "input_price_per_1m": 0.22,
         "output_price_per_1m": 0.22,
+        # Same family + smallest variant; tool-call hallucinations are
+        # particularly common.
+        "weak_tool_calling": True,
     },
     "microsoft/Phi-4-mini-instruct": {
         "label": "Microsoft Phi 4 Mini 3.8B",
@@ -93,6 +110,11 @@ MODEL_METADATA: dict[str, dict[str, Any]] = {
         "params": "3.8B (Total)",
         "input_price_per_1m": 0.08,
         "output_price_per_1m": 0.35,
+        # vLLM tool-parser issue (vllm-project/vllm#14682) where Phi-4 Mini
+        # generates tool calls inside ``content`` but the parser returns an
+        # empty ``tool_calls`` array; the W&B Inference catalog also doesn't
+        # position this model for agentic use.
+        "weak_tool_calling": True,
     },
     "MiniMaxAI/MiniMax-M2.5": {
         "label": "MiniMax M2.5",
@@ -223,3 +245,24 @@ def model_label(model_id: str) -> str:
     """
     meta = MODEL_METADATA.get(model_id)
     return meta["label"] if meta else model_id.split("/")[-1]
+
+
+def has_weak_tool_calling(model_id: str | None) -> bool:
+    """Return True when ``model_id`` is documented to mishandle tool calling.
+
+    "Mishandle" here means: the model often emits tool-call intentions as
+    plain assistant text without producing the structured ``tool_calls``
+    deltas the OpenAI streaming protocol requires, so the agent loop sees
+    nothing to dispatch and the user sees a reply like "I'll write the
+    file..." that didn't actually edit anything.
+
+    Unknown / experimental ids and ids not present in
+    :data:`MODEL_METADATA` return ``False`` (no warning shown). Only flip
+    a model's ``weak_tool_calling`` to ``True`` when there's documented
+    evidence (vendor docs, an upstream bug report, or a reproducible W&B
+    Inference observation); see the module docstring's authoring rules.
+    """
+    if not model_id:
+        return False
+    meta = MODEL_METADATA.get(model_id)
+    return bool(meta and meta.get("weak_tool_calling"))

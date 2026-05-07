@@ -48,7 +48,7 @@ import usage as usage_log
 from agent import DEEPSEEK_MODEL
 from chat_input import mount_slash_autocomplete
 from git_ops import GitError
-from models import MODEL_METADATA, model_label
+from models import MODEL_METADATA, has_weak_tool_calling, model_label
 
 TOOL_ICONS = {
     "list_files": ":material/folder_open:",
@@ -659,7 +659,7 @@ def _format_repo_option(repo: dict[str, Any]) -> str:
     return f"{bits[0]} ({' \u00b7 '.join(extra)})"
 
 
-@st.dialog("Start a new project", width="large")
+@st.dialog("Start a new project", width="large", on_dismiss=_close_new_project_dialog)
 def _new_project_dialog() -> None:
     """Modal that creates a project folder, ``git init``s it, and wires an upstream.
 
@@ -667,6 +667,11 @@ def _new_project_dialog() -> None:
     map to short orchestrations against ``account.py``. Errors raised by
     those helpers (validation, network, git failures) surface as a single
     ``st.error`` and leave the dialog open so the user can fix and retry.
+
+    ``on_dismiss=_close_new_project_dialog`` is mandatory so X / Esc /
+    click-outside dismissal clears ``ss.new_project_dialog_open``;
+    otherwise the modal re-opens on the next rerun (e.g. the next chat
+    submission). See :func:`_diff_dialog` for the full rationale.
     """
     import actions
 
@@ -969,6 +974,21 @@ def _render_model_controls() -> None:
         desc = meta.get("description", "")
         st.caption(f"{header} \u2014 {desc}" if desc else header)
 
+    # Soft warning for models documented to mishandle tool calling. These
+    # models often *describe* file edits in plain text without ever emitting
+    # a structured ``tool_calls`` delta, so the agent loop has nothing to
+    # dispatch and the user sees "I'll write the file..." that doesn't
+    # actually edit anything. Source-of-truth lives in
+    # ``models.has_weak_tool_calling`` so the flag list stays in one place.
+    # Mode-agnostic on purpose: even Ask mode's read-only flow needs the
+    # model to call ``read_file`` / ``list_files`` to be useful.
+    if has_weak_tool_calling(ss.model):
+        st.caption(
+            ":orange[:material/warning: This model often *describes* file "
+            "edits without actually making them. For reliable changes try "
+            "**Qwen3 Coder 480B**, **DeepSeek V3.1**, or **GPT OSS 120B**.]"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Working-tree diff (button + dialog overlay)
@@ -1095,7 +1115,7 @@ def _close_diff_dialog() -> None:
     st.session_state.diff_dialog_open = False
 
 
-@st.dialog("Changes", width="large")
+@st.dialog("Changes", width="large", on_dismiss=_close_diff_dialog)
 def _diff_dialog() -> None:
     """Modal overlay showing the live working-tree diff for the active chat.
 
@@ -1107,6 +1127,15 @@ def _diff_dialog() -> None:
     line-by-line unified diff. The dialog handles its own internal
     scroll, so opening it never pushes the chat input or controls
     out of the way.
+
+    ``on_dismiss=_close_diff_dialog`` is mandatory: without it, when
+    the user closes the modal via the built-in X / Esc / click-outside
+    affordances, ``ss.diff_dialog_open`` stays ``True`` and the dialog
+    re-opens on the very next rerun (e.g. when the user presses Enter
+    to send a chat message). Streamlit calls the dismiss callback
+    before the next rerun, so clearing the flag there guarantees the
+    "X-then-send-a-message" flow doesn't loop the user back into the
+    Changes modal.
     """
     ss = st.session_state
     chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
@@ -1544,7 +1573,7 @@ def _close_first_push_dialog() -> None:
     st.session_state.first_push_dialog_open = False
 
 
-@st.dialog("New branch", width="small")
+@st.dialog("New branch", width="small", on_dismiss=_close_new_branch_dialog)
 def _new_branch_dialog() -> None:
     """Modal for creating a new branch off HEAD.
 
@@ -1553,6 +1582,11 @@ def _new_branch_dialog() -> None:
     when they say "let me put this on a new branch first".
     Validation errors render inline; the dialog stays open so the
     user can fix and retry.
+
+    ``on_dismiss=_close_new_branch_dialog`` is mandatory so X / Esc /
+    click-outside dismissal clears ``ss.new_branch_dialog_open``;
+    otherwise the modal re-opens on the next rerun (e.g. the next chat
+    submission). See :func:`_diff_dialog` for the full rationale.
     """
     ss = st.session_state
     chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
@@ -1619,7 +1653,7 @@ def _new_branch_dialog() -> None:
     st.rerun()
 
 
-@st.dialog("Publish branch", width="medium")
+@st.dialog("Publish branch", width="medium", on_dismiss=_close_first_push_dialog)
 def _first_push_dialog() -> None:
     """Modal shown on the first push of a branch (no upstream yet).
 
@@ -1628,6 +1662,11 @@ def _first_push_dialog() -> None:
     an extra DeepSeek call to draft a title + body, then opens the
     GitHub compare URL with both pre-filled — the user can review
     and edit before submitting on the platform side.
+
+    ``on_dismiss=_close_first_push_dialog`` is mandatory so X / Esc /
+    click-outside dismissal clears ``ss.first_push_dialog_open``;
+    otherwise the modal re-opens on the next rerun (e.g. the next chat
+    submission). See :func:`_diff_dialog` for the full rationale.
     """
     ss = st.session_state
     chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None

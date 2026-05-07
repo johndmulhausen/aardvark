@@ -406,7 +406,21 @@ def _format_kv_lines(items: dict[str, str], header_style: bool = False) -> str:
     return "\n".join(f"{k}{sep}{v}" for k, v in items.items())
 
 
-@st.dialog("MCP server", width="large")
+def _close_mcp_dialog() -> None:
+    """Drop the dialog flags so subsequent reruns don't re-mount the modal.
+
+    Wired to ``@st.dialog(..., on_dismiss=_close_mcp_dialog)`` so X /
+    Esc / click-outside dismissals clear the gating flag — without
+    this, the dialog re-opens on the very next rerun (e.g. the next
+    chat submission on the chat page) because ``mcp_dialog_open``
+    stays ``True``. The Cancel / Save / Delete handlers inside the
+    dialog body clear the same flags and call ``st.rerun()`` directly.
+    """
+    st.session_state.mcp_dialog_open = False
+    st.session_state.mcp_dialog_editing = None
+
+
+@st.dialog("MCP server", width="large", on_dismiss=_close_mcp_dialog)
 def _mcp_server_dialog() -> None:
     """Add or edit an MCP server config.
 
@@ -414,6 +428,13 @@ def _mcp_server_dialog() -> None:
     otherwise it's the id of the server being edited (we look it up in the
     registry to pre-fill the form). Save reconciles live sessions; Delete
     is the explicit destructive action.
+
+    ``on_dismiss=_close_mcp_dialog`` is mandatory so X / Esc /
+    click-outside dismissal clears ``ss.mcp_dialog_open`` /
+    ``ss.mcp_dialog_editing``; otherwise the modal re-opens on the
+    next rerun (e.g. when the user navigates to the chat page and
+    sends a message). See :func:`app_pages.chat._diff_dialog` for
+    the full rationale.
     """
     registry = _get_mcp_registry()
     editing_id: str | None = st.session_state.mcp_dialog_editing

@@ -279,6 +279,15 @@ def _render_agent_tab() -> None:
         "- **Description** — a short note from the W&B docs about what "
         "the model is good at."
     )
+    st.markdown(
+        "On some models you'll also see an **orange warning** right "
+        "under the card. That means the model is known to *describe* "
+        "edits in plain text without actually making them — you'll get "
+        "a reply like \"I'll update the file...\" but no diff and no "
+        "real change on disk. If that happens, switch to a model "
+        "built for coding or agent work. Good first picks are "
+        "**Qwen3 Coder 480B**, **DeepSeek V3.1**, and **GPT OSS 120B**."
+    )
 
     st.markdown("##### The Skills popover")
     st.markdown(

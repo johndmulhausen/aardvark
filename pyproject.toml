@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "Streamlit code editing agent powered by W&B Inference"
 requires-python = ">=3.11"
 dependencies = [
-    "streamlit>=1.53.0",
+    # 1.56.0+ is required for the ``on_dismiss=`` parameter on
+    # ``@st.dialog`` — it's the only way to detect that the user closed a
+    # modal via the built-in X / Esc / click-outside affordances and clear
+    # our own ``ss.<dialog>_open`` gating flags. Without this, a dismissed
+    # dialog re-opens on the very next rerun (e.g. when the user presses
+    # Enter to send a chat message), because the gating flag is still True.
+    "streamlit>=1.56.0",
     "openai>=1.40.0",
     # 0.52.24+ is required for ``kind=`` / ``color=`` kwargs on ``@weave.op``.
     # Older 0.52.x installs reject those kwargs with ``TypeError`` at module

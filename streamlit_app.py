@@ -522,7 +522,21 @@ def _open_delete_confirm(chat_id: str) -> None:
     st.session_state.delete_chat_confirm_id = chat_id
 
 
-@st.dialog("Delete chat?", width="small")
+def _close_delete_chat_dialog() -> None:
+    """Drop the gating id so subsequent reruns don't re-mount the modal.
+
+    Wired to ``@st.dialog(..., on_dismiss=_close_delete_chat_dialog)``
+    so X / Esc / click-outside dismissals clear the gating id —
+    without this, the dialog re-opens on the very next rerun (e.g.
+    the next chat submission on the chat page) because
+    ``delete_chat_confirm_id`` stays set. The Cancel / Delete /
+    "OK on running" handlers inside the dialog body clear the same
+    id and call ``st.rerun()`` directly.
+    """
+    st.session_state.delete_chat_confirm_id = None
+
+
+@st.dialog("Delete chat?", width="small", on_dismiss=_close_delete_chat_dialog)
 def _delete_chat_dialog() -> None:
     """Confirm modal for the per-chat delete icon.
 
@@ -530,6 +544,12 @@ def _delete_chat_dialog() -> None:
     holding the chat's lock + its on-disk file is its only persistence
     handle). Otherwise removes the chat from the session dict + its
     JSON file, picks a successor active chat, and reruns.
+
+    ``on_dismiss=_close_delete_chat_dialog`` is mandatory so X / Esc /
+    click-outside dismissal clears ``ss.delete_chat_confirm_id``;
+    otherwise the modal re-opens on the next rerun (e.g. when the
+    user navigates to the chat page and sends a message). See
+    :func:`app_pages.chat._diff_dialog` for the full rationale.
     """
     ss = st.session_state
     chat_id = ss.delete_chat_confirm_id
