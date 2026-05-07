@@ -124,6 +124,19 @@ class Chat:
     # the submit handler in ``app_pages/chat.py`` once the prompt is
     # consumed by :func:`start_turn`.
     draft_text: str = ""
+    # Per-chat feature toggles for native-SDK options that the picker's
+    # current model exposes. Keys are namespaced by the option:
+    # ``"reasoning_effort"`` (str: "low" / "medium" / "high" — OpenAI
+    # o-series), ``"grounding"`` (bool — Google Search grounding for
+    # Gemini), ``"live_search"`` (bool — xAI Live Search for Grok),
+    # ``"thinking"`` (bool — Anthropic extended thinking, hook only
+    # today). Read by the chat-page UI to render applicable toggles
+    # under the model card; threaded through ``agent.run_agent_turn``
+    # → ``chat_streams.stream_chat`` → the per-kind dispatch path
+    # which pulls the keys it cares about and silently ignores
+    # unknown ones. Stored as a single dict so adding a new toggle
+    # doesn't require a Chat schema migration.
+    model_options: dict[str, Any] = field(default_factory=dict)
     archived: bool = False
     created_at: str = ""
     updated_at: str = ""
@@ -164,6 +177,7 @@ class Chat:
             "error_message": self.error_message,
             "partial_text": self.partial_text,
             "draft_text": self.draft_text,
+            "model_options": dict(self.model_options),
             "archived": self.archived,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -181,6 +195,10 @@ class Chat:
         without it on the next persist.
         """
         chat_id = str(raw.get("id") or uuid.uuid4().hex)
+        raw_options = raw.get("model_options")
+        model_options = (
+            dict(raw_options) if isinstance(raw_options, dict) else {}
+        )
         return cls(
             id=chat_id,
             title=str(raw.get("title") or DEFAULT_TITLE),
@@ -193,6 +211,7 @@ class Chat:
             error_message=str(raw.get("error_message") or ""),
             partial_text=str(raw.get("partial_text") or ""),
             draft_text=str(raw.get("draft_text") or ""),
+            model_options=model_options,
             archived=bool(raw.get("archived") or False),
             created_at=str(raw.get("created_at") or ""),
             updated_at=str(raw.get("updated_at") or ""),
@@ -663,10 +682,11 @@ def generate_title(chat: Chat, client: Any, *, api_key: str = "") -> str | None:
     returned blank). The caller is expected to fall back to
     :func:`derive_title` in that case.
 
-    The ``api_key`` keyword arg is the W&B Inference API key — DeepSeek
-    is currently a W&B-only model, so this should be the user's
-    ``ss.provider_keys["wandb"]``. ``client`` is passed for back-compat
-    but ignored on the LiteLLM-routed W&B path.
+    The ``api_key`` keyword arg is accepted for back-compat with older
+    callers but is otherwise unused — the ``client`` (an
+    ``openai.OpenAI`` configured against W&B's ``base_url``) carries
+    the credential. DeepSeek is currently a W&B-only model, so
+    ``client`` should be the user's ``ss.clients["wandb"]``.
 
     We feed the model the first user message plus the first assistant
     text response so it has both the question and the agent's framing
@@ -764,9 +784,10 @@ def start_turn(
 
     ``provider_id`` and ``api_key`` are the multi-provider routing
     arguments. When ``provider_id`` is None it's auto-derived from the
-    qualified model id (``<provider>:<raw>``). For ``litellm_compat``
-    providers ``client`` may be ``None`` (LiteLLM is stateless) — only
-    the API key is needed; we permit ``client is None`` for those.
+    qualified model id (``<provider>:<raw>``). Every provider needs a
+    real ``client`` object — ``openai.OpenAI`` for ``openai_native``
+    and ``openai_compat`` (with the per-provider ``base_url``), the
+    matching native SDK for ``anthropic_native`` / ``google_native``.
     """
     from models import is_qualified, model_provider as _model_provider
 
@@ -788,20 +809,17 @@ def start_turn(
         derived = _model_provider(turn_model) if is_qualified(turn_model) else None
         provider_id = derived or "wandb"
 
-    # ``litellm_compat`` providers don't need a persistent client
-    # object — the call layer reads the API key at request time. We
-    # only require ``client is not None`` for the three native paths.
+    # Every provider needs a connected client object. The chat page
+    # passes ``ss.clients[provider_id]`` here when starting a turn;
+    # for the cross-provider DeepSeek-on-W&B git-push flow the chat
+    # page resolves the W&B client and threads it through.
     import providers as _providers
     provider = _providers.get_provider(provider_id)
     if provider is None:
         raise RuntimeError(f"Unknown provider id: {provider_id!r}")
-    if provider.kind != "litellm_compat" and client is None:
+    if client is None:
         raise RuntimeError(
             f"Cannot start a turn for {provider.label}: no connected client."
-        )
-    if provider.kind == "litellm_compat" and not (api_key or "").strip():
-        raise RuntimeError(
-            f"Cannot start a turn for {provider.label}: no API key configured."
         )
 
     # Clear any leftover cancel signal from a prior turn. If the
@@ -903,6 +921,7 @@ def start_turn(
                 chat_id=chat.id,
                 provider_keys=provider_keys,
                 clients=clients,
+                model_options=dict(chat.model_options),
             )
             for event in events_iter:
                 # Cancellation tripwire #1: between every event from the

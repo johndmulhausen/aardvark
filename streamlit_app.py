@@ -81,11 +81,11 @@ def _init_state() -> None:
     #   when the user ticks "Remember on this machine" before clicking
     #   Connect.
     # ``clients[provider_id] -> Any | None``: the persistent client
-    #   object. ``openai.OpenAI`` for ``openai_native``, ``anthropic.
-    #   Anthropic`` for ``anthropic_native``, ``google.genai.Client`` for
-    #   ``google_native``, and ``None`` for the 9 ``litellm_compat``
-    #   providers (LiteLLM is stateless — only the API key is needed
-    #   at call time and it's read out of ``provider_keys``).
+    #   object. ``openai.OpenAI`` for ``openai_native`` AND for the 9
+    #   ``openai_compat`` providers (same SDK, per-provider
+    #   ``base_url``); ``anthropic.Anthropic`` for ``anthropic_native``;
+    #   ``google.genai.Client`` for ``google_native``. ``None`` means
+    #   the user hasn't connected that provider yet.
     # ``provider_models[provider_id] -> list[str]``: raw model ids
     #   returned by ``client.models.list()`` for each provider, sorted
     #   by display label (the chat picker shows qualified
@@ -118,10 +118,10 @@ def _init_state() -> None:
     ss.setdefault("project", "")
     # ``ss.client`` is the W&B-specific legacy alias retained for one
     # release; the multi-provider ``ss.clients["wandb"]`` is the
-    # canonical key going forward. The W&B path is ``litellm_compat``,
-    # so the canonical value is always ``None``; the legacy alias is
-    # kept as a lightweight "is W&B connected" flag (``None`` vs a
-    # truthy sentinel set after a successful connect).
+    # canonical key going forward. W&B Inference is ``openai_compat``,
+    # dispatched through the OpenAI SDK with W&B's ``base_url``, so
+    # both keys hold the same ``openai.OpenAI`` instance after a
+    # successful connect.
     ss.setdefault("client", None)
     ss.setdefault("models", [])
     ss.setdefault("model", None)
@@ -296,8 +296,10 @@ def _maybe_auto_connect() -> None:
     connected synchronously (so the chat picker has at least one
     provider's models populated by the time the first render
     completes). After that, :func:`model_catalog.refresh_all_async`
-    runs in a daemon thread to top up the catalog with LiteLLM +
-    OpenRouter enrichment without blocking the UI.
+    runs in a daemon thread to refresh every connected provider's
+    catalog (live ``/v1/models`` listing + OpenRouter description
+    enrichment for the ``openrouter:*`` namespace) without blocking
+    the UI.
     """
     ss = st.session_state
     if ss.auto_connect_attempted:
@@ -336,10 +338,11 @@ def _maybe_auto_connect() -> None:
             icon=":material/check_circle:",
         )
         # Kick off a background refresh so providers we successfully
-        # auto-connected get their LiteLLM + OpenRouter enrichment
-        # without blocking the first render. The chat page's polling
-        # @st.fragment will re-render the modal once
-        # ``model_catalog_refreshing`` flips back to False.
+        # auto-connected get their full catalog refresh (live
+        # ``/v1/models`` listing + OpenRouter enrichment for
+        # ``openrouter:*``) without blocking the first render. The
+        # chat page's polling @st.fragment will re-render the modal
+        # once ``model_catalog_refreshing`` flips back to False.
         import model_catalog
         ss.model_catalog_refreshing = True
 
@@ -355,10 +358,9 @@ def _maybe_auto_connect() -> None:
             # changes.
             pass
 
-        keys_for_refresh = dict(ss.provider_keys)
         clients_for_refresh = dict(ss.clients)
         model_catalog.refresh_all_async(
-            clients_for_refresh, keys_for_refresh, on_done=_on_done
+            clients_for_refresh, on_done=_on_done
         )
 
 

@@ -1,11 +1,12 @@
-"""Model catalog: live model lists + enriched pricing / descriptions / tags.
+"""Model catalog: live model lists + curated metadata + OpenRouter enrichment.
 
 The single source of truth for everything the model picker shows. Owns:
 
 - Per-provider ``/v1/models`` adapters (the only place in the codebase
   that hits a provider's listing endpoint).
-- The LiteLLM pricing-registry fetch + bundled offline snapshot.
-- The OpenRouter ``/api/v1/models`` description fetch.
+- The OpenRouter ``/api/v1/models`` description / pricing fetch (used
+  for the ``openrouter:*`` namespace only — see source-precedence
+  rules below).
 - The merge logic that enforces the **strict completeness gate**: a
   model only enters :func:`available_qualified_ids` if it has a real
   description, provider-accurate pricing, and a known context window.
@@ -18,29 +19,36 @@ Hard rules (mirrored in ``AGENTS.md``):
 
 - **No Streamlit imports** — runs from background threads safely.
 - **Pricing for ``<provider>:<raw>`` MUST come from a source that priced
-  that exact provider's offering** (curated > LiteLLM-with-
-  ``litellm_provider``-assertion > OpenRouter for ``openrouter:*`` only
-  > the provider's own ``/v1/models`` if it carries pricing). No cross-
-  provider substitution.
+  that exact provider's offering.** The precedence is curated
+  ``MODEL_METADATA`` first, then OpenRouter's catalog (only for
+  ``openrouter:*`` qualified ids — the user is paying OpenRouter
+  directly so OpenRouter's price IS the direct rate from their
+  perspective). No cross-provider substitution; no third-party
+  metadata scrape; no live-API pricing fallback (OpenRouter exposes
+  pricing in ``/v1/models`` and we use that for the
+  ``openrouter:*`` namespace; everyone else needs curated pricing
+  to surface in the picker).
 - **No auto-generated description floors** — if no real description is
   available, the model is hidden, not faked.
 - **Disk cache files
-  (``~/.wb_coding_agent/{model_catalog,litellm_registry,openrouter_catalog}.json``)
+  (``~/.wb_coding_agent/{model_catalog,openrouter_catalog}.json``)
   are written ONLY by this module.**
 
 Source precedence per field
 ---------------------------
 - **Pricing**: curated ``MODEL_METADATA`` entry with both
   ``input_price_per_1m`` and ``output_price_per_1m`` set →
-  LiteLLM entry (``litellm_provider`` field asserted to match the
-  qualified provider) → for ``openrouter:*`` ids only, OpenRouter's
-  ``pricing.prompt`` / ``pricing.completion`` → provider's own API
-  response if it carries pricing (Together does, OpenRouter does).
-- **Description**: curated ``MODEL_METADATA`` → OpenRouter
-  ``description`` → provider's API description (Google's
-  ``description`` field, Anthropic's ``display_name``).
-- **Context**: curated → LiteLLM's ``max_input_tokens`` →
-  provider's API response if it carries one.
+  for ``openrouter:*`` ids only, OpenRouter's
+  ``pricing.prompt`` / ``pricing.completion``.
+  Other providers' models without curated pricing are dropped from
+  the picker by the strict gate.
+- **Description**: curated ``MODEL_METADATA`` → provider's API
+  description (Google's ``description`` field, Anthropic's
+  ``display_name``) → for ``openrouter:*`` ids only, OpenRouter's
+  ``description``.
+- **Context**: curated → provider's API response if it carries a
+  context-window field (Google's ``input_token_limit``, OpenRouter's
+  ``context_length``).
 
 Auto-derived tags
 -----------------
@@ -50,8 +58,9 @@ stay curated-only):
 
 - ``long_context`` when ``context >= 200_000``.
 - ``cheap`` when ``output_price_per_1m <= 0.5``.
-- ``fast`` when the provider is Groq or Cerebras (latency-tier hardware).
-- ``multimodal`` when LiteLLM's ``supports_vision`` flag is true.
+- ``multimodal`` / ``vision`` when the curated entry sets
+  ``supports_vision: True`` OR (for ``openrouter:*`` ids) OpenRouter's
+  ``architecture.input_modalities`` lists ``image``.
 """
 from __future__ import annotations
 
@@ -74,15 +83,7 @@ from providers import PROVIDERS, Provider, get_provider
 # ---------------------------------------------------------------------------
 CONFIG_DIR = Path.home() / ".wb_coding_agent"
 LIVE_CATALOG_FILE = CONFIG_DIR / "model_catalog.json"
-LITELLM_CACHE_FILE = CONFIG_DIR / "litellm_registry.json"
 OPENROUTER_CACHE_FILE = CONFIG_DIR / "openrouter_catalog.json"
-
-# Repo-bundled offline-floor snapshot. Used when we have no fresh disk
-# cache and the runtime LiteLLM fetch fails (offline first-launch). The
-# refresh procedure for this file is documented in
-# ``data/litellm_model_registry.json``'s top-level comment field.
-_REPO_DIR = Path(__file__).resolve().parent
-BUNDLED_LITELLM_SNAPSHOT = _REPO_DIR / "data" / "litellm_model_registry.json"
 
 # How long a per-source disk cache entry is considered fresh before the
 # next ``refresh()`` call refetches. 24h matches the "models change
@@ -91,21 +92,7 @@ BUNDLED_LITELLM_SNAPSHOT = _REPO_DIR / "data" / "litellm_model_registry.json"
 # window.
 CATALOG_TTL_SECONDS = 24 * 3600
 
-# Upstream URLs.
-LITELLM_REGISTRY_URL = (
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
-    "model_prices_and_context_window.json"
-)
 OPENROUTER_CATALOG_URL = "https://openrouter.ai/api/v1/models"
-
-
-# Provider-id → LiteLLM-prefix mapping. Mirrored from
-# ``providers.PROVIDERS[*].litellm_prefix`` so this module never
-# reaches back into ``providers``-mutation territory; the values must
-# stay in lockstep with the ``Provider.litellm_prefix`` field.
-PROVIDER_LITELLM_PREFIX: dict[str, str] = {
-    pid: provider.litellm_prefix for pid, provider in PROVIDERS.items()
-}
 
 
 # Curated allowlist of qualified ids known to support PDF input. Used
@@ -115,11 +102,23 @@ PROVIDER_LITELLM_PREFIX: dict[str, str] = {
 # the explicitly-known cases — bringing a model in here means we've
 # verified the provider's API accepts PDF input for that model.
 PDF_SUPPORT_ALLOWLIST: frozenset[str] = frozenset({
+    # Anthropic Claude 4.x — native PDF input via ``document`` content blocks.
+    "anthropic:claude-opus-4-7",
+    "anthropic:claude-sonnet-4-6",
+    "anthropic:claude-haiku-4-5",
+    "anthropic:claude-opus-4-1",
+    # Anthropic Claude 3.x — native PDF input added in Claude 3.5+.
     "anthropic:claude-3-5-sonnet-20241022",
     "anthropic:claude-3-5-haiku-20241022",
-    "anthropic:claude-3-opus-20240229",
+    # Google Gemini 3.x — native PDF input via ``Part.from_bytes`` with
+    # ``application/pdf`` mime.
+    "gemini:gemini-3.1-pro-preview",
+    "gemini:gemini-3-flash-preview",
+    "gemini:gemini-3.1-flash-lite-preview",
+    # Google Gemini 2.5 — same native PDF input surface.
     "gemini:gemini-2.5-pro",
     "gemini:gemini-2.5-flash",
+    "gemini:gemini-2.5-flash-lite",
     "gemini:gemini-2.0-flash",
 })
 
@@ -127,7 +126,7 @@ PDF_SUPPORT_ALLOWLIST: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
-PricingSource = Literal["curated", "litellm", "openrouter", "live"]
+PricingSource = Literal["curated", "openrouter", "live"]
 DescriptionSource = Literal["curated", "openrouter", "live"]
 ModelMode = Literal[
     "chat",
@@ -156,7 +155,9 @@ class ModelInfo:
 
     - ``image_pricing``: dict keyed by ``"<size>/<quality>"`` (e.g.
       ``"1024x1024/standard"``) → USD per image. Populated only for
-      ``mode == "image_generation"`` models.
+      ``mode == "image_generation"`` models — sourced from curated
+      metadata (a curated entry must declare ``mode`` + the matching
+      pricing field; nothing auto-derives the mode).
     - ``tts_pricing_per_1m_chars``: USD per 1M input characters.
       Populated only for ``mode == "audio_speech"`` models.
     - ``stt_pricing_per_1m_seconds``: USD per 1M audio seconds.
@@ -191,7 +192,9 @@ class ModelInfo:
     tags: list[str]
     pricing_source: PricingSource
     description_source: DescriptionSource
-    # Phase 5: mode discriminator + per-mode pricing slots.
+    # Phase 5: mode discriminator + per-mode pricing slots. Populated
+    # only when a curated entry declares ``mode`` explicitly (none do
+    # today); the v1 picker is chat-only.
     mode: ModelMode = "chat"
     image_pricing: dict[str, float] | None = None
     tts_pricing_per_1m_chars: float | None = None
@@ -227,8 +230,6 @@ class _CatalogState:
     # Last successful refresh time per provider (for the "Last
     # refreshed Nm ago" caption).
     last_refreshed: dict[str, datetime] = field(default_factory=dict)
-    # Last successful LiteLLM registry fetch.
-    last_litellm: datetime | None = None
     # Last successful OpenRouter catalog fetch.
     last_openrouter: datetime | None = None
     # Per-source error messages (for the modal warning chip).
@@ -287,17 +288,15 @@ def _read_json_any_age(path: Path) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 # Per-provider /v1/models adapters
 # ---------------------------------------------------------------------------
-def _list_via_openai_compat(api_key: str, base_url: str) -> tuple[list[str], dict[str, dict[str, Any]]]:
-    """List raw model ids + (when present) per-model live metadata via OpenAI-compat.
+def _list_via_openai_compat(client: Any) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """List raw model ids + per-model live metadata from an OpenAI-shape client.
 
-    Returns ``(ids, live_meta)`` where ``live_meta[id]`` is a dict
-    carrying any extra fields the provider's response surfaces. Most
-    OpenAI-compat providers return only ``id`` + ``owned_by``; Together
-    + OpenRouter additionally carry pricing / context info that we
-    fold into the merge step (lowest priority — curated and LiteLLM win).
+    Used for both ``openai_native`` and ``openai_compat`` — same SDK,
+    same ``client.models.list()`` surface. Most providers return only
+    ``id`` + ``owned_by``; OpenRouter additionally carries pricing /
+    context info that the merge step folds into ``openrouter:*``
+    entries (other providers fall back to curated metadata).
     """
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key, base_url=base_url)
     response = client.models.list()
     ids: list[str] = []
     live_meta: dict[str, dict[str, Any]] = {}
@@ -306,21 +305,6 @@ def _list_via_openai_compat(api_key: str, base_url: str) -> tuple[list[str], dic
         # ``model_dump()`` is the Pydantic v2 method on openai SDK
         # response objects. Falling back to a manual extraction keeps
         # us safe against SDK schema drift.
-        try:
-            payload = m.model_dump()
-        except Exception:
-            payload = {"id": m.id}
-        live_meta[m.id] = payload
-    return sorted(set(ids)), live_meta
-
-
-def _list_via_openai_native(client: Any) -> tuple[list[str], dict[str, dict[str, Any]]]:
-    """List raw model ids + minimal live metadata from native OpenAI client."""
-    response = client.models.list()
-    ids: list[str] = []
-    live_meta: dict[str, dict[str, Any]] = {}
-    for m in response.data:
-        ids.append(m.id)
         try:
             payload = m.model_dump()
         except Exception:
@@ -360,14 +344,40 @@ def _list_via_anthropic_native(client: Any) -> tuple[list[str], dict[str, dict[s
     return sorted(out_ids), live_meta
 
 
+def _list_via_mistral_native(client: Any) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """List raw model ids + minimal live metadata from native Mistral client.
+
+    The ``mistralai`` SDK exposes ``client.models.list()`` which
+    returns a Pydantic model with a ``.data`` list of model entries.
+    Each entry has ``id``, ``name``, ``description``, ``max_context_length``,
+    and capability flags. We fold the description + context into
+    live_meta so the merge step can use them.
+    """
+    out_ids: set[str] = set()
+    live_meta: dict[str, dict[str, Any]] = {}
+    response = client.models.list()
+    for m in getattr(response, "data", None) or []:
+        raw = getattr(m, "id", None)
+        if not isinstance(raw, str) or not raw:
+            continue
+        out_ids.add(raw)
+        live_meta[raw] = {
+            "id": raw,
+            "display_name": getattr(m, "name", None) or "",
+            "description": getattr(m, "description", None) or "",
+            "context_length": getattr(m, "max_context_length", None),
+        }
+    return sorted(out_ids), live_meta
+
+
 def _list_via_google_native(client: Any) -> tuple[list[str], dict[str, dict[str, Any]]]:
     """List raw model ids + description / context from native Google client.
 
     The ``google-genai`` SDK names models like ``"models/gemini-2.5-pro"``
     and exposes ``displayName``, ``description``, ``inputTokenLimit``,
     ``outputTokenLimit``, and ``supportedActions`` on each entry. We
-    strip the ``models/`` prefix so the raw id matches what LiteLLM
-    expects under its ``"gemini/"`` namespace.
+    strip the ``models/`` prefix so the raw id matches the curated
+    qualified-id format (``gemini:gemini-2.5-pro``).
     """
     out_ids: set[str] = set()
     live_meta: dict[str, dict[str, Any]] = {}
@@ -391,24 +401,28 @@ def _list_via_google_native(client: Any) -> tuple[list[str], dict[str, dict[str,
 def _list_provider_models_with_meta(
     provider_id: str,
     client: Any,
-    api_key: str,
 ) -> tuple[list[str], dict[str, dict[str, Any]]]:
-    """Dispatch to the right per-kind adapter."""
+    """Dispatch to the right per-kind adapter.
+
+    ``xai_native`` reuses the ``openai`` SDK listing adapter because
+    xAI's ``/v1/models`` endpoint is OpenAI-compatible (we constructed
+    the client as ``openai.OpenAI(base_url=...)`` in the connect flow).
+    """
     provider = PROVIDERS.get(provider_id)
     if provider is None:
         raise ValueError(f"Unknown provider id: {provider_id!r}")
-    if provider.kind == "openai_native":
-        return _list_via_openai_native(client)
+    if provider.kind in ("openai_native", "openai_compat", "xai_native"):
+        return _list_via_openai_compat(client)
     if provider.kind == "anthropic_native":
         return _list_via_anthropic_native(client)
     if provider.kind == "google_native":
         return _list_via_google_native(client)
-    if provider.kind == "litellm_compat":
-        return _list_via_openai_compat(api_key, provider.base_url)
+    if provider.kind == "mistral_native":
+        return _list_via_mistral_native(client)
     raise ValueError(f"Unhandled provider kind: {provider.kind!r}")
 
 
-def list_raw_models(provider_id: str, client: Any, api_key: str) -> list[str]:
+def list_raw_models(provider_id: str, client: Any) -> list[str]:
     """Return raw model ids reachable for ``provider_id``.
 
     Convenience wrapper around the listing adapters that returns just
@@ -417,12 +431,12 @@ def list_raw_models(provider_id: str, client: Any, api_key: str) -> list[str]:
     full enrichment path goes through :func:`refresh` which keeps the
     live metadata for the merge.
     """
-    ids, _ = _list_provider_models_with_meta(provider_id, client, api_key)
+    ids, _ = _list_provider_models_with_meta(provider_id, client)
     return ids
 
 
 # ---------------------------------------------------------------------------
-# LiteLLM pricing registry fetch
+# OpenRouter catalog fetch
 # ---------------------------------------------------------------------------
 def _http_get_json(url: str, *, timeout: float = 15.0) -> Any:
     """Plain-stdlib JSON GET with a User-Agent. Raises on non-2xx / parse errors."""
@@ -436,48 +450,6 @@ def _http_get_json(url: str, *, timeout: float = 15.0) -> Any:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = resp.read()
     return json.loads(body.decode("utf-8"))
-
-
-def _load_litellm_registry() -> dict[str, Any]:
-    """Read the LiteLLM registry from the freshest available source.
-
-    Order: fresh disk cache → runtime fetch → repo-bundled snapshot.
-    Returns ``{}`` when even the bundled snapshot is missing (fresh
-    install, no network) so the merge step still runs.
-    """
-    cached = _read_json_if_fresh(LITELLM_CACHE_FILE)
-    if isinstance(cached, dict) and isinstance(cached.get("registry"), dict):
-        return cached["registry"]
-    try:
-        registry = _http_get_json(LITELLM_REGISTRY_URL)
-        if isinstance(registry, dict):
-            try:
-                _atomic_write_json(
-                    LITELLM_CACHE_FILE,
-                    {
-                        "fetched_at": datetime.now(timezone.utc).isoformat(),
-                        "registry": registry,
-                    },
-                )
-            except OSError:
-                pass
-            with _state_lock:
-                _state.last_litellm = datetime.now(timezone.utc)
-                _state.errors.pop("litellm", None)
-            return registry
-    except Exception as e:  # noqa: BLE001 — surfaced verbatim
-        with _state_lock:
-            _state.errors["litellm"] = f"LiteLLM fetch failed: {e}"
-    # Fall through: stale disk cache, then repo-bundled snapshot.
-    stale = _read_json_any_age(LITELLM_CACHE_FILE)
-    if isinstance(stale, dict) and isinstance(stale.get("registry"), dict):
-        return stale["registry"]
-    bundled = _read_json_any_age(BUNDLED_LITELLM_SNAPSHOT)
-    if isinstance(bundled, dict):
-        # The bundled file is the raw upstream payload (not wrapped
-        # with ``{fetched_at, registry}``) so we use it directly.
-        return bundled
-    return {}
 
 
 def _fetch_openrouter_catalog() -> dict[str, dict[str, Any]]:
@@ -531,116 +503,29 @@ def _curated_meta(qualified_id: str) -> dict[str, Any] | None:
     return MODEL_METADATA.get(qualified_id)
 
 
-def _litellm_lookup(
-    registry: dict[str, Any],
-    provider: Provider,
-    raw_id: str,
-) -> dict[str, Any] | None:
-    """Look up ``provider.litellm_prefix + raw_id`` in the LiteLLM registry.
-
-    Returns the raw entry when the lookup succeeds AND the
-    ``litellm_provider`` field on the entry asserts the same provider
-    family we expect. The provider-family check is the integrity
-    safeguard that keeps us from substituting (say) Together's
-    Llama-3.3 entry for Groq's identically-named model — different
-    inference offerings, different prices.
-
-    Returns ``None`` when the entry isn't there or the provider
-    assertion fails.
-    """
-    if not isinstance(registry, dict) or not registry:
-        return None
-    key = f"{provider.litellm_prefix}{raw_id}"
-    entry = registry.get(key)
-    if not isinstance(entry, dict):
-        return None
-    expected = _LITELLM_PROVIDER_FOR.get(provider.id)
-    if expected is None:
-        # We don't have a provider-family expectation, so accept the
-        # entry as-is. This covers ``openai`` / ``anthropic`` whose
-        # entries don't always carry ``litellm_provider``.
-        return entry
-    actual = entry.get("litellm_provider")
-    if actual is not None and actual != expected:
-        return None
-    return entry
-
-
-# Mapping from our provider id to the value LiteLLM's registry uses in
-# its ``litellm_provider`` field. Where None, we don't enforce the
-# assertion (no false-positive risk because the prefix is unique). Kept
-# private because it's an implementation detail of the LiteLLM-fetch
-# layer.
-_LITELLM_PROVIDER_FOR: dict[str, str | None] = {
-    "wandb": None,
-    "openai": "openai",
-    "anthropic": "anthropic",
-    "gemini": "gemini",
-    "mistral": "mistral",
-    "xai": "xai",
-    "together": "together_ai",
-    "fireworks": "fireworks_ai",
-    "groq": "groq",
-    "openrouter": "openrouter",
-    "deepinfra": "deepinfra",
-    "cerebras": "cerebras",
-}
-
-
 def _openrouter_lookup(
     catalog: dict[str, dict[str, Any]],
-    provider: Provider,
     raw_id: str,
 ) -> dict[str, Any] | None:
-    """Find an OpenRouter entry that describes ``raw_id`` from this provider.
+    """Find the OpenRouter entry for an ``openrouter:<raw_id>`` qualified id.
 
-    OpenRouter ids look like ``"anthropic/claude-3-5-sonnet"`` so we try
-    a few candidate keys: the bare raw id, ``provider/raw``, and
-    ``provider_label/raw``. The match is best-effort — OpenRouter's
-    purpose for us is descriptions only (and pricing for the
-    ``openrouter:*`` namespace), so a missed match just means the
-    catalog falls through to the next source.
+    OpenRouter uses ``"<provider_slug>/<model_slug>"`` as its catalog
+    key (e.g. ``"anthropic/claude-3-5-sonnet"``); the user pastes that
+    same id into the model picker as the raw id, so a direct
+    ``catalog.get(raw_id)`` lookup is enough. Returns ``None`` when
+    the id isn't in OpenRouter's catalog.
     """
     if not catalog:
         return None
-    candidates = [raw_id]
-    # OpenRouter prefixes ids with the upstream provider's slug.
-    or_provider_slug = {
-        "wandb": "wandb",
-        "openai": "openai",
-        "anthropic": "anthropic",
-        "gemini": "google",
-        "mistral": "mistralai",
-        "xai": "x-ai",
-        "together": "meta-llama",  # not a real prefix; raw_id often already has owner
-        "fireworks": "fireworks",
-        "groq": "groq",
-        "openrouter": "",
-        "deepinfra": "deepinfra",
-        "cerebras": "cerebras",
-    }
-    slug = or_provider_slug.get(provider.id, "")
-    if slug and "/" not in raw_id:
-        candidates.append(f"{slug}/{raw_id}")
-    # Some Anthropic ids have date suffixes; try the prefix-only form too.
-    if provider.id == "anthropic" and "-202" in raw_id:
-        # ``claude-3-5-sonnet-20241022`` → try ``anthropic/claude-3.5-sonnet``
-        # since OpenRouter aliases differ; this is best-effort only.
-        bare = raw_id.split("-202", 1)[0]
-        candidates.append(f"anthropic/{bare.replace('claude-3-', 'claude-3.')}")
-    for cand in candidates:
-        entry = catalog.get(cand)
-        if entry is not None:
-            return entry
-    return None
+    return catalog.get(raw_id)
 
 
 def _to_per_1m(per_token: Any) -> float | None:
-    """Convert a LiteLLM ``input_cost_per_token`` (per-token USD) to per-1M.
+    """Convert an OpenRouter ``pricing.prompt`` (per-token USD) to per-1M.
 
-    LiteLLM's pricing fields are floats like ``0.0000025`` (per token)
-    or strings the registry occasionally produces for newer entries.
-    We coerce conservatively and return ``None`` on any parse failure.
+    OpenRouter ships per-token prices as decimal strings like
+    ``"0.0000025"``; we coerce conservatively and return ``None`` on
+    any parse failure.
     """
     if per_token is None:
         return None
@@ -667,27 +552,14 @@ def _to_int(val: Any) -> int | None:
 # ---------------------------------------------------------------------------
 # Merge logic + completeness gate
 # ---------------------------------------------------------------------------
-_LITELLM_MODE_TO_OURS: dict[str, ModelMode] = {
-    "chat": "chat",
-    "completion": "chat",
-    "image_generation": "image_generation",
-    "audio_speech": "audio_speech",
-    "audio_transcription": "audio_transcription",
-    "video_generation": "video_generation",
-    "embedding": "embedding",
-}
-
-
-def _detect_mode(litellm_entry: dict[str, Any]) -> ModelMode:
-    """Map LiteLLM's ``mode`` field to our :data:`ModelMode` enum.
-
-    LiteLLM uses ``"chat"`` / ``"completion"`` interchangeably for
-    text models — we normalize both to ``"chat"`` since
-    ``client.chat.completions.create`` is the only call shape we
-    serve in v1.
-    """
-    raw = (litellm_entry.get("mode") or "").strip()
-    return _LITELLM_MODE_TO_OURS.get(raw, "chat")
+_VALID_MODES: tuple[str, ...] = (
+    "chat",
+    "image_generation",
+    "audio_speech",
+    "audio_transcription",
+    "video_generation",
+    "embedding",
+)
 
 
 def _merge_one(
@@ -695,7 +567,6 @@ def _merge_one(
     raw_id: str,
     *,
     live_meta: dict[str, Any] | None,
-    litellm_registry: dict[str, Any],
     openrouter_catalog: dict[str, dict[str, Any]],
 ) -> ModelInfo | None:
     """Build a :class:`ModelInfo` for one ``(provider, raw_id)`` pair.
@@ -704,29 +575,32 @@ def _merge_one(
     (missing pricing, description, or context). Callers count those
     failures into ``hidden_per_provider``.
 
-    Mode detection: LiteLLM's ``mode`` field on the entry tells us
-    whether this is a chat / image / audio / video / embedding model.
-    The completeness gate runs per-mode — chat needs both input and
-    output prices, image_generation needs at least one
-    ``input_cost_per_image`` rate, etc. Models without a recognizable
-    mode-specific pricing field are dropped from the picker (same
-    silence-beats-wrong-data principle as the chat path).
+    The strict gate is the user-trust contract: pricing must be either
+    curated (transcribed by us from the provider's own pricing page)
+    or sourced from OpenRouter's catalog (only for ``openrouter:*``
+    ids, where the user is paying OpenRouter directly so OpenRouter's
+    price IS the direct rate). Other providers' models without curated
+    pricing get hidden — better silence than a wrong number on the
+    Usage dashboard.
     """
     qualified = f"{provider.id}:{raw_id}"
     curated = _curated_meta(qualified) or {}
-    litellm = _litellm_lookup(litellm_registry, provider, raw_id) or {}
-    openrouter = _openrouter_lookup(openrouter_catalog, provider, raw_id) or {}
+    # OpenRouter enrichment ONLY applies to ``openrouter:*`` ids.
+    # Other providers' models that happen to also exist on OpenRouter
+    # don't pick up its pricing/description because that would
+    # silently substitute one provider's offering for another's.
+    openrouter_entry: dict[str, Any] = {}
+    if provider.id == "openrouter":
+        openrouter_entry = _openrouter_lookup(openrouter_catalog, raw_id) or {}
     live = live_meta or {}
 
-    mode: ModelMode = _detect_mode(litellm)
-    # Curated entries don't currently carry an explicit ``mode`` field
-    # (every curated entry is a chat model in v1); a future curated
-    # image / audio / video entry would override here.
+    # ---- Mode (curated declaration only — no auto-detection)
+    mode: ModelMode = "chat"
     cur_mode = curated.get("mode")
-    if isinstance(cur_mode, str) and cur_mode in _LITELLM_MODE_TO_OURS.values():
+    if isinstance(cur_mode, str) and cur_mode in _VALID_MODES:
         mode = cur_mode  # type: ignore[assignment]
 
-    # ---- Pricing (curated > litellm > openrouter[only if openrouter:*] > live)
+    # ---- Pricing (curated > openrouter[only if openrouter:*])
     in_price: float | None = None
     out_price: float | None = None
     cache_hit_price: float | None = None
@@ -740,20 +614,11 @@ def _merge_one(
         pricing_source = "curated"
         cache_hit_price = curated.get("cache_hit_price_per_1m")
 
-    if pricing_source is None:
-        ll_in = _to_per_1m(litellm.get("input_cost_per_token"))
-        ll_out = _to_per_1m(litellm.get("output_cost_per_token"))
-        if ll_in is not None and ll_out is not None:
-            in_price = ll_in
-            out_price = ll_out
-            pricing_source = "litellm"
-            cache_hit_price = _to_per_1m(litellm.get("cache_read_input_token_cost"))
-
     if pricing_source is None and provider.id == "openrouter":
         # OpenRouter pricing only used for openrouter:* qualified ids
         # (the user is paying OpenRouter directly, so OpenRouter's
         # pricing IS the direct rate from their perspective).
-        pricing = openrouter.get("pricing") or {}
+        pricing = openrouter_entry.get("pricing") or {}
         or_in = _to_per_1m(pricing.get("prompt"))
         or_out = _to_per_1m(pricing.get("completion"))
         if or_in is not None and or_out is not None:
@@ -761,20 +626,12 @@ def _merge_one(
             out_price = or_out
             pricing_source = "openrouter"
 
-    if pricing_source is None:
-        # Live API pricing fallthrough — Together + OpenRouter
-        # historically include pricing in their /v1/models response.
-        live_pricing = live.get("pricing") or {}
-        live_in = _to_per_1m(live_pricing.get("input")) or _to_per_1m(live_pricing.get("prompt"))
-        live_out = _to_per_1m(live_pricing.get("output")) or _to_per_1m(live_pricing.get("completion"))
-        if live_in is not None and live_out is not None:
-            in_price = live_in
-            out_price = live_out
-            pricing_source = "live"
-
     # Per-mode pricing (image / audio / video / embedding). Only
     # populated for non-chat modes; chat models stay on
-    # input_price_per_1m / output_price_per_1m above.
+    # input_price_per_1m / output_price_per_1m above. These come
+    # exclusively from curated metadata; no curated entry sets them
+    # today, so any entry with mode != "chat" will be dropped by
+    # the gate until curation lands.
     image_pricing: dict[str, float] | None = None
     tts_pricing: float | None = None
     stt_pricing: float | None = None
@@ -782,61 +639,52 @@ def _merge_one(
     embedding_pricing: float | None = None
 
     if mode == "image_generation":
-        # LiteLLM ships per-image image-generation prices in
-        # ``input_cost_per_pixel`` (legacy) or via mode-specific
-        # ``input_cost_per_image`` (current). Fall through to a
-        # default 1024x1024/standard slot.
-        per_image = litellm.get("input_cost_per_image")
-        if isinstance(per_image, (int, float)) and per_image > 0:
-            image_pricing = {"1024x1024/standard": float(per_image)}
-        if image_pricing is None:
+        cur_img = curated.get("image_pricing")
+        if isinstance(cur_img, dict) and cur_img:
+            image_pricing = {k: float(v) for k, v in cur_img.items() if isinstance(v, (int, float))}
+        if not image_pricing:
             return None
-        # Image-gen models don't have meaningful in/out token prices;
-        # zero them out so the chat-pricing path's strict gate doesn't
-        # accidentally fail an image-generation entry.
         in_price = 0.0
         out_price = 0.0
-        pricing_source = pricing_source or "litellm"
+        pricing_source = "curated"
 
     elif mode == "audio_speech":
-        per_char = _to_per_1m(litellm.get("input_cost_per_character"))
-        if per_char is not None:
-            tts_pricing = per_char
+        cur_tts = curated.get("tts_pricing_per_1m_chars")
+        if isinstance(cur_tts, (int, float)) and cur_tts > 0:
+            tts_pricing = float(cur_tts)
         else:
             return None
         in_price = 0.0
         out_price = 0.0
-        pricing_source = pricing_source or "litellm"
+        pricing_source = "curated"
 
     elif mode == "audio_transcription":
-        # LiteLLM uses ``input_cost_per_second`` for STT.
-        per_sec = litellm.get("input_cost_per_second")
-        if isinstance(per_sec, (int, float)) and per_sec > 0:
-            stt_pricing = round(float(per_sec) * 1_000_000, 6)
+        cur_stt = curated.get("stt_pricing_per_1m_seconds")
+        if isinstance(cur_stt, (int, float)) and cur_stt > 0:
+            stt_pricing = float(cur_stt)
         else:
             return None
         in_price = 0.0
         out_price = 0.0
-        pricing_source = pricing_source or "litellm"
+        pricing_source = "curated"
 
     elif mode == "video_generation":
-        per_vsec = litellm.get("input_cost_per_video_per_second")
-        if isinstance(per_vsec, (int, float)) and per_vsec > 0:
-            video_pricing = float(per_vsec)
+        cur_vid = curated.get("video_pricing_per_second")
+        if isinstance(cur_vid, (int, float)) and cur_vid > 0:
+            video_pricing = float(cur_vid)
         else:
             return None
         in_price = 0.0
         out_price = 0.0
-        pricing_source = pricing_source or "litellm"
+        pricing_source = "curated"
 
     elif mode == "embedding":
-        # Embeddings only have an "input" cost.
-        emb = _to_per_1m(litellm.get("input_cost_per_token"))
-        if emb is not None:
-            embedding_pricing = emb
-            in_price = emb
+        cur_emb = curated.get("embedding_pricing_per_1m")
+        if isinstance(cur_emb, (int, float)) and cur_emb > 0:
+            embedding_pricing = float(cur_emb)
+            in_price = float(cur_emb)
             out_price = 0.0
-            pricing_source = pricing_source or "litellm"
+            pricing_source = "curated"
         else:
             return None
 
@@ -844,7 +692,7 @@ def _merge_one(
         # Chat models still require both axes.
         return None
 
-    # ---- Description (curated > openrouter > live)
+    # ---- Description (curated > live API > openrouter[only if openrouter:*])
     description: str | None = None
     description_source: DescriptionSource | None = None
 
@@ -854,23 +702,23 @@ def _merge_one(
         description_source = "curated"
 
     if description is None:
-        or_desc = openrouter.get("description")
-        if isinstance(or_desc, str) and or_desc.strip():
-            description = or_desc.strip()
-            description_source = "openrouter"
-
-    if description is None:
-        # Live API description (Google's `description`, Anthropic's
-        # `display_name` as a soft floor).
+        # Live API description — Google's ``description`` field,
+        # Anthropic's ``display_name`` as a soft floor.
         live_desc = live.get("description") or live.get("display_name")
         if isinstance(live_desc, str) and live_desc.strip():
             description = live_desc.strip()
             description_source = "live"
 
+    if description is None and provider.id == "openrouter":
+        or_desc = openrouter_entry.get("description")
+        if isinstance(or_desc, str) and or_desc.strip():
+            description = or_desc.strip()
+            description_source = "openrouter"
+
     if description is None or description_source is None:
         return None
 
-    # ---- Context (curated > litellm > live)
+    # ---- Context (curated > live > openrouter[only if openrouter:*])
     context: int | None = None
     cur_ctx = curated.get("context")
     if isinstance(cur_ctx, str):
@@ -885,18 +733,14 @@ def _merge_one(
         context = int(cur_ctx)
 
     if context is None:
-        ll_ctx = _to_int(litellm.get("max_input_tokens")) or _to_int(litellm.get("max_tokens"))
-        if ll_ctx:
-            context = ll_ctx
-
-    if context is None:
         live_ctx = _to_int(live.get("context_length")) or _to_int(live.get("input_token_limit"))
         if live_ctx:
             context = live_ctx
-        else:
-            or_ctx = _to_int(openrouter.get("context_length"))
-            if or_ctx:
-                context = or_ctx
+
+    if context is None and provider.id == "openrouter":
+        or_ctx = _to_int(openrouter_entry.get("context_length"))
+        if or_ctx:
+            context = or_ctx
 
     if context is None or context <= 0:
         if mode == "chat":
@@ -906,47 +750,54 @@ def _merge_one(
         context = 0
 
     # ---- Capability flags
-    supports_tools = bool(litellm.get("supports_function_calling", True))
-    # Pull OpenRouter's modality arrays for both the supports_vision
-    # check and the new auto-tag derivation below. They look like
-    # ``["text", "image", "file"]`` etc.; the ``modality`` short
-    # string (``"text+image->text"``) is a fallback for older entries.
-    arch = openrouter.get("architecture") or {}
+    # ``supports_tools``: default True (the vast majority of chat
+    # models in our catalog handle OpenAI tool calls). Curated entries
+    # that document tool-calling problems can override; the chat page
+    # also surfaces a known-issue caption for entries with
+    # ``weak_tool_calling_issue_url``.
+    supports_tools = bool(curated.get("supports_tools", True))
+
+    # ``supports_vision``: curated declaration first; OpenRouter
+    # architecture-modality fallback for ``openrouter:*`` ids only.
+    supports_vision = bool(curated.get("supports_vision", False))
+    arch = openrouter_entry.get("architecture") or {}
     input_modalities = [m.lower() for m in (arch.get("input_modalities") or []) if isinstance(m, str)]
     output_modalities = [m.lower() for m in (arch.get("output_modalities") or []) if isinstance(m, str)]
     short_modality = (arch.get("modality") or "").lower()
-    supports_vision = bool(litellm.get("supports_vision", False))
-    if not supports_vision:
+    if not supports_vision and provider.id == "openrouter":
         if "image" in input_modalities or "image" in short_modality:
             supports_vision = True
+
     supports_pdf = qualified in PDF_SUPPORT_ALLOWLIST
 
     # ---- Auto-derived modality flags (used by the tag derivation
     # below + ALSO surfaced as picker tabs so users can filter to
-    # "models that take images" / "models that produce audio" etc.)
+    # "models that take images" / "models that produce audio" etc.).
+    # Modality auto-derivation only fires for ``openrouter:*`` ids
+    # (where OpenRouter's catalog provides architecture-modality
+    # arrays); other providers' modality tabs depend on curated
+    # ``mode`` declarations or curated tags.
     is_image_gen = (
         mode == "image_generation"
-        or "image" in output_modalities
+        or (provider.id == "openrouter" and "image" in output_modalities)
     )
     is_audio_gen = (
         mode == "audio_speech"
-        or "audio" in output_modalities
-        or bool(litellm.get("supports_audio_output", False))
+        or (provider.id == "openrouter" and "audio" in output_modalities)
     )
     is_audio_in = (
         mode == "audio_transcription"
-        or "audio" in input_modalities
-        or bool(litellm.get("supports_audio_input", False))
+        or (provider.id == "openrouter" and "audio" in input_modalities)
     )
     is_video_gen = (
         mode == "video_generation"
-        or "video" in output_modalities
+        or (provider.id == "openrouter" and "video" in output_modalities)
     )
-    is_video_in = "video" in input_modalities
+    is_video_in = (provider.id == "openrouter" and "video" in input_modalities)
 
     # ---- Tags: curated wins for opinionated tags (coding, reasoning,
     # frontier); auto-derived layer adds the objective ones
-    # (long_context, cheap, fast, multimodal) plus modality flags
+    # (long_context, cheap, multimodal) plus modality flags
     # (vision, image_gen, audio_gen, audio_in, video_gen, video_in).
     # Auto-tags merge with curated rather than replace, so a curated
     # ``coding`` entry on a vision-capable model gets both ``coding``
@@ -957,8 +808,6 @@ def _merge_one(
         auto_tags.append("long_context")
     if out_price <= 0.5:
         auto_tags.append("cheap")
-    if provider.id in ("groq", "cerebras"):
-        auto_tags.append("fast")
     if supports_vision:
         auto_tags.append("multimodal")
         # ``vision`` is the picker-tab tag (chat models that accept
@@ -1044,7 +893,6 @@ def _persist_live_catalog() -> None:
             "hidden_per_provider": dict(_state.hidden_per_provider),
             "raw_ids_per_provider": {k: list(v) for k, v in _state.raw_ids_per_provider.items()},
             "last_refreshed": {k: v.isoformat() for k, v in _state.last_refreshed.items()},
-            "last_litellm": _state.last_litellm.isoformat() if _state.last_litellm else None,
             "last_openrouter": _state.last_openrouter.isoformat() if _state.last_openrouter else None,
         }
     try:
@@ -1115,11 +963,6 @@ def _hydrate_from_disk() -> None:
                         _state.last_refreshed[k] = datetime.fromisoformat(v)
                     except ValueError:
                         pass
-        if isinstance(raw.get("last_litellm"), str):
-            try:
-                _state.last_litellm = datetime.fromisoformat(raw["last_litellm"])
-            except ValueError:
-                pass
         if isinstance(raw.get("last_openrouter"), str):
             try:
                 _state.last_openrouter = datetime.fromisoformat(raw["last_openrouter"])
@@ -1134,7 +977,7 @@ _hydrate_from_disk()
 # ---------------------------------------------------------------------------
 # Public API: refresh / get_info / available_qualified_ids / hidden_summary
 # ---------------------------------------------------------------------------
-def refresh(provider_id: str, client: Any, api_key: str = "") -> list[ModelInfo]:
+def refresh(provider_id: str, client: Any) -> list[ModelInfo]:
     """Refresh the catalog for ``provider_id``. Synchronous; blocks the caller.
 
     Steps:
@@ -1143,8 +986,8 @@ def refresh(provider_id: str, client: Any, api_key: str = "") -> list[ModelInfo]
     2. Fold in any curated raw ids that the live listing missed (so
        hand-picked recommended rows always appear even if the
        provider's listing surface doesn't mention them).
-    3. Pull the LiteLLM registry + OpenRouter catalog (with disk-cache
-       fall-through on network failure).
+    3. For ``openrouter`` only, pull the OpenRouter catalog (with
+       disk-cache fall-through on network failure).
     4. Run the merge step on every (provider, raw_id) candidate. The
        completeness gate returns ``None`` for incomplete entries —
        count those into ``hidden_per_provider`` for the modal caption.
@@ -1164,13 +1007,10 @@ def refresh(provider_id: str, client: Any, api_key: str = "") -> list[ModelInfo]
 
     # 1. Live listing.
     try:
-        raw_ids, live_meta = _list_provider_models_with_meta(provider_id, client, api_key)
+        raw_ids, live_meta = _list_provider_models_with_meta(provider_id, client)
     except Exception as e:  # noqa: BLE001
         with _state_lock:
             _state.errors[provider_id] = f"{provider.label} list-models failed: {e}"
-        # Don't drop existing entries on transient failure — keep the
-        # last-known-good slice. Just bail.
-        with _state_lock:
             return [
                 mi for mi in _state.info_by_qualified_id.values()
                 if mi.provider_id == provider_id
@@ -1180,9 +1020,11 @@ def refresh(provider_id: str, client: Any, api_key: str = "") -> list[ModelInfo]
     curated_ids = _all_curated_for_provider(provider_id)
     candidate_set: set[str] = set(raw_ids) | set(curated_ids)
 
-    # 3. LiteLLM + OpenRouter blobs.
-    litellm_registry = _load_litellm_registry()
-    openrouter_catalog = _fetch_openrouter_catalog()
+    # 3. OpenRouter catalog (only meaningful for the openrouter
+    # provider; other providers don't pick up enrichment from it).
+    openrouter_catalog: dict[str, dict[str, Any]] = {}
+    if provider_id == "openrouter":
+        openrouter_catalog = _fetch_openrouter_catalog()
 
     # 4. Merge each candidate.
     fresh: dict[str, ModelInfo] = {}
@@ -1193,7 +1035,6 @@ def refresh(provider_id: str, client: Any, api_key: str = "") -> list[ModelInfo]
             provider,
             raw,
             live_meta=meta,
-            litellm_registry=litellm_registry,
             openrouter_catalog=openrouter_catalog,
         )
         if info is None:
@@ -1217,25 +1058,22 @@ def refresh(provider_id: str, client: Any, api_key: str = "") -> list[ModelInfo]
     return sorted(fresh.values(), key=lambda mi: mi.label.casefold())
 
 
-def refresh_all(clients: dict[str, Any], api_keys: dict[str, str]) -> dict[str, list[ModelInfo]]:
-    """Refresh every provider for which we have either a client or a key.
+def refresh_all(clients: dict[str, Any]) -> dict[str, list[ModelInfo]]:
+    """Refresh every provider with a connected client.
 
-    Skips providers that have neither a live client nor a saved API
-    key — those simply aren't connected, and refreshing them would
-    just hit the same auth error every time. The catch-all per-
-    provider exception handling in :func:`refresh` means a single
-    failing provider never blocks the others.
+    Skips providers whose ``clients[pid]`` is None — those simply
+    aren't connected, and refreshing them would just hit the same
+    auth error every time. The catch-all per-provider exception
+    handling in :func:`refresh` means a single failing provider never
+    blocks the others.
     """
     results: dict[str, list[ModelInfo]] = {}
     for pid, provider in PROVIDERS.items():
         client = clients.get(pid)
-        api_key = (api_keys.get(pid) or "").strip()
-        if provider.kind == "litellm_compat" and not api_key:
-            continue
-        if provider.kind != "litellm_compat" and client is None:
+        if client is None:
             continue
         try:
-            results[pid] = refresh(pid, client, api_key)
+            results[pid] = refresh(pid, client)
         except Exception as e:  # noqa: BLE001 — surfaced via _state.errors
             with _state_lock:
                 _state.errors[pid] = f"{provider.label} refresh raised: {e}"
@@ -1245,7 +1083,6 @@ def refresh_all(clients: dict[str, Any], api_keys: dict[str, str]) -> dict[str, 
 
 def refresh_all_async(
     clients: dict[str, Any],
-    api_keys: dict[str, str],
     on_done: Callable[[], None] | None = None,
 ) -> threading.Thread:
     """Spawn a daemon thread to run :func:`refresh_all` in the background.
@@ -1260,7 +1097,7 @@ def refresh_all_async(
     """
     def _runner() -> None:
         try:
-            refresh_all(clients, api_keys)
+            refresh_all(clients)
         except Exception as e:  # noqa: BLE001
             with _state_lock:
                 _state.errors["__refresh_all__"] = f"refresh_all failed: {e}"
@@ -1293,21 +1130,15 @@ def available_qualified_ids(clients: dict[str, Any] | None = None) -> list[str]:
     Two-step filter:
 
     1. **Connectivity** — the provider must be connected this session.
-       ``litellm_compat`` providers count as connected when the
-       connect flow successfully listed any models (LiteLLM is
-       stateless, so we use the raw-id list as the connectivity
-       signal). Native providers (``openai_native`` / ``anthropic_native``
-       / ``google_native``) require a non-None client object in
-       ``clients[pid]``.
+       Every provider has a real client object after :func:`refresh`
+       runs, so connectivity is signalled by ``clients[pid] is not
+       None``.
     2. **Reachability** — the model's raw id MUST appear in the live
        ``/v1/models`` listing for that provider. This catches the
        case where ``MODEL_METADATA`` carries a curated entry for, say,
        ``openai:o1`` but the user's API key doesn't have access to
        o1; we'd otherwise let them pick it and crash on the first
-       chat call with a 401/403. The strict completeness gate
-       (curated > LiteLLM > OpenRouter > live) guarantees real
-       *metadata* but the *reachability* check is a separate axis
-       enforced here.
+       chat call with a 401/403.
 
     When ``clients`` is None, both filters are bypassed and every
     catalogued model is returned (used by the Settings page when no
@@ -1325,20 +1156,8 @@ def available_qualified_ids(clients: dict[str, Any] | None = None) -> list[str]:
             raw_ids = _state.raw_ids_per_provider.get(info.provider_id, []) if info else []
         if info is None:
             continue
-        provider = PROVIDERS.get(info.provider_id)
-        if provider is None:
+        if clients.get(info.provider_id) is None:
             continue
-        # Connectivity check.
-        if provider.kind == "litellm_compat":
-            connected = bool(raw_ids)
-        else:
-            connected = clients.get(info.provider_id) is not None
-        if not connected:
-            continue
-        # Reachability check: the live listing must have confirmed
-        # this raw id. Without this, a curated MODEL_METADATA entry
-        # for a model the user's key can't actually call would land
-        # in the picker and crash on the first turn.
         if info.raw_id not in raw_ids:
             continue
         out.append(qid)
@@ -1358,17 +1177,10 @@ def hidden_models_summary(clients: dict[str, Any] | None = None) -> dict[str, in
         return full
     out: dict[str, int] = {}
     for pid, n in full.items():
-        provider = PROVIDERS.get(pid)
-        if provider is None:
+        if PROVIDERS.get(pid) is None:
             continue
-        with _state_lock:
-            connected = bool(_state.raw_ids_per_provider.get(pid))
-        if provider.kind == "litellm_compat":
-            if connected:
-                out[pid] = n
-        else:
-            if clients.get(pid) is not None:
-                out[pid] = n
+        if clients.get(pid) is not None:
+            out[pid] = n
     return out
 
 
@@ -1384,12 +1196,6 @@ def newest_refresh() -> datetime | None:
         if not _state.last_refreshed:
             return None
         return max(_state.last_refreshed.values())
-
-
-def last_litellm_refresh() -> datetime | None:
-    """Return the wall-clock time we last successfully fetched LiteLLM."""
-    with _state_lock:
-        return _state.last_litellm
 
 
 def errors() -> dict[str, str]:
@@ -1457,20 +1263,16 @@ def default_model_for_mode(
 
 
 __all__ = [
-    "BUNDLED_LITELLM_SNAPSHOT",
     "CATALOG_TTL_SECONDS",
-    "LITELLM_REGISTRY_URL",
     "LIVE_CATALOG_FILE",
     "ModelInfo",
     "OPENROUTER_CATALOG_URL",
     "PDF_SUPPORT_ALLOWLIST",
-    "PROVIDER_LITELLM_PREFIX",
     "all_qualified_ids",
     "available_qualified_ids",
     "errors",
     "get_info",
     "hidden_models_summary",
-    "last_litellm_refresh",
     "last_refreshed_at",
     "list_raw_models",
     "newest_refresh",

@@ -255,18 +255,20 @@ def init_weave(
     is broken in a Streamlit/desktop context), then calls
     ``weave.init(project)``. After this returns, **every supported SDK is
     auto-patched** — Weave 0.52+ ships native integrations for ``openai``,
-    ``anthropic``, ``google_genai``, ``litellm``, ``groq``, ``cerebras``,
-    and ``mistral`` (verified via the bundled integrations directory).
+    ``anthropic``, and ``google_genai`` (the three SDKs we use). Weave
+    also ships integrations for several inference servers we don't
+    list (``groq``, ``cerebras``, ``mistral``, etc.), but those are
+    no-ops for us because we don't import their SDKs.
 
-    All four dispatch paths in :func:`chat_streams.stream_chat` therefore
+    All three dispatch paths in :func:`chat_streams.stream_chat` therefore
     log into the same trace tree without per-provider wiring beyond the
     existing ``@_op`` decorator on ``_stream_one_call``:
 
     - ``openai_native`` → patched ``openai.OpenAI`` (one trace per call)
+    - ``openai_compat`` → patched ``openai.OpenAI`` with per-provider
+      ``base_url`` (same auto-patch hook fires regardless of base URL)
     - ``anthropic_native`` → patched ``anthropic.Anthropic``
     - ``google_native`` → patched ``google.genai.Client``
-    - ``litellm_compat`` → patched ``litellm.completion`` (one trace per
-      call, child ops for the underlying HTTP request)
 
     Reuses the same `team/project` string the user pastes in the sidebar (also
     used for W&B Inference usage attribution by ``make_client``); when empty,

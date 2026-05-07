@@ -60,7 +60,6 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 import weave
-from openai import OpenAI
 
 import chat_streams
 import mcp_servers
@@ -93,15 +92,15 @@ from tools import ToolContext, dispatch, tools_for_mode
 # titles/bodies, and merge-conflict resolution. Hard-coded to V4-Flash
 # because its 1M context comfortably fits multi-file diffs and the
 # multi-file conflict-resolution turn. Stored as a fully-qualified id
-# (``wandb:<raw>``) since the multi-provider migration in Phase 2 — the
-# helper :func:`commit_ai.is_deepseek_available` checks this against
-# the user's connected W&B catalog before invoking; if not, the
-# downstream UI surfaces a clear "model unavailable" error and
-# disables generation. The git push / commit-message / conflict-
-# resolution flows still REQUIRE W&B Inference to be configured (and
-# this model present on the user's account) — Phase 3.5's
-# generalization preserves the qualified-id contract; we just no
-# longer assume the OpenAI client object is the one to call against.
+# (``wandb:<raw>``) since the multi-provider migration — the helper
+# :func:`commit_ai.is_deepseek_available` checks this against the
+# user's connected W&B catalog before invoking; if not, the downstream
+# UI surfaces a clear "model unavailable" error and disables generation.
+# The git push / commit-message / conflict-resolution flows REQUIRE
+# W&B Inference to be configured (and this model present on the user's
+# account); the W&B-pinned qualified id routes the call through the
+# user's W&B-configured ``openai.OpenAI`` client (with W&B's
+# ``base_url``) just like any other ``openai_compat`` provider.
 DEEPSEEK_MODEL = "wandb:deepseek-ai/DeepSeek-V4-Flash"
 
 
@@ -269,12 +268,14 @@ def _stream_one_call(
     *,
     provider_id: str | None = None,
     api_key: str | None = None,
+    clients: dict[str, Any] | None = None,
+    model_options: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Stream a single chat-completion call and yield UI events.
 
     Dispatches via :func:`chat_streams.stream_chat`, which routes per
-    ``provider.kind`` (``openai_native`` / ``anthropic_native`` /
-    ``google_native`` / ``litellm_compat``). The four-way dispatch
+    ``provider.kind`` (``openai_native`` / ``openai_compat`` /
+    ``anthropic_native`` / ``google_native``). The three-way dispatch
     is the single outbound chat-completion entry point per AGENTS.md.
 
     Yields ``assistant_text_delta`` events while the model is producing text,
@@ -296,9 +297,16 @@ def _stream_one_call(
     Back-compat: when ``provider_id`` is ``None``, the function assumes
     a W&B Inference path (legacy callers) and treats ``model`` as a
     qualified id if it contains a ``:``, otherwise as a bare W&B id.
+
+    ``client`` is the persistent client object for the resolved
+    provider — typically passed in by the caller via session state.
+    When ``clients`` is provided, the resolved provider's client is
+    looked up there instead (handy for cross-provider calls like the
+    DeepSeek-on-W&B git-push flow being invoked from a turn whose
+    ``client`` argument is a different provider's). ``api_key`` is
+    accepted for back-compat with older call sites and is otherwise
+    unused — clients now carry their own credentials.
     """
-    # Resolve provider + raw model id. Both pieces are needed by
-    # ``chat_streams.stream_chat`` to pick the right dispatch path.
     if provider_id is None and is_qualified(model):
         provider_id = model_provider(model)
     if provider_id is None:
@@ -308,13 +316,18 @@ def _stream_one_call(
     if provider is None:
         raise ValueError(f"Unknown provider id: {provider_id!r}")
 
+    if clients is not None:
+        resolved_client = clients.get(provider_id) or client
+    else:
+        resolved_client = client
+
     stream = chat_streams.stream_chat(
         provider=provider,
-        api_key=api_key or "",
-        client=client,
+        client=resolved_client,
         model=raw_model,
         messages=messages,
         tools=tools,
+        model_options=model_options,
     )
 
     content_parts: list[str] = []
@@ -466,7 +479,7 @@ def generate_text(
     passed. The function consumes the OpenAI-shape stream from
     :func:`chat_streams.stream_chat` and concatenates the text deltas
     instead of calling the underlying SDK directly — this keeps the
-    four-way dispatch in one place (``chat_streams.stream_chat``)
+    three-way dispatch in one place (``chat_streams.stream_chat``)
     and means a future provider added there is automatically picked
     up by ``generate_text`` without further changes.
 
@@ -477,9 +490,10 @@ def generate_text(
     provider supports them — for now we ignore them on the
     non-streaming path since we route through the streaming layer
     (the agent loop already discards token / temp tuning at that
-    level).
+    level). ``api_key`` is accepted for back-compat with older call
+    sites and is otherwise unused — the ``client`` carries its own
+    credentials.
     """
-    # Resolve the provider + raw model id.
     if provider_id is None and is_qualified(model):
         provider_id = model_provider(model)
     if provider_id is None:
@@ -501,7 +515,6 @@ def generate_text(
     parts: list[str] = []
     stream = chat_streams.stream_chat(
         provider=provider,
-        api_key=api_key or "",
         client=client,
         model=raw_model,
         messages=messages,
@@ -545,6 +558,7 @@ def run_agent_turn(
     chat_id: str | None = None,
     provider_keys: dict[str, str] | None = None,
     clients: dict[str, Any] | None = None,
+    model_options: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Drive one user turn through the model + tool loop.
 
@@ -656,6 +670,8 @@ def run_agent_turn(
                 tools,
                 provider_id=provider_id,
                 api_key=api_key,
+                clients=clients,
+                model_options=model_options,
             )
             pending_tool_calls: list[dict[str, Any]] = []
             saw_final = False

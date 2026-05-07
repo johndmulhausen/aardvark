@@ -196,19 +196,23 @@ def _persist_provider_key(provider_id: str) -> None:
 
 
 def connect_provider(provider_id: str) -> None:
-    """Connect a single provider: build client (if any), list models, persist.
+    """Connect a single provider: build client, list models, persist.
 
     Reads from ``ss.provider_keys[provider_id]`` (already synced by
     :func:`_sync_provider_widgets`), constructs the per-kind client via
-    :func:`providers.make_provider_client` (returns ``None`` for
-    ``litellm_compat`` providers — LiteLLM is stateless), and validates
-    connectivity by listing the provider's models through
-    :func:`model_catalog.list_raw_models`.
+    :func:`providers.make_provider_client` (an ``openai.OpenAI`` for
+    ``openai_native`` / ``openai_compat``, an ``anthropic.Anthropic``
+    for ``anthropic_native``, a ``google.genai.Client`` for
+    ``google_native``), and validates connectivity by listing the
+    provider's models through :func:`model_catalog.refresh`.
 
     On success:
 
-    - ``ss.clients[provider_id]`` carries the client object (or
-      ``None`` for ``litellm_compat`` — the API key is enough).
+    - ``ss.clients[provider_id]`` carries the persistent client object
+      (every provider gets a real client — for ``openai_compat`` the
+      same ``openai.OpenAI`` SDK is used with a per-provider
+      ``base_url``, the same pattern the app used for W&B Inference
+      before the multi-provider migration).
     - ``ss.provider_models[provider_id]`` carries the raw model ids
       sorted alphabetically.
     - ``ss.connect_errors[provider_id]`` is cleared.
@@ -221,11 +225,12 @@ def connect_provider(provider_id: str) -> None:
     On failure the client / models are dropped and the error message is
     stashed for the Settings card to render.
 
-    The model catalog refresh (with LiteLLM + OpenRouter enrichment)
-    runs separately in :mod:`model_catalog` once that path lands in
-    Phase 2 — this Phase 1 connect just covers raw-id listing for
-    connectivity validation + the chat picker's "is this provider
-    connected" check.
+    The model catalog refresh (with OpenRouter description enrichment
+    for the ``openrouter:*`` namespace) runs synchronously inside
+    :func:`model_catalog.refresh` — this connect path doubles as both
+    the "is this API key live" connectivity check (a /v1/models call
+    that returns 401/403 on a bad key) and the catalog-populator for
+    the picker.
     """
     ss = st.session_state
     provider = providers.get_provider(provider_id)
@@ -243,9 +248,15 @@ def connect_provider(provider_id: str) -> None:
     ss.provider_keys = keys
 
     if not api_key:
-        ss.connect_errors[provider_id] = f"Enter your {provider.label} API key first."
-        ss.clients[provider_id] = None
-        ss.provider_models[provider_id] = []
+        errors = dict(ss.connect_errors)
+        errors[provider_id] = f"Enter your {provider.label} API key first."
+        ss.connect_errors = errors
+        clients = dict(ss.clients)
+        clients[provider_id] = None
+        ss.clients = clients
+        pm = dict(ss.provider_models)
+        pm[provider_id] = []
+        ss.provider_models = pm
         if provider_id == "wandb":
             # Mirror into the legacy back-compat fields so existing
             # zero-state UI keeps working.
@@ -259,9 +270,15 @@ def connect_provider(provider_id: str) -> None:
     try:
         client = providers.make_provider_client(provider_id, api_key)
     except Exception as e:
-        ss.clients[provider_id] = None
-        ss.provider_models[provider_id] = []
-        ss.connect_errors[provider_id] = f"Could not initialize {provider.label} client: {e}"
+        clients = dict(ss.clients)
+        clients[provider_id] = None
+        ss.clients = clients
+        pm = dict(ss.provider_models)
+        pm[provider_id] = []
+        ss.provider_models = pm
+        errors = dict(ss.connect_errors)
+        errors[provider_id] = f"Could not initialize {provider.label} client: {e}"
+        ss.connect_errors = errors
         if provider_id == "wandb":
             ss.client = None
             ss.models = []
@@ -271,16 +288,23 @@ def connect_provider(provider_id: str) -> None:
     # Validate connectivity AND refresh the model catalog in one pass.
     # ``model_catalog.refresh`` lists models (the de-facto "is this API
     # key live" connectivity check — /v1/models endpoints return 401 /
-    # 403 on a bad key) and folds in LiteLLM + OpenRouter enrichment,
-    # populating the picker with fresh data immediately. The synchronous
-    # call here is fine — it's only run on user-initiated Connect
-    # clicks, not at startup; the startup path uses ``refresh_all_async``.
+    # 403 on a bad key) and folds in OpenRouter description enrichment
+    # for the ``openrouter:*`` namespace, populating the picker with
+    # fresh data immediately. The synchronous call here is fine — it's
+    # only run on user-initiated Connect clicks, not at startup; the
+    # startup path uses ``refresh_all_async``.
     try:
-        infos = model_catalog.refresh(provider_id, client, api_key)
+        model_catalog.refresh(provider_id, client)
     except Exception as e:
-        ss.clients[provider_id] = None
-        ss.provider_models[provider_id] = []
-        ss.connect_errors[provider_id] = f"Could not connect to {provider.label}: {e}"
+        clients = dict(ss.clients)
+        clients[provider_id] = None
+        ss.clients = clients
+        pm = dict(ss.provider_models)
+        pm[provider_id] = []
+        ss.provider_models = pm
+        errors = dict(ss.connect_errors)
+        errors[provider_id] = f"Could not connect to {provider.label}: {e}"
+        ss.connect_errors = errors
         if provider_id == "wandb":
             ss.client = None
             ss.models = []
@@ -312,13 +336,13 @@ def connect_provider(provider_id: str) -> None:
     ss.connect_errors = errors
 
     # Legacy back-compat fields for the W&B path until the chat page
-    # fully migrates to qualified ids in Phase 2.
+    # fully migrates to qualified ids in Phase 2. ``ss.client`` is the
+    # legacy alias the chat page reads as a connectivity flag; we set
+    # it to the real ``openai.OpenAI`` client (W&B Inference is now
+    # ``openai_compat``, dispatched through the OpenAI SDK with
+    # ``base_url`` set to the W&B endpoint).
     if provider_id == "wandb":
-        # ``ss.client`` is the legacy alias the chat page reads; keep
-        # it in sync. The actual call layer will eventually go through
-        # ``chat_streams.stream_chat`` with no client object, but the
-        # one-release alias keeps existing code paths working.
-        ss.client = client if client is not None else _LegacyWandbConnected()
+        ss.client = client
         ss.models = sorted_ids
         if ss.model not in ss.models:
             ss.model = ss.models[0] if ss.models else None
@@ -344,22 +368,6 @@ def connect_provider(provider_id: str) -> None:
 
     # Persist the key (or clear it if the user un-ticked Remember).
     _persist_provider_key(provider_id)
-
-
-class _LegacyWandbConnected:
-    """Sentinel object stashed into ``ss.client`` when W&B is connected.
-
-    The legacy W&B-only ``ss.client`` was an actual ``openai.OpenAI``
-    instance. Now that W&B routes through ``litellm.completion(...)``
-    (no persistent client), we still need a truthy value in
-    ``ss.client`` so any code path that does ``if ss.client is not
-    None`` continues to behave as "W&B is connected and ready". This
-    sentinel never makes a network call; the real call layer reads
-    ``ss.provider_keys["wandb"]`` directly through ``chat_streams``.
-    """
-
-    def __repr__(self) -> str:  # pragma: no cover — debug aid only
-        return "<LegacyWandbConnected sentinel>"
 
 
 def disconnect_provider(provider_id: str) -> None:

@@ -1484,14 +1484,9 @@ _PROVIDER_BADGE_COLOR: dict[str, str] = {
     "openai": "green",
     "anthropic": "orange",
     "gemini": "violet",
-    "together": "blue",
-    "groq": "red",
-    "fireworks": "red",
+    "openrouter": "gray",
     "mistral": "violet",
     "xai": "blue",
-    "cerebras": "orange",
-    "deepinfra": "blue",
-    "openrouter": "gray",
 }
 
 
@@ -1555,7 +1550,6 @@ def _kick_catalog_refresh() -> None:
     """Header Refresh button: kick a daemon refresh + flip the spinner flag."""
     ss = st.session_state
     ss.model_catalog_refreshing = True
-    keys = dict(ss.provider_keys)
     clients = dict(ss.clients)
 
     def _on_done() -> None:
@@ -1564,7 +1558,7 @@ def _kick_catalog_refresh() -> None:
         # picks up completion via ``model_catalog.newest_refresh()``.
         pass
 
-    model_catalog.refresh_all_async(clients, keys, on_done=_on_done)
+    model_catalog.refresh_all_async(clients, on_done=_on_done)
 
 
 def _format_last_refreshed() -> str:
@@ -1587,8 +1581,10 @@ def _format_last_refreshed() -> str:
 # Picker tabs. Order is the visual order, left to right. The first
 # group (Recommended → Coding → Reasoning) is curated; the next
 # group (Vision → Image gen → Audio gen → Video gen) is modality-
-# based and auto-derived from LiteLLM + OpenRouter data; the last
-# group (Long context → Fast & cheap → All) is generic-utility.
+# based and auto-derived from per-model curated capability flags +
+# OpenRouter's architecture-modality arrays for ``openrouter:*``
+# ids; the last group (Long context → Fast & cheap → All) is
+# generic-utility.
 #
 # Adding a new tab: append the label to ``_TAB_LABELS`` and (if it
 # corresponds to a tag from ``models.ALLOWED_TAGS``) add it to
@@ -1679,11 +1675,11 @@ def _connected_qualified_ids() -> list[str]:
     """
     ss = st.session_state
     available = model_catalog.available_qualified_ids(ss.clients)
-    # ``available_qualified_ids`` already filters litellm_compat
-    # providers by raw-id presence; for the native trio we additionally
-    # require a non-None ``ss.clients`` entry (which the function
-    # already checks). Sort by recommended order if the qualified id
-    # is in ``RECOMMENDED_MODELS`` so the more-prominent picks surface
+    # ``available_qualified_ids`` checks both connectivity (a
+    # non-None client object in ``ss.clients[pid]``) and reachability
+    # (the model's raw id appears in the live ``/v1/models`` listing).
+    # Sort by recommended order if the qualified id is in
+    # ``RECOMMENDED_MODELS`` so the more-prominent picks surface
     # first within each tab; otherwise alphabetical.
     rec_order = {qid: i for i, qid in enumerate(RECOMMENDED_MODELS)}
     return sorted(
@@ -1824,7 +1820,7 @@ def _model_picker_dialog() -> None:
                 key="_picker_refresh_btn",
             )
 
-    # Per-source error chips (LiteLLM / OpenRouter / per-provider).
+    # Per-source error chips (OpenRouter / per-provider).
     errs = model_catalog.errors()
     if errs:
         with st.container(border=False):
@@ -2034,6 +2030,172 @@ def _render_model_controls() -> None:
             f"edits without actually making them ([known issue]({issue_url}))."
             "]"
         )
+
+    # Per-chat model-options toggles. Only rendered when the currently-
+    # selected model exposes at least one applicable native feature
+    # (so most chats see zero extra UI lines below the model card).
+    _render_model_options()
+
+
+# ---------------------------------------------------------------------------
+# Per-chat model-options toggles
+# ---------------------------------------------------------------------------
+# These render directly under the model card caption. The set of toggles
+# depends on the currently-selected model:
+#
+# - OpenAI o-series (o1, o3, o3-mini, o3-pro, o4, ...): a segmented
+#   control for ``reasoning_effort`` (low / medium / high). Default:
+#   medium (matches OpenAI's API default). Setting this passes
+#   ``reasoning_effort=...`` on the chat completion call.
+# - Google Gemini: a toggle for **Google Search grounding**. Off by
+#   default. When on, the call config gets a ``Tool(google_search=...)``
+#   so the model can hit real-time web at query time. Grounding adds
+#   per-search costs above the picker's curated $/M-token figure
+#   (~$14/1000 search queries beyond Google's free 5k/month tier).
+# - xAI (Grok): a toggle for **Live Search**. Off by default. When on,
+#   the OpenAI-SDK call gets ``extra_body={"search_parameters":
+#   {"mode": "auto"}}`` so Grok can decide when to hit the real-time
+#   web. Live Search has its own per-search costs (xAI publishes
+#   those separately).
+# - Anthropic Claude: no toggles — prompt caching is auto-applied by
+#   ``chat_streams._stream_anthropic_native`` because it's a near-pure
+#   win on the agent's long system prompt. Extended thinking is wired
+#   as a hook in chat_streams but not surfaced as a UI toggle yet.
+#
+# All toggles persist per-chat via ``Chat.model_options`` and JSON-
+# round-trip through chats.save_chat. Adding a new option is a
+# 3-line change here + 1 line in chat_streams + a key in the
+# Chat.model_options docstring.
+# ---------------------------------------------------------------------------
+def _render_model_options() -> None:
+    """Render applicable per-chat option toggles inline under the model card.
+
+    Reads ``ss.model`` to figure out the current provider + model id,
+    then dispatches per provider. Persists changes to the active
+    chat's ``model_options`` dict via :func:`chats.save_chat` so the
+    toggle state survives chat switches and process restarts.
+    """
+    ss = st.session_state
+    chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
+    if chat is None or not ss.model:
+        return
+
+    provider_id = model_provider(ss.model)
+    raw_id = ss.model.split(":", 1)[1] if ":" in ss.model else ss.model
+    if provider_id is None:
+        return
+
+    if provider_id == "openai" and _is_openai_reasoning_model(raw_id):
+        _render_openai_reasoning_effort_control(chat, raw_id)
+    elif provider_id == "gemini":
+        _render_gemini_grounding_toggle(chat)
+    elif provider_id == "xai":
+        _render_xai_live_search_toggle(chat)
+
+
+def _is_openai_reasoning_model(raw_id: str) -> bool:
+    """Match OpenAI o-series reasoning model ids (o1*, o3*, o4*).
+
+    Mirrors :func:`chat_streams._is_openai_reasoning_model` so we
+    surface the toggle for exactly the same model set the dispatch
+    layer accepts the kwarg on.
+    """
+    if not isinstance(raw_id, str) or not raw_id:
+        return False
+    return raw_id.startswith("o1") or raw_id.startswith("o3") or raw_id.startswith("o4")
+
+
+_REASONING_EFFORT_OPTIONS: tuple[str, ...] = ("low", "medium", "high")
+
+
+def _render_openai_reasoning_effort_control(chat: chats.Chat, raw_id: str) -> None:
+    """Segmented control for o-series ``reasoning_effort``."""
+    current = chat.model_options.get("reasoning_effort", "medium")
+    if current not in _REASONING_EFFORT_OPTIONS:
+        current = "medium"
+
+    widget_key = f"_reasoning_effort_{chat.id}"
+    cols = st.columns([1, 4], vertical_alignment="center")
+    with cols[0]:
+        st.caption(":material/psychology: Reasoning effort")
+    with cols[1]:
+        picked = st.segmented_control(
+            "Reasoning effort",
+            options=list(_REASONING_EFFORT_OPTIONS),
+            default=current,
+            key=widget_key,
+            label_visibility="collapsed",
+            help=(
+                "How much chain-of-thought the o-series model uses before "
+                "answering. **Low** is fast and cheap; **high** is slow but "
+                "best on hard problems. Output tokens charged at the model's "
+                "standard rate either way."
+            ),
+        )
+    if picked and picked != current:
+        opts = dict(chat.model_options)
+        opts["reasoning_effort"] = picked
+        with chat._lock:
+            chat.model_options = opts
+        chats.save_chat(chat)
+
+
+def _render_gemini_grounding_toggle(chat: chats.Chat) -> None:
+    """Toggle for Gemini Google Search grounding (per-chat)."""
+    current = bool(chat.model_options.get("grounding", False))
+    widget_key = f"_grounding_{chat.id}"
+    cols = st.columns([1, 4], vertical_alignment="center")
+    with cols[0]:
+        st.caption(":material/travel_explore: Google Search")
+    with cols[1]:
+        picked = st.toggle(
+            "Google Search grounding",
+            value=current,
+            key=widget_key,
+            label_visibility="collapsed",
+            help=(
+                "Let Gemini hit Google Search at query time for real-time "
+                "facts. **Adds search costs** above Google's free tier "
+                "(~$14 per 1000 queries beyond the first 5,000 / month "
+                "shared across Gemini 3). When the agent already has "
+                "function tools, grounding is silently dropped because "
+                "Gemini's API can't combine the two."
+            ),
+        )
+    if picked != current:
+        opts = dict(chat.model_options)
+        opts["grounding"] = bool(picked)
+        with chat._lock:
+            chat.model_options = opts
+        chats.save_chat(chat)
+
+
+def _render_xai_live_search_toggle(chat: chats.Chat) -> None:
+    """Toggle for xAI Live Search (per-chat)."""
+    current = bool(chat.model_options.get("live_search", False))
+    widget_key = f"_live_search_{chat.id}"
+    cols = st.columns([1, 4], vertical_alignment="center")
+    with cols[0]:
+        st.caption(":material/travel_explore: Live Search")
+    with cols[1]:
+        picked = st.toggle(
+            "xAI Live Search",
+            value=current,
+            key=widget_key,
+            label_visibility="collapsed",
+            help=(
+                "Let Grok hit real-time web at query time. **Adds per-search "
+                "costs** (xAI publishes those separately from the per-token "
+                "rate shown in the picker). Set to ``mode=\"auto\"`` so the "
+                "model decides per-turn whether a search is needed."
+            ),
+        )
+    if picked != current:
+        opts = dict(chat.model_options)
+        opts["live_search"] = bool(picked)
+        with chat._lock:
+            chat.model_options = opts
+        chats.save_chat(chat)
 
 
 # ---------------------------------------------------------------------------

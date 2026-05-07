@@ -11,29 +11,41 @@ dependencies = [
     # dialog re-opens on the very next rerun (e.g. when the user presses
     # Enter to send a chat message), because the gating flag is still True.
     "streamlit>=1.56.0",
-    # OpenAI SDK is used directly for the OpenAI native provider AND under
-    # the hood by litellm for the OpenAI-compat 9 (W&B Inference, Together,
-    # Groq, Fireworks, Mistral, xAI, OpenRouter, DeepInfra, Cerebras) AND
-    # by ``model_catalog.py`` for ``/v1/models`` listing on every
-    # LiteLLM-routed provider.
+    # OpenAI SDK is used directly for: (1) the OpenAI native provider
+    # (api.openai.com via the OpenAI-native client), (2) the 2
+    # OpenAI-compat providers (W&B Inference, OpenRouter) — same SDK,
+    # different ``base_url`` per provider, (3) the xAI native path
+    # (xAI's REST endpoint is officially OpenAI-compatible per
+    # docs.x.ai; we use the OpenAI SDK with ``base_url=https://api.x.ai/v1``
+    # routed through a separate dispatch path so xAI-specific kwargs like
+    # ``search_parameters`` for Live Search can flow through ``extra_body``
+    # without entangling the openai_compat 2), and (4) ``model_catalog.py``
+    # for ``/v1/models`` listing on every OpenAI-shape provider. The OpenAI
+    # SDK is the single HTTP client library for the 4 OpenAI-shape
+    # endpoints; native SDKs (anthropic, google-genai, mistralai) own the
+    # other 3.
     "openai>=1.40.0",
-    # Anthropic native SDK — Phase 3. Unlocks prompt caching via
-    # ``cache_control`` blocks (~90% repeat-cost savings), extended
-    # thinking, computer use / bash / text-editor pre-built tools, and
-    # ``client.messages.count_tokens``. LiteLLM only passes these through
-    # generically.
+    # Anthropic native SDK — unlocks prompt caching via ``cache_control``
+    # blocks (~90% repeat-cost savings on every turn after the first when
+    # the long system prompt is cached, applied automatically by
+    # ``chat_streams._openai_messages_to_anthropic``), extended thinking
+    # with typed thinking blocks, computer use / bash / text-editor
+    # pre-built tools, and ``client.messages.count_tokens``.
     "anthropic>=0.40",
-    # Google Gemini native SDK — Phase 3. Unlocks grounding with Google
-    # Search, code execution, ``client.caches.create`` for context caching,
-    # and native Imagen / Veo for image / video generation.
+    # Google Gemini native SDK — unlocks grounding with Google Search
+    # (per-chat opt-in toggle in the chat page), code execution,
+    # ``client.caches.create`` for context caching, and native Imagen /
+    # Veo for image / video generation.
     "google-genai>=1.0",
-    # LiteLLM PyPI library — Phase 3 unified call layer for the 9
-    # OpenAI-compat providers. MIT-licensed, no-markup: makes direct
-    # provider HTTPS calls with the user's keys (the LiteLLM Cloud proxy
-    # is a SEPARATE commercial product we never use). Also ships
-    # ``model_prices_and_context_window.json`` which ``model_catalog.py``
-    # uses as the primary pricing source for non-curated models.
-    "litellm>=1.50",
+    # Mistral native SDK — Mistral's official Python client. Beyond
+    # OpenAI-compat chat completions it exposes Mistral's full surface
+    # (FIM completion via ``mistral.fim.complete``, ``mistral.embeddings``,
+    # ``mistral.classifiers``, the agents API, and Magistral reasoning
+    # options). The chat path uses ``mistral.chat.stream(...)`` whose
+    # SSE chunks are OpenAI-shape-compatible, so the translator in
+    # ``chat_streams._stream_mistral_native`` is mostly a passthrough
+    # plus a couple of getattr-with-fallbacks for SDK-shape variance.
+    "mistralai>=1.0",
     # pypdf — Phase 6 PDF text extraction for non-native-PDF providers
     # (everything except Anthropic Claude 3.5+ and Google Gemini 1.5+).
     # Pure Python, ~500KB, only invoked when a user attaches a PDF to a
@@ -77,5 +89,4 @@ include = [
     "fullscreen_trigger.py",
     "attachments.py",
     "_artifact_paths.py",
-    "data/litellm_model_registry.json",
 ]

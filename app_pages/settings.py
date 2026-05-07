@@ -17,19 +17,22 @@ full page width for forms and help text. Layout:
      :func:`actions.set_font_size_pref`).
      The actual at-runtime CSS override is done by
      :mod:`font_size_switcher`, also mounted from the entry script.
-4. **Providers** — one card per provider, in two tiers per
-   :data:`providers.PROVIDERS`:
+4. **Providers** — one card per provider directly in the page body
+   (W&B Inference, OpenAI, Anthropic, Google Gemini, Mistral, xAI,
+   OpenRouter). All 7 providers earn their top-of-page card on a
+   different axis: W&B for tracing, OpenAI / Anthropic / Google /
+   Mistral / xAI as native-SDK frontier-lab routes, and OpenRouter
+   as the marked-up gateway covering the long tail. OpenRouter
+   carries a persistent ``:gray-badge[marked-up gateway]`` plus a
+   caveat caption explaining its 5–10% markup so users see the
+   trade-off before opting in to the long-tail route.
 
-   - 7 ``tier == "primary"`` cards directly in the page body (W&B
-     Inference, OpenAI, Anthropic, Google Gemini, Together AI, Groq,
-     Fireworks AI). These are the most commonly used direct-host
-     providers; native pricing, no markup.
-   - 5 ``tier == "more"`` cards inside a collapsed
-     ``st.expander("More providers")`` (Mistral, xAI, Cerebras,
-     DeepInfra, OpenRouter). OpenRouter is intentionally last and
-     carries a persistent ``:gray-badge[marked-up gateway]`` plus a
-     caveat caption explaining its 5–10% markup so users only route
-     through it for niche models.
+   The :data:`providers.Provider.tier` field still exists (with
+   ``"primary"`` / ``"more"`` literals) so a future expansion of the
+   catalog can move less-prominent providers into a collapsed
+   expander, but every entry today is ``tier="primary"``. The
+   Settings page renders the "More providers" expander only when
+   :func:`providers.more_providers` returns a non-empty list.
 
    Each card renders the same dual-key-pattern API key field
    (``_<id>_key_input`` widget key paired with the canonical
@@ -297,14 +300,19 @@ def _sync_wandb_project_input() -> None:
 
 
 def _provider_status(provider_id: str) -> tuple[bool, int, str | None]:
-    """Return ``(is_connected, model_count, error_message)`` for ``provider_id``."""
+    """Return ``(is_connected, model_count, error_message)`` for ``provider_id``.
+
+    Connectivity is signalled by a non-None client object in
+    ``ss.clients[provider_id]`` (every provider gets a real client
+    after a successful connect — for ``openai_compat`` it's an
+    ``openai.OpenAI`` configured against the provider's ``base_url``).
+    The model count comes from the live ``/v1/models`` listing the
+    connect path stashed into ``ss.provider_models``.
+    """
     ss = st.session_state
     error = ss.connect_errors.get(provider_id)
     models = ss.provider_models.get(provider_id) or []
-    # ``litellm_compat`` providers have ``ss.clients[id] is None`` even
-    # when connected, so connectivity is signalled by the presence of
-    # listed models + no error message.
-    is_connected = (not error) and bool(models)
+    is_connected = (not error) and (ss.clients.get(provider_id) is not None)
     return is_connected, len(models), error
 
 
@@ -488,51 +496,71 @@ def _render_provider_card(provider: providers.Provider) -> None:
 
 
 def _render_providers_section() -> None:
-    """Render the multi-provider section: 5 primary cards + 7 in an expander.
+    """Render the multi-provider section: one card per provider in catalog order.
 
-    Tier rationale (same logic as :data:`providers.PROVIDERS` — kept in
-    lockstep): the primary tier is the smallest set of keys that
-    together let you do almost everything in this app.
+    Every provider in :data:`providers.PROVIDERS` lives in the page
+    body today — there is no "More providers" expander because the
+    catalog is small enough (7 providers) that all of them earn
+    above-the-fold treatment:
 
-    - **W&B Inference** (Weave tracing kicks in only when W&B is
+    - **W&B Inference** — Weave tracing kicks in only when W&B is
       connected, regardless of which provider you call for inference,
       so even users who plan to call other providers want a W&B key
-      for observability).
-    - **OpenAI**, **Anthropic**, **Google Gemini** — three frontier
-      providers, each unlocking native-SDK features the LiteLLM
-      library only passes through generically.
-    - **OpenRouter** — labeled as a marked-up gateway, but kept in
-      the primary tier because it's the cheapest one-key-fits-all
-      path to the dozens of open-model clouds (Together, Fireworks,
-      etc.) without managing seven separate keys.
+      for observability.
+    - **OpenAI**, **Anthropic**, **Google Gemini**, **Mistral**,
+      **xAI** — frontier labs (they train and release their own
+      foundation models). Each routes through a dedicated native-SDK
+      dispatch path; OpenAI / Anthropic / Google / xAI have
+      native-only features actively wired (``reasoning_effort``,
+      auto prompt-caching, Google Search grounding, Live Search).
+    - **OpenRouter** — labeled as a marked-up gateway, kept in the
+      catalog because it's the cheapest one-key-fits-all path to
+      dozens of open-model clouds without managing a separate key
+      per backend.
+
+    Pure inference-server providers (Together / Groq / Fireworks /
+    DeepInfra / Cerebras) are intentionally NOT listed — OpenRouter
+    routes to those backends already, and the only direct-key value-
+    add is skipping OpenRouter's markup. Add a :class:`Provider`
+    entry in :mod:`providers` if a future use case needs one of
+    those routes specifically.
+
+    The :data:`providers.Provider.tier` field still distinguishes
+    ``"primary"`` from ``"more"`` so a future catalog expansion can
+    fold less-prominent providers behind an expander; we render the
+    expander only when :func:`providers.more_providers` returns a
+    non-empty list.
     """
     st.markdown("### :material/hub: Providers")
     st.caption(
-        "Add an API key from any provider you want to use. The five "
-        "below give you the smallest set of keys that together cover "
-        "almost everything: W&B Inference for tracing, OpenAI / "
-        "Anthropic / Google for the native frontier features, and "
-        "OpenRouter as a one-key route to the long tail (with a 5–10% "
-        "markup). For heavy use of any single open-model cloud, you "
-        "can save the markup by adding a direct key from "
-        "**More providers** below."
+        "Add an API key from any provider you want to use. W&B "
+        "Inference is the source of Weave tracing (works regardless "
+        "of which provider you call); OpenAI, Anthropic, Google, "
+        "Mistral, and xAI each route through their native SDK so "
+        "you get features that OpenAI-compat HTTP can't model "
+        "(reasoning effort, prompt caching, grounding, Live Search); "
+        "OpenRouter is a one-key route to the long tail at a 5–10% "
+        "markup."
     )
 
     for provider in providers.primary_providers():
         _render_provider_card(provider)
 
-    # The "More providers" expander — direct-host providers without a
-    # frontier-class native-feature reason to keep them top-of-page.
-    # Collapsed by default so first-time users aren't overwhelmed.
-    with st.expander(":material/expand_more: More providers", expanded=False):
-        st.caption(
-            "Direct-to-provider keys with no markup. Worth adding when "
-            "you use that specific provider heavily; otherwise the "
-            "OpenRouter card above already reaches every model here at "
-            "a small premium."
-        )
-        for provider in providers.more_providers():
-            _render_provider_card(provider)
+    # The "More providers" expander — only shown when the catalog
+    # actually has tier="more" entries. Today the list is empty
+    # (every provider lives above the fold), but the affordance
+    # remains so a future catalog expansion can collapse less-
+    # prominent additions without touching this rendering code.
+    more = providers.more_providers()
+    if more:
+        with st.expander(":material/expand_more: More providers", expanded=False):
+            st.caption(
+                "Less-prominent providers. Add a key when you use that "
+                "specific service heavily; otherwise the cards above "
+                "cover almost everything."
+            )
+            for provider in more:
+                _render_provider_card(provider)
 
 
 # ---------------------------------------------------------------------------

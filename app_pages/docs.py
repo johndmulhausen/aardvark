@@ -766,11 +766,10 @@ def _render_settings_tab() -> None:
 
     st.subheader("Providers")
     st.markdown(
-        "The Settings page lists every AI provider you can use. There "
-        "are 12 in total: **5 visible by default** and 7 more inside "
-        "the **More providers** drop-down. The five up top are picked "
-        "to be the smallest set of API keys that together cover almost "
-        "every model and feature you'd want."
+        "The Settings page lists 7 AI providers, all visible above "
+        "the fold. You only need to add a key for the providers you "
+        "actually want to use — adding even one is enough to start "
+        "chatting."
     )
     st.markdown(
         "Each provider card has the same pieces: an **API key** field "
@@ -778,10 +777,9 @@ def _render_settings_tab() -> None:
         "button that opens the provider's key page in your browser, a "
         "**Remember on this machine** checkbox so the app can re-use "
         "the key next time, and **Connect / Disconnect / Forget** "
-        "buttons. You only need to add a key for the providers you "
-        "actually want to use — adding even one is enough to start chatting."
+        "buttons."
     )
-    st.markdown("##### The 5 first-class providers")
+    st.markdown("##### The 7 providers")
     st.markdown(
         "- **W&B Inference** — Weights & Biases' open-model service, "
         "and the source of **traces** (a recorded timeline of every "
@@ -792,40 +790,33 @@ def _render_settings_tab() -> None:
         "[wandb.ai/settings](https://wandb.ai/settings). The optional "
         "**Project** field tags your usage to a specific W&B team.\n"
         "- **OpenAI** — GPT-4o, o-series reasoning models, "
-        "GPT-Image-1, native text-to-speech, and Sora video.\n"
+        "GPT-Image-1, native text-to-speech, and Sora video. When "
+        "you pick an o-series model (o1, o3, o3-mini, o3-pro, ...) "
+        "the chat page shows a **Reasoning effort** control under "
+        "the model card so you can dial chain-of-thought up or down.\n"
         "- **Anthropic** — the Claude family. **Prompt caching** "
-        "(a feature only the native Anthropic key unlocks) cuts the "
-        "cost of every turn after the first by about 90%, which adds "
-        "up fast for a coding agent that re-sends a long system "
-        "prompt every turn.\n"
-        "- **Google Gemini** — Gemini 2.5 Pro / Flash, Imagen for "
-        "images, Veo for video.\n"
+        "(automatic, no toggle needed) cuts the cost of every turn "
+        "after the first by about 90% — a big deal for a coding "
+        "agent that re-sends a long system prompt every turn.\n"
+        "- **Google Gemini** — Gemini 3.1 Pro / 3 Flash / 2.5 Pro / "
+        "Flash, Imagen for images, Veo for video. The chat page "
+        "shows a **Google Search grounding** toggle under the model "
+        "card when a Gemini model is selected (lets the model hit "
+        "real-time web at query time; adds per-search costs above "
+        "Google's free tier).\n"
+        "- **Mistral** — Mistral's own models (Mistral Large 3, "
+        "Codestral for code, Magistral Medium / Small for "
+        "reasoning).\n"
+        "- **xAI** — the Grok family (Grok 4, Grok 4 Fast). The "
+        "chat page shows a **Live Search** toggle under the model "
+        "card when a Grok model is selected (lets Grok hit "
+        "real-time web at query time; adds per-search costs above "
+        "the per-token rate).\n"
         "- **OpenRouter** — labeled **marked-up gateway**. OpenRouter "
-        "is one key that reaches hundreds of models from other "
+        "is one key that reaches hundreds of models from many other "
         "providers, but they add 5–10% on top of the native price. "
         "Pick this when you want broad model coverage without "
-        "managing seven keys; if you use one of the open-model clouds "
-        "below heavily, save the markup by adding its direct key "
-        "instead."
-    )
-    st.markdown("##### The 7 in **More providers**")
-    st.markdown(
-        "All of these are direct-to-provider with no markup — worth "
-        "adding when you use that one provider heavily, but optional "
-        "if OpenRouter already covers your needs."
-    )
-    st.markdown(
-        "- **Together AI** — open-source models like Llama and "
-        "DeepSeek with strong throughput.\n"
-        "- **Groq** — the same open models, but on extra-fast LPU "
-        "hardware. Good when you want quick replies.\n"
-        "- **Fireworks AI** — production-grade hosted open models "
-        "with an in-house inference engine.\n"
-        "- **Mistral**, **xAI** (Grok), **Cerebras**, **DeepInfra** — "
-        "additional direct-host providers each with their own "
-        "specialty (Mistral's own models, Grok, Cerebras's wafer-"
-        "scale low-latency hardware, DeepInfra's deep-discount "
-        "open-model hosting)."
+        "managing a separate key per model lab."
     )
     st.caption(
         "Pricing in this app is always **direct from the provider** "

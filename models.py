@@ -6,23 +6,28 @@ counts, capability tags, and (where we have it) per-million-token pricing.
 It is read by:
 
 - ``model_catalog.py`` as the highest-priority source in the per-field
-  precedence stack (curated > LiteLLM > OpenRouter > live API). When a
-  qualified id has a curated entry here, those fields are used verbatim;
-  the catalog never overwrites them.
+  precedence stack. Pricing comes from curated metadata first, then
+  from OpenRouter's catalog (only for the ``openrouter:*`` namespace,
+  where the user is paying OpenRouter directly so OpenRouter's price
+  IS the direct rate). Descriptions come from curated first, then the
+  provider's own ``/v1/models`` response (Google's ``description``,
+  Anthropic's ``display_name``), then OpenRouter (again, only for
+  ``openrouter:*``). When a qualified id has a curated entry here,
+  those fields are used verbatim; the catalog never overwrites them.
 - ``app_pages/chat.py`` for the inline model-card caption + the picker
   modal's row labels / descriptions / tag membership.
 - ``usage.py`` for the per-turn cost compute (when curated pricing is
-  set; otherwise it falls back to LiteLLM via the catalog).
+  set; otherwise the dashboard renders ``-`` for that turn's cost
+  because we don't trust any other source for chat-completion pricing).
 
 Qualified-id format
 -------------------
 Every entry is keyed by ``"<provider_id>:<raw_model_id>"`` where
 ``provider_id`` is one of :data:`providers.PROVIDERS` (today: ``wandb``,
-``openai``, ``anthropic``, ``gemini``, ``together``, ``groq``,
-``fireworks``, ``mistral``, ``xai``, ``cerebras``, ``deepinfra``,
-``openrouter``) and ``raw_model_id`` is the model id the provider's API
+``openai``, ``anthropic``, ``gemini``, ``openrouter``, ``mistral``,
+``xai``) and ``raw_model_id`` is the model id the provider's API
 accepts (e.g. ``gpt-4o``, ``claude-3-5-sonnet-20241022``,
-``meta-llama/Llama-3.3-70B-Instruct-Turbo``).
+``mistral-large-latest``).
 
 Migrating from the old W&B-only schema
 --------------------------------------
@@ -42,17 +47,18 @@ these three):
 - ``"frontier"`` — current-generation flagship from a major lab.
 
 The ``model_catalog`` layer additionally derives ``"long_context"``
-(>=200k context), ``"cheap"`` (<=$0.50/M output), ``"fast"`` (Groq /
-Cerebras latency tier), and ``"multimodal"`` (LiteLLM
-``supports_vision``) automatically when a curated ``tags`` list is
-absent.
+(>=200k context), ``"cheap"`` (<=$0.50/M output), and (for
+``openrouter:*`` ids only) ``"multimodal"`` from OpenRouter's
+architecture-modality flags.
 
 Pricing
 -------
 ``input_price_per_1m`` / ``output_price_per_1m`` are USD per million
 tokens. Both are ``None`` when we don't have a verified curated price;
-in that case the catalog merge layer falls back to LiteLLM's
-``model_prices_and_context_window.json`` for the same qualified id.
+in that case the model is dropped from the picker by the strict
+completeness gate (with the sole exception of ``openrouter:*`` ids,
+which pick up pricing from OpenRouter's own catalog because the user
+is paying OpenRouter directly).
 ``cache_hit_price_per_1m`` is optional and currently set only for
 models that publish a cache-read price separately (e.g. Anthropic).
 
@@ -74,9 +80,8 @@ age poorly as the catalog rotates, while a public bug URL is durable.
 
 Today the flagged entries are:
 
-- **Every Llama 3.x deployment in the catalog** — across W&B,
-  Together, Groq, Fireworks, Cerebras, and DeepInfra — points at the
-  shared module constant :data:`LLAMA_3X_TOOL_CALLING_ISSUE_URL`,
+- **Every W&B-served Llama 3.x deployment in the catalog** points at
+  the shared module constant :data:`LLAMA_3X_TOOL_CALLING_ISSUE_URL`,
   which resolves to ``meta-llama/llama-models#229`` (an open issue
   filed in *Meta's own* repository, framed as a model behavior
   rather than a server-parser bug). The Llama 3.x family weights
@@ -84,12 +89,13 @@ Today the flagged entries are:
   ``tool_calls`` field, miss the ``<|python_tag|>`` token in
   multi-step flows, and miscall when a system message is present —
   all of which are model-side behaviors that every downstream
-  inference server inherits. Linking *all* Llama 3.x entries to the
-  same Meta-tracker URL (rather than to a per-provider bug) is the
-  most honest framing: it's a Llama family limitation, not a
-  W&B-only quirk. If a future provider demonstrates a robust
-  parser-side workaround that fully mitigates the symptom, drop the
-  field on that single entry — until then, flag.
+  inference server inherits. The same Llama models are also reachable
+  via OpenRouter (which dispatches to whichever upstream backend it
+  chooses); we don't flag OpenRouter Llama entries individually
+  because OpenRouter's catalog doesn't have a stable per-model
+  capability schema to extend. If a future provider demonstrates a
+  robust parser-side workaround that fully mitigates the symptom,
+  drop the field on that single entry — until then, flag.
 - ``vllm-project/vllm#14682`` — vLLM tool-parser bug where Phi-4 Mini
   emits tool calls inside ``content`` and the parser returns an empty
   ``tool_calls`` array (set on the ``wandb:microsoft/Phi-4-mini-instruct``
@@ -378,86 +384,145 @@ MODEL_METADATA: dict[str, dict[str, Any]] = {
 
     # =====================================================================
     # OpenAI (provider_id = "openai")
+    #
+    # Pricing transcribed from openai.com/api/pricing (Feb 2026 snapshot).
+    # The ``cache_hit_price_per_1m`` matches OpenAI's published cached-
+    # input rate (typically 50% of the base input price for the o-series,
+    # and 50% for GPT-4o).
     # =====================================================================
+    "openai:o3": {
+        "provider_id": "openai",
+        "label": "o3",
+        "description": "OpenAI's flagship reasoning model. Strong chain-of-thought before answering; excels at coding, math, and multi-step agentic loops. Supports adjustable reasoning_effort (low / medium / high).",
+        "context": "200k",
+        "params": "—",
+        "input_price_per_1m": 2.00,
+        "output_price_per_1m": 8.00,
+        "cache_hit_price_per_1m": 0.50,
+        "tags": ["frontier", "reasoning", "coding"],
+    },
+    "openai:o3-pro": {
+        "provider_id": "openai",
+        "label": "o3-pro",
+        "description": "Premium-tier o3 with extended reasoning depth for the hardest problems. Significantly more expensive than o3; reserve for tasks where the extra thinking pays off.",
+        "context": "200k",
+        "params": "—",
+        "input_price_per_1m": 20.00,
+        "output_price_per_1m": 80.00,
+        "tags": ["frontier", "reasoning"],
+    },
+    "openai:o3-mini": {
+        "provider_id": "openai",
+        "label": "o3-mini",
+        "description": "Compact reasoning model with adjustable reasoning_effort. Excellent value for coding, agentic workflows, and math where deep reasoning matters more than world knowledge.",
+        "context": "200k",
+        "params": "—",
+        "input_price_per_1m": 1.10,
+        "output_price_per_1m": 4.40,
+        "cache_hit_price_per_1m": 0.55,
+        "tags": ["reasoning", "coding"],
+    },
+    "openai:o1": {
+        "provider_id": "openai",
+        "label": "o1",
+        "description": "OpenAI's first-generation reasoning model. Still preferred by some workflows that pre-date o3, but the o3 family is faster and cheaper for most tasks.",
+        "context": "200k",
+        "params": "—",
+        "input_price_per_1m": 15.00,
+        "output_price_per_1m": 60.00,
+        "cache_hit_price_per_1m": 7.50,
+        "tags": ["reasoning"],
+    },
     "openai:gpt-4o": {
         "provider_id": "openai",
         "label": "GPT-4o",
-        "description": "OpenAI's flagship multimodal model with vision and audio understanding. Strong general-purpose reasoning and coding with broad tool support.",
+        "description": "OpenAI's flagship multimodal chat model with vision and audio understanding. Strong general-purpose reasoning and coding with broad tool support; the default pick when you don't need o-series chain-of-thought.",
         "context": "128k",
         "params": "—",
         "input_price_per_1m": 2.50,
         "output_price_per_1m": 10.00,
+        "cache_hit_price_per_1m": 1.25,
         "tags": ["frontier", "reasoning", "coding"],
     },
     "openai:gpt-4o-mini": {
         "provider_id": "openai",
         "label": "GPT-4o mini",
-        "description": "Compact, low-latency multimodal model. Excellent value for everyday chat, simple coding, and high-throughput workloads.",
+        "description": "Compact, low-latency multimodal model. Excellent value for everyday chat, simple coding, and high-throughput agentic loops where cost dominates.",
         "context": "128k",
         "params": "—",
         "input_price_per_1m": 0.15,
         "output_price_per_1m": 0.60,
         "tags": ["coding"],
     },
-    "openai:o1": {
-        "provider_id": "openai",
-        "label": "o1",
-        "description": "OpenAI's first reasoning model — uses chain-of-thought before answering. Strong on math, science, and complex coding tasks.",
-        "context": "200k",
-        "params": "—",
-        "input_price_per_1m": 15.00,
-        "output_price_per_1m": 60.00,
-        "tags": ["frontier", "reasoning"],
-    },
-    "openai:o1-mini": {
-        "provider_id": "openai",
-        "label": "o1-mini",
-        "description": "Smaller, cheaper, faster reasoning model. Strong on coding and STEM problems where deep reasoning matters more than world knowledge.",
-        "context": "128k",
-        "params": "—",
-        "input_price_per_1m": 1.10,
-        "output_price_per_1m": 4.40,
-        "tags": ["reasoning", "coding"],
-    },
-    "openai:o3-mini": {
-        "provider_id": "openai",
-        "label": "o3-mini",
-        "description": "Next-gen compact reasoning model with adjustable reasoning_effort. Excellent for coding, agentic workflows, and math.",
-        "context": "200k",
-        "params": "—",
-        "input_price_per_1m": 1.10,
-        "output_price_per_1m": 4.40,
-        "tags": ["reasoning", "coding"],
-    },
-    "openai:gpt-4-turbo": {
-        "provider_id": "openai",
-        "label": "GPT-4 Turbo",
-        "description": "Previous-generation GPT-4 model with vision support. Solid at long-form generation and coding when GPT-4o isn't available.",
-        "context": "128k",
-        "params": "—",
-        "input_price_per_1m": 10.00,
-        "output_price_per_1m": 30.00,
-        "tags": ["coding"],
-    },
 
     # =====================================================================
     # Anthropic (provider_id = "anthropic")
+    #
+    # Pricing transcribed from docs.anthropic.com/en/about-claude/pricing
+    # (April 2026 snapshot). Cache-hit prices reflect the 0.1x multiplier
+    # over base input price (the standard 5-minute cache rate). Claude
+    # Opus 4.7 / 4.6 / 4.5 dropped pricing relative to Opus 4.1 / 4
+    # ($5/$25 vs $15/$75) — the 4.x flagships are the value play.
     # =====================================================================
-    "anthropic:claude-3-5-sonnet-20241022": {
+    "anthropic:claude-opus-4-7": {
         "provider_id": "anthropic",
-        "label": "Claude 3.5 Sonnet",
-        "description": "Anthropic's flagship balance of intelligence and speed. Strong on agentic coding, long-form reasoning, and tool use. Supports prompt caching for ~90% repeat-cost savings.",
+        "label": "Claude Opus 4.7",
+        "description": "Anthropic's flagship Claude. Best-in-class for the hardest reasoning, analysis, and long-form coding. New tokenizer (~35% more tokens for the same fixed text but better quality). Supports prompt caching for ~90% repeat-cost savings.",
         "context": "200k",
+        "params": "—",
+        "input_price_per_1m": 5.00,
+        "output_price_per_1m": 25.00,
+        "cache_hit_price_per_1m": 0.50,
+        "tags": ["frontier", "reasoning", "coding"],
+    },
+    "anthropic:claude-sonnet-4-6": {
+        "provider_id": "anthropic",
+        "label": "Claude Sonnet 4.6",
+        "description": "Anthropic's flagship Sonnet — the best balance of intelligence and speed for an agentic coding workflow. 1M-token context window. Prompt caching is the killer feature: ~90% cost cut on every turn after the first when the system prompt is cached.",
+        "context": "1000k",
         "params": "—",
         "input_price_per_1m": 3.00,
         "output_price_per_1m": 15.00,
         "cache_hit_price_per_1m": 0.30,
         "tags": ["frontier", "reasoning", "coding"],
     },
+    "anthropic:claude-haiku-4-5": {
+        "provider_id": "anthropic",
+        "label": "Claude Haiku 4.5",
+        "description": "Fastest current-generation Claude. Great for high-volume agentic loops where Haiku-class speed matters and full Sonnet isn't needed; still benefits from prompt caching.",
+        "context": "200k",
+        "params": "—",
+        "input_price_per_1m": 1.00,
+        "output_price_per_1m": 5.00,
+        "cache_hit_price_per_1m": 0.10,
+        "tags": ["coding"],
+    },
+    "anthropic:claude-opus-4-1": {
+        "provider_id": "anthropic",
+        "label": "Claude Opus 4.1 (legacy)",
+        "description": "Previous-generation Opus. Identical capability tier to Opus 4 but at the old $15/$75 pricing — most users will prefer the much cheaper Opus 4.7.",
+        "context": "200k",
+        "params": "—",
+        "input_price_per_1m": 15.00,
+        "output_price_per_1m": 75.00,
+        "cache_hit_price_per_1m": 1.50,
+        "tags": ["reasoning"],
+    },
+    "anthropic:claude-3-5-sonnet-20241022": {
+        "provider_id": "anthropic",
+        "label": "Claude 3.5 Sonnet (legacy)",
+        "description": "Older-generation Sonnet from October 2024. Kept for workflows pinned to a specific dated id; new chats should use Sonnet 4.6.",
+        "context": "200k",
+        "params": "—",
+        "input_price_per_1m": 3.00,
+        "output_price_per_1m": 15.00,
+        "cache_hit_price_per_1m": 0.30,
+        "tags": ["coding"],
+    },
     "anthropic:claude-3-5-haiku-20241022": {
         "provider_id": "anthropic",
-        "label": "Claude 3.5 Haiku",
-        "description": "Fast, lightweight Claude model. Great for high-volume tasks where Haiku-class speed matters and full Sonnet isn't needed.",
+        "label": "Claude 3.5 Haiku (legacy)",
+        "description": "Older-generation Haiku from October 2024. Slightly cheaper input ($0.80 vs $1.00) than Haiku 4.5 but lower quality; kept for workflows pinned to a specific dated id.",
         "context": "200k",
         "params": "—",
         "input_price_per_1m": 0.80,
@@ -465,44 +530,87 @@ MODEL_METADATA: dict[str, dict[str, Any]] = {
         "cache_hit_price_per_1m": 0.08,
         "tags": ["coding"],
     },
-    "anthropic:claude-3-opus-20240229": {
-        "provider_id": "anthropic",
-        "label": "Claude 3 Opus",
-        "description": "Anthropic's previous flagship. Premium tier for the hardest reasoning, analysis, and writing tasks. Still preferred by some workflows that pre-date Sonnet 3.5.",
-        "context": "200k",
-        "params": "—",
-        "input_price_per_1m": 15.00,
-        "output_price_per_1m": 75.00,
-        "tags": ["frontier", "reasoning"],
-    },
 
     # =====================================================================
     # Google Gemini (provider_id = "gemini")
+    #
+    # Pricing transcribed from ai.google.dev/gemini-api/docs/pricing
+    # (Standard tier, 2026 snapshot). Several Gemini models tier
+    # pricing by prompt size (<=200k vs >200k); the curated price here
+    # is the <=200k rate (the common case for an agent loop). Caches
+    # use Google's "context caching" feature; the cache rate matches
+    # the published 0.1x multiplier on standard input.
     # =====================================================================
+    "gemini:gemini-3.1-pro-preview": {
+        "provider_id": "gemini",
+        "label": "Gemini 3.1 Pro",
+        "description": "Google's flagship 3.x Pro — best-in-class for multimodal understanding, agentic capabilities, and vibe-coding. Massive context window. Native grounding with Google Search; supports context caching for repeat-cost savings.",
+        "context": "1000k",
+        "params": "—",
+        "input_price_per_1m": 2.00,
+        "output_price_per_1m": 12.00,
+        "cache_hit_price_per_1m": 0.20,
+        "tags": ["frontier", "reasoning", "coding"],
+    },
+    "gemini:gemini-3-flash-preview": {
+        "provider_id": "gemini",
+        "label": "Gemini 3 Flash",
+        "description": "Most intelligent Gemini built for speed. Combines frontier intelligence with superior search and grounding — strong throughput for multimodal Q&A and agentic loops at a fraction of Pro pricing.",
+        "context": "1000k",
+        "params": "—",
+        "input_price_per_1m": 0.50,
+        "output_price_per_1m": 3.00,
+        "cache_hit_price_per_1m": 0.05,
+        "tags": ["frontier", "coding"],
+    },
+    "gemini:gemini-3.1-flash-lite-preview": {
+        "provider_id": "gemini",
+        "label": "Gemini 3.1 Flash-Lite",
+        "description": "Most cost-efficient Gemini, optimized for high-volume agentic tasks, translation, and simple data processing. Preview status — pricing and availability may shift before stable release.",
+        "context": "1000k",
+        "params": "—",
+        "input_price_per_1m": 0.25,
+        "output_price_per_1m": 1.50,
+        "cache_hit_price_per_1m": 0.025,
+        "tags": ["coding"],
+    },
     "gemini:gemini-2.5-pro": {
         "provider_id": "gemini",
         "label": "Gemini 2.5 Pro",
-        "description": "Google's flagship multimodal model with strong reasoning and a massive context window. Native grounding with Google Search and code execution available via the SDK.",
+        "description": "Stable-generation Gemini Pro with strong multipurpose reasoning and coding. Native grounding with Google Search and code execution available via the SDK.",
         "context": "1000k",
         "params": "—",
         "input_price_per_1m": 1.25,
         "output_price_per_1m": 10.00,
-        "tags": ["frontier", "reasoning", "coding"],
+        "cache_hit_price_per_1m": 0.125,
+        "tags": ["reasoning", "coding"],
     },
     "gemini:gemini-2.5-flash": {
         "provider_id": "gemini",
         "label": "Gemini 2.5 Flash",
-        "description": "Lower-latency Gemini sibling. Excellent throughput for everyday chat, multimodal Q&A, and high-volume agentic loops at a fraction of the Pro price.",
+        "description": "Stable hybrid reasoning Flash with thinking budgets and a 1M-token context. Solid value for everyday chat, multimodal Q&A, and high-volume agentic loops.",
         "context": "1000k",
         "params": "—",
         "input_price_per_1m": 0.30,
         "output_price_per_1m": 2.50,
+        "cache_hit_price_per_1m": 0.03,
         "tags": ["coding"],
+    },
+    "gemini:gemini-2.5-flash-lite": {
+        "provider_id": "gemini",
+        "label": "Gemini 2.5 Flash-Lite",
+        "description": "Smallest and most cost-effective stable Gemini, built for at-scale usage. Lower quality than Flash but unbeatable on per-token cost for simple chat / classification / extraction.",
+        "context": "1000k",
+        "params": "—",
+        "input_price_per_1m": 0.10,
+        "output_price_per_1m": 0.40,
+        "cache_hit_price_per_1m": 0.01,
+        "tags": [],
     },
     "gemini:gemini-2.0-flash": {
         "provider_id": "gemini",
         "label": "Gemini 2.0 Flash",
-        "description": "Stable Flash-tier Gemini with multimodal input + audio output support. Good baseline for cost-effective coding and chat.",
+        "description": "Previous-generation Flash with multimodal input + audio output support. Mostly superseded by 2.5 Flash but kept for workflows that depend on its specific behavior.",
         "context": "1000k",
         "params": "—",
         "input_price_per_1m": 0.10,
@@ -511,220 +619,106 @@ MODEL_METADATA: dict[str, dict[str, Any]] = {
     },
 
     # =====================================================================
-    # Together AI (provider_id = "together")
-    # =====================================================================
-    "together:meta-llama/Llama-3.3-70B-Instruct-Turbo": {
-        "provider_id": "together",
-        "label": "Llama 3.3 70B Turbo",
-        "description": "Together's optimized 70B Llama deployment. Strong open-weights generalist with low per-token pricing.",
-        "context": "128k",
-        "params": "70B (Total)",
-        "input_price_per_1m": 0.88,
-        "output_price_per_1m": 0.88,
-        "tags": ["coding"],
-        "weak_tool_calling_issue_url": LLAMA_3X_TOOL_CALLING_ISSUE_URL,
-    },
-    "together:Qwen/Qwen2.5-Coder-32B-Instruct": {
-        "provider_id": "together",
-        "label": "Qwen2.5 Coder 32B",
-        "description": "Open-weights model fine-tuned for code generation, completion, and review. Among the strongest OSS coding models at this size.",
-        "context": "32k",
-        "params": "32B (Total)",
-        "input_price_per_1m": 0.80,
-        "output_price_per_1m": 0.80,
-        "tags": ["coding"],
-    },
-    "together:deepseek-ai/DeepSeek-V3": {
-        "provider_id": "together",
-        "label": "DeepSeek V3 (Together)",
-        "description": "DeepSeek V3 served via Together AI. Frontier-tier coding and reasoning at OSS pricing.",
-        "context": "131k",
-        "params": "37B-671B (Active-Total)",
-        "input_price_per_1m": 1.25,
-        "output_price_per_1m": 1.25,
-        "tags": ["frontier", "reasoning", "coding"],
-    },
-    "together:meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": {
-        "provider_id": "together",
-        "label": "Llama 3.1 405B Turbo",
-        "description": "The largest publicly-available Llama. Strong general-purpose capabilities; useful when you need OSS provenance at the high-parameter end.",
-        "context": "128k",
-        "params": "405B (Total)",
-        "input_price_per_1m": 3.50,
-        "output_price_per_1m": 3.50,
-        "tags": ["frontier"],
-        "weak_tool_calling_issue_url": LLAMA_3X_TOOL_CALLING_ISSUE_URL,
-    },
-
-    # =====================================================================
-    # Groq (provider_id = "groq")
-    # =====================================================================
-    "groq:llama-3.3-70b-versatile": {
-        "provider_id": "groq",
-        "label": "Llama 3.3 70B (Groq)",
-        "description": "Llama 3.3 70B running on Groq's LPU hardware — exceptionally fast token streaming. Same model weights as elsewhere; pay for the speed.",
-        "context": "128k",
-        "params": "70B (Total)",
-        "input_price_per_1m": 0.59,
-        "output_price_per_1m": 0.79,
-        "tags": ["coding"],
-        "weak_tool_calling_issue_url": LLAMA_3X_TOOL_CALLING_ISSUE_URL,
-    },
-    "groq:llama-3.1-8b-instant": {
-        "provider_id": "groq",
-        "label": "Llama 3.1 8B Instant",
-        "description": "Smallest Llama on Groq — sub-second responses for high-volume agentic workflows where latency dominates.",
-        "context": "128k",
-        "params": "8B (Total)",
-        "input_price_per_1m": 0.05,
-        "output_price_per_1m": 0.08,
-        "tags": [],
-        "weak_tool_calling_issue_url": LLAMA_3X_TOOL_CALLING_ISSUE_URL,
-    },
-    "groq:mixtral-8x7b-32768": {
-        "provider_id": "groq",
-        "label": "Mixtral 8x7B (Groq)",
-        "description": "Mistral's MoE model on Groq hardware. Solid quality at very high throughput for tool-calling agents.",
-        "context": "32k",
-        "params": "47B (Total)",
-        "input_price_per_1m": 0.24,
-        "output_price_per_1m": 0.24,
-        "tags": [],
-    },
-
-    # =====================================================================
-    # Fireworks AI (provider_id = "fireworks")
-    # =====================================================================
-    "fireworks:accounts/fireworks/models/llama-v3p3-70b-instruct": {
-        "provider_id": "fireworks",
-        "label": "Llama 3.3 70B (Fireworks)",
-        "description": "Fireworks-hosted Llama 3.3 70B with FireAttention for high-throughput inference. Production-grade SLAs.",
-        "context": "128k",
-        "params": "70B (Total)",
-        "input_price_per_1m": 0.90,
-        "output_price_per_1m": 0.90,
-        "tags": ["coding"],
-        "weak_tool_calling_issue_url": LLAMA_3X_TOOL_CALLING_ISSUE_URL,
-    },
-    "fireworks:accounts/fireworks/models/qwen2p5-coder-32b-instruct": {
-        "provider_id": "fireworks",
-        "label": "Qwen2.5 Coder 32B (Fireworks)",
-        "description": "Code-specialized Qwen2.5 model on Fireworks. Strong open-weights pick for coding agents.",
-        "context": "32k",
-        "params": "32B (Total)",
-        "input_price_per_1m": 0.90,
-        "output_price_per_1m": 0.90,
-        "tags": ["coding"],
-    },
-    "fireworks:accounts/fireworks/models/deepseek-v3": {
-        "provider_id": "fireworks",
-        "label": "DeepSeek V3 (Fireworks)",
-        "description": "DeepSeek V3 hosted on Fireworks. Competitive frontier-tier model at OSS pricing.",
-        "context": "131k",
-        "params": "37B-671B (Active-Total)",
-        "input_price_per_1m": 0.90,
-        "output_price_per_1m": 0.90,
-        "tags": ["frontier", "reasoning", "coding"],
-    },
-
-    # =====================================================================
     # Mistral (provider_id = "mistral")
+    #
+    # Pricing transcribed from docs.mistral.ai (2026 lineup). The
+    # December 2025 Large 3 release dropped flagship pricing 4x vs
+    # the previous Large 2 ($0.50/$1.50 vs $2.00/$6.00). Magistral is
+    # Mistral's reasoning family (similar role to o-series for OpenAI
+    # or thinking models for Anthropic / Google).
     # =====================================================================
     "mistral:mistral-large-latest": {
         "provider_id": "mistral",
-        "label": "Mistral Large",
-        "description": "Mistral's flagship dense model. Strong reasoning + multilingual generation.",
+        "label": "Mistral Large 3",
+        "description": "Mistral's flagship dense model. Strong reasoning + multilingual generation. The December 2025 release brought a 4x price cut vs Large 2 — now strongly competitive on cost.",
+        "context": "256k",
+        "params": "—",
+        "input_price_per_1m": 0.50,
+        "output_price_per_1m": 1.50,
+        "tags": ["frontier", "reasoning"],
+    },
+    "mistral:magistral-medium-latest": {
+        "provider_id": "mistral",
+        "label": "Magistral Medium",
+        "description": "Mistral's frontier-class reasoning model — chain-of-thought before answering, similar to o-series. Best Mistral pick for hard coding, math, and multi-step agentic loops.",
         "context": "128k",
         "params": "—",
         "input_price_per_1m": 2.00,
-        "output_price_per_1m": 6.00,
-        "tags": ["frontier", "reasoning"],
+        "output_price_per_1m": 5.00,
+        "tags": ["frontier", "reasoning", "coding"],
     },
-    "mistral:mistral-small-latest": {
+    "mistral:magistral-small-latest": {
         "provider_id": "mistral",
-        "label": "Mistral Small",
-        "description": "Mistral's efficient small model. Great cost / quality balance for high-volume tasks.",
-        "context": "32k",
+        "label": "Magistral Small",
+        "description": "Lightweight reasoning model from Mistral. Strong on domain-specific tasks where cost matters but you still want chain-of-thought.",
+        "context": "128k",
         "params": "—",
-        "input_price_per_1m": 0.20,
-        "output_price_per_1m": 0.60,
-        "tags": [],
+        "input_price_per_1m": 0.50,
+        "output_price_per_1m": 1.50,
+        "tags": ["reasoning"],
+    },
+    "mistral:mistral-medium-3": {
+        "provider_id": "mistral",
+        "label": "Mistral Medium 3",
+        "description": "Balanced-tier dense Mistral. ~90% of frontier performance at ~20% of frontier cost; a strong default pick when Large 3 is overkill.",
+        "context": "128k",
+        "params": "—",
+        "input_price_per_1m": 0.40,
+        "output_price_per_1m": 2.00,
+        "tags": ["coding"],
     },
     "mistral:codestral-latest": {
         "provider_id": "mistral",
         "label": "Codestral",
-        "description": "Mistral's code-specialized model. Strong fill-in-the-middle and instruct-following on code.",
-        "context": "32k",
+        "description": "Mistral's code-specialized model. Strong fill-in-the-middle and instruct-following on code; the natural pick from Mistral when the workload is code-heavy.",
+        "context": "262k",
         "params": "22B (Total)",
-        "input_price_per_1m": 0.20,
-        "output_price_per_1m": 0.60,
+        "input_price_per_1m": 0.30,
+        "output_price_per_1m": 0.90,
         "tags": ["coding"],
+    },
+    "mistral:mistral-small-latest": {
+        "provider_id": "mistral",
+        "label": "Mistral Small 3.2",
+        "description": "Mistral's most cost-efficient model. Sub-$0.10/M input — great for high-volume classification, extraction, and simple chat where Magistral or Medium would be wasted.",
+        "context": "32k",
+        "params": "—",
+        "input_price_per_1m": 0.075,
+        "output_price_per_1m": 0.20,
+        "tags": [],
     },
 
     # =====================================================================
     # xAI (provider_id = "xai")
+    #
+    # Pricing transcribed from docs.x.ai/models (2026 lineup). The
+    # Grok 4 family supplanted the Grok 2 series; the older Grok 2
+    # entry is dropped because xAI has retired most of those endpoints.
+    # Live Search is a native xAI feature (real-time web access at
+    # query time) — not yet wired through this app's chat flow.
     # =====================================================================
-    "xai:grok-2-1212": {
+    "xai:grok-4": {
         "provider_id": "xai",
-        "label": "Grok 2",
-        "description": "xAI's flagship Grok 2. Competitive on reasoning and conversational quality with native real-time web context support.",
-        "context": "128k",
+        "label": "Grok 4",
+        "description": "xAI's flagship Grok 4. Competitive on reasoning and conversational quality with function calling, structured outputs, and native Live Search (real-time web access).",
+        "context": "256k",
         "params": "—",
-        "input_price_per_1m": 2.00,
-        "output_price_per_1m": 10.00,
-        "tags": ["frontier"],
+        "input_price_per_1m": 3.00,
+        "output_price_per_1m": 15.00,
+        "tags": ["frontier", "reasoning"],
     },
-
-    # =====================================================================
-    # Cerebras (provider_id = "cerebras")
-    # =====================================================================
-    "cerebras:llama-3.3-70b": {
-        "provider_id": "cerebras",
-        "label": "Llama 3.3 70B (Cerebras)",
-        "description": "Llama 3.3 70B running on Cerebras' wafer-scale CS-3 hardware. Industry-leading throughput for long-context generation.",
-        "context": "128k",
-        "params": "70B (Total)",
-        "input_price_per_1m": 0.85,
-        "output_price_per_1m": 1.20,
-        "tags": [],
-        "weak_tool_calling_issue_url": LLAMA_3X_TOOL_CALLING_ISSUE_URL,
-    },
-    "cerebras:llama3.1-8b": {
-        "provider_id": "cerebras",
-        "label": "Llama 3.1 8B (Cerebras)",
-        "description": "Sub-second-latency Llama 3.1 8B on Cerebras hardware. Useful when you need LLM speed comparable to local inference.",
-        "context": "128k",
-        "params": "8B (Total)",
-        "input_price_per_1m": 0.10,
-        "output_price_per_1m": 0.10,
-        "tags": [],
-        "weak_tool_calling_issue_url": LLAMA_3X_TOOL_CALLING_ISSUE_URL,
-    },
-
-    # =====================================================================
-    # DeepInfra (provider_id = "deepinfra")
-    # =====================================================================
-    "deepinfra:meta-llama/Meta-Llama-3.1-70B-Instruct": {
-        "provider_id": "deepinfra",
-        "label": "Llama 3.1 70B (DeepInfra)",
-        "description": "Cost-optimized Llama 3.1 70B on DeepInfra. Among the cheapest pricing for this model size.",
-        "context": "128k",
-        "params": "70B (Total)",
-        "input_price_per_1m": 0.35,
-        "output_price_per_1m": 0.40,
-        "tags": [],
-        "weak_tool_calling_issue_url": LLAMA_3X_TOOL_CALLING_ISSUE_URL,
-    },
-    "deepinfra:Qwen/Qwen2.5-Coder-32B-Instruct": {
-        "provider_id": "deepinfra",
-        "label": "Qwen2.5 Coder 32B (DeepInfra)",
-        "description": "DeepInfra-hosted Qwen2.5 Coder. Cheap option for OSS code generation.",
-        "context": "32k",
-        "params": "32B (Total)",
-        "input_price_per_1m": 0.07,
-        "output_price_per_1m": 0.16,
+    "xai:grok-4-fast": {
+        "provider_id": "xai",
+        "label": "Grok 4 Fast",
+        "description": "Cost-efficient Grok 4 variant with a 2M-token context. Excellent for long-document analysis and high-volume agentic loops where the full Grok 4 price isn't justified.",
+        "context": "2000k",
+        "params": "—",
+        "input_price_per_1m": 0.20,
+        "output_price_per_1m": 0.50,
+        "cache_hit_price_per_1m": 0.05,
         "tags": ["coding"],
     },
+
 }
 
 
@@ -737,16 +731,17 @@ MODEL_METADATA: dict[str, dict[str, Any]] = {
 # silently skipped (the model_catalog filter does that intersection).
 # ---------------------------------------------------------------------------
 RECOMMENDED_MODELS: list[str] = [
-    "anthropic:claude-3-5-sonnet-20241022",
+    "anthropic:claude-sonnet-4-6",
+    "openai:o3",
+    "gemini:gemini-3.1-pro-preview",
     "openai:gpt-4o",
-    "gemini:gemini-2.5-pro",
-    "openai:o3-mini",
+    "anthropic:claude-opus-4-7",
     "wandb:deepseek-ai/DeepSeek-V3.1",
     "wandb:Qwen/Qwen3-Coder-480B-A35B-Instruct",
+    "anthropic:claude-haiku-4-5",
+    "gemini:gemini-3-flash-preview",
     "openai:gpt-4o-mini",
-    "anthropic:claude-3-5-haiku-20241022",
-    "groq:llama-3.3-70b-versatile",
-    "gemini:gemini-2.5-flash",
+    "openai:o3-mini",
 ]
 
 
@@ -757,11 +752,11 @@ RECOMMENDED_MODELS: list[str] = [
 # auto-derived): ``coding`` / ``reasoning`` / ``frontier``.
 #
 # Auto-derived tags (computed inside ``model_catalog._merge_one``
-# from LiteLLM flags + OpenRouter modality arrays + provider
-# attributes — overlay onto curated tags):
+# from provider attributes + per-model curated capability flags +
+# OpenRouter's architecture-modality arrays for ``openrouter:*``
+# ids — overlay onto curated tags):
 # - ``long_context`` — context >= 200k tokens.
 # - ``cheap`` — output_price <= $0.50/M tokens.
-# - ``fast`` — provider is Groq or Cerebras (latency-tier hardware).
 # - ``multimodal`` — supports image input (legacy alias of ``vision``;
 #   kept for back-compat with curated entries).
 # - ``vision`` — chat model that accepts image input. Picker tab.
@@ -770,11 +765,15 @@ RECOMMENDED_MODELS: list[str] = [
 # - ``audio_in`` — model that accepts audio input but doesn't gen.
 # - ``video_gen`` — model that GENERATES video. Picker tab.
 # - ``video_in`` — model that accepts video input but doesn't gen.
+# Without a per-provider machine-readable signal for the modality
+# flags, the auto-derivation only fires for ``openrouter:*`` ids
+# (where OpenRouter's catalog provides architecture data) and for
+# any curated entry that explicitly sets ``mode`` or carries the
+# matching tag. Other providers' modality tabs depend on curation.
 ALLOWED_TAGS: tuple[str, ...] = (
     "coding",
     "reasoning",
     "long_context",
-    "fast",
     "cheap",
     "frontier",
     "multimodal",

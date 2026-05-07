@@ -284,9 +284,11 @@ class ToolContext:
     without re-importing Streamlit. Populated by ``chats.start_turn``
     from ``ss.provider_keys``; ``{}`` when no keys are configured.
 
-    ``clients`` is the per-provider native client dict (Anthropic /
-    Google / OpenAI native clients keyed by provider id). LiteLLM-
-    routed providers carry ``None`` since LiteLLM is stateless.
+    ``clients`` is the per-provider client dict (an ``openai.OpenAI``
+    for ``openai_native`` / ``openai_compat``, an ``anthropic.Anthropic``
+    for ``anthropic_native``, a ``google.genai.Client`` for
+    ``google_native``, keyed by provider id). Every connected provider
+    has a real client object; ``None`` means "not connected".
     """
     working_dir: Path
     chat_id: str | None = None

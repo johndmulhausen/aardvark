@@ -80,11 +80,12 @@ def generate_commit_message(
 
     Returns ``""`` when the diff is empty (nothing to summarize) so the
     caller can fall back to a stub message instead of submitting an
-    empty string. The W&B route uses LiteLLM under the hood, so
-    ``client`` may be ``None`` here — what matters is ``api_key`` being
-    populated for the W&B provider; we accept ``client=None`` defensively
-    and rely on the ``DEEPSEEK_MODEL`` qualified id (``wandb:...``)
-    routing through the right path.
+    empty string. ``client`` is the user's W&B-configured
+    ``openai.OpenAI`` instance (W&B Inference is ``openai_compat``,
+    dispatched through the OpenAI SDK with W&B's ``base_url``);
+    ``DEEPSEEK_MODEL`` is the qualified ``wandb:...`` id that pins
+    routing to that provider. ``api_key`` is accepted for back-compat
+    with older callers and is otherwise unused.
     """
     diff = git_ops.combined_diff_for_paths(working_dir, paths)
     if not diff.strip():

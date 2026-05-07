@@ -75,13 +75,6 @@ BUNDLED_MODULES: tuple[str, ...] = (
     "app_pages/usage.py",
     "app_pages/settings.py",
     "app_pages/docs.py",
-    # Repo-bundled LiteLLM pricing snapshot — the offline floor for
-    # ``model_catalog._load_litellm_registry``. Without this, a fresh
-    # install with no network connectivity would have no pricing data
-    # for any model; the strict completeness gate would hide
-    # everything from the picker until the first online refresh.
-    "data/litellm_model_registry.json",
-    "data/LITELLM_REGISTRY_SHA.txt",
 )
 
 # Third-party packages imported by ``BUNDLED_MODULES`` (not by
@@ -95,16 +88,19 @@ COLLECT_ALL_PACKAGES: tuple[str, ...] = (
     "weave",
     "mcp",
     "httpx",
-    # Phase 1–6 deps. ``litellm`` is the call layer for 9 of the 12
-    # providers; ``anthropic`` and ``google.genai`` are the native SDKs
-    # for the other two; ``pypdf`` is used by ``attachments.extract_text``
-    # for non-native PDF-input models; ``PIL`` is needed by
+    # Multi-provider deps. The OpenAI SDK (collected above) is the call
+    # layer for 4 providers (OpenAI native + xAI native + the 2
+    # OpenAI-compat providers W&B Inference and OpenRouter, all via
+    # per-provider ``base_url``); ``anthropic``, ``google.genai``, and
+    # ``mistralai`` are the native SDKs for the other 3 frontier labs.
+    # ``pypdf`` is used by ``attachments.extract_text`` for non-native
+    # PDF-input models; ``PIL`` is needed by
     # ``attachments.preprocess_image`` (transitive Streamlit dep, but
     # we collect it explicitly so PyInstaller picks up the bundled
     # image codecs).
     "anthropic",
     "google.genai",
-    "litellm",
+    "mistralai",
     "pypdf",
     "PIL",
 )

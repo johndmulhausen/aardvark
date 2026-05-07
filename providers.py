@@ -1,62 +1,67 @@
 """Provider catalog and client factory for the multi-provider inference layer.
 
 Single source of truth for which inference providers the app supports, what
-kind of dispatch each one needs, and how to build a client for the ones
-that own persistent client objects.
+kind of dispatch each one needs, and how to build a client for each.
 
-The 12-entry ``PROVIDERS`` dict is split four ways by ``kind``:
+The 7-entry ``PROVIDERS`` dict is split five ways by ``kind``:
 
 - ``"openai_native"`` (1 provider): OpenAI. Uses the ``openai`` SDK direct
-  to ``api.openai.com`` so users get first-class access to features
-  LiteLLM only passes through generically — ``reasoning_effort`` for the
-  o-series, typed structured outputs via
-  ``client.beta.chat.completions.parse(...)``, ``prediction`` for predicted
-  outputs, and the Files / Batch / Vector Stores APIs.
+  to ``api.openai.com``. Wires native OpenAI features the OpenAI-compat
+  branch can't model — ``reasoning_effort`` for the o-series (live
+  per-chat toggle: low / medium / high) is the active one today; typed
+  structured outputs via ``client.beta.chat.completions.parse(...)``,
+  ``prediction`` for predicted outputs, and the Files / Batch / Vector
+  Stores APIs are hooks-ready for future expansion. Identical wire
+  format to the ``openai_compat`` providers below; the kind
+  discriminator exists so OpenAI-specific kwargs land in one branch
+  without affecting the other HTTP-compatible providers.
 - ``"anthropic_native"`` (1 provider): Anthropic. Uses the ``anthropic``
-  SDK so users get prompt caching via ``cache_control`` blocks (~90%
-  repeat-cost savings on every turn after the first), extended thinking
-  with typed thinking blocks, computer use / bash / text-editor pre-built
-  tools, the Message Batches API (50% off async work), and
-  ``client.messages.count_tokens(...)`` for pre-flight cost estimation.
+  SDK so users get prompt caching via ``cache_control`` blocks
+  (auto-applied to the system prompt by
+  ``chat_streams._openai_messages_to_anthropic`` — ~90% repeat-cost
+  savings on every turn after the first when the long system prompt is
+  cached), extended thinking with typed thinking blocks, computer use /
+  bash / text-editor pre-built tools, the Message Batches API (50% off
+  async work), and ``client.messages.count_tokens(...)`` for pre-flight
+  cost estimation.
 - ``"google_native"`` (1 provider): Google Gemini. Uses the
-  ``google-genai`` SDK so users get grounding with Google Search,
-  code-execution, ``client.caches.create(...)`` for context caching, and
-  native Imagen / Veo image / video gen.
-- ``"litellm_compat"`` (9 providers): W&B Inference, Mistral, xAI,
-  Together, Fireworks, Groq, OpenRouter, DeepInfra, Cerebras. All nine
-  are OpenAI-compatible chat-completions endpoints with no significantly
-  differentiating native features for our use case. Calls dispatch via
-  ``litellm.completion(model=f"{prefix}{raw_id}", api_key=..., base_url=..., ...)``
-  with no persistent client object — LiteLLM is stateless. The catalog-
-  fetch path in ``model_catalog.py`` does construct an ``openai.OpenAI``
-  instance per LiteLLM-routed provider for ``client.models.list()`` calls
-  because LiteLLM's listing surface is per-provider, but those clients
-  live there and aren't exposed via session state.
-
-**Important: the LiteLLM library does not mark up tokens.** It is the
-MIT-licensed open source ``litellm`` PyPI package and ``litellm.completion``
-makes direct ``httpx`` calls to the provider's endpoint using the user's
-API key. The ``litellm.ai`` hosted proxy (LiteLLM Cloud) is a separate
-commercial product we never use. The pricing in LiteLLM's
-``model_prices_and_context_window.json`` is direct-from-provider rates
-because the library makes direct-from-provider calls.
+  ``google-genai`` SDK so users get grounding with Google Search
+  (per-chat opt-in toggle in the chat page), code-execution,
+  ``client.caches.create(...)`` for context caching, and native Imagen /
+  Veo image / video gen.
+- ``"mistral_native"`` (1 provider): Mistral. Uses the ``mistralai`` SDK
+  so users get Mistral's full surface — FIM completion, embeddings,
+  classifiers, the agents API, and Magistral reasoning options —
+  alongside chat completions. The chat path itself is OpenAI-shape on
+  the wire, but the dispatch route stays separate so future
+  Mistral-only kwargs can land in one branch without affecting other
+  providers.
+- ``"xai_native"`` (1 provider): xAI (Grok). Uses the ``openai`` SDK with
+  ``base_url=https://api.x.ai/v1`` because xAI's REST endpoint is
+  officially OpenAI-compatible (per docs.x.ai). The dedicated dispatch
+  route is what unlocks the per-chat **Live Search** toggle (real-time
+  web access at query time), passed through as
+  ``extra_body={"search_parameters": {...}}`` on the OpenAI-SDK call.
+  We deliberately do NOT pull in the gRPC-based ``xai-sdk`` package
+  because the REST surface covers everything we need for chat + Live
+  Search and avoids the gRPC / OpenTelemetry dependency tail.
+- ``"openai_compat"`` (2 providers): W&B Inference, OpenRouter. Both
+  expose OpenAI-shape ``/v1/chat/completions`` endpoints, so they share
+  one code path: ``openai.OpenAI(base_url=provider.base_url,
+  api_key=...)`` with ``client.chat.completions.create(stream=True,
+  ...)`` and no provider-specific kwargs. W&B Inference is here because
+  it's the home provider whose OSS model lineup is OpenAI-shape;
+  OpenRouter is here because it's the marked-up gateway that aggregates
+  hundreds of upstream models without exposing per-upstream native
+  features.
 
 The ``tier`` field drives the Settings page card layout:
 ``"primary"`` cards render in the default body of the Settings page;
 ``"more"`` cards render inside an ``st.expander("More providers")``.
-OpenRouter is intentionally placed in ``"more"`` and carries a
-non-empty ``notes`` string about its 5–10% markup so the UI can warn
-users.
-
-The ``litellm_prefix`` field is consulted by ``chat_streams.py``
-(Phase 3) to build the ``model=`` argument passed to
-``litellm.completion(...)`` and by ``model_catalog.py`` (Phase 2) to
-look up entries in LiteLLM's pricing registry under the right namespace.
-For ``openai_native`` / ``anthropic_native`` / ``google_native`` the
-prefix is unused at call time but kept for completeness so
-``model_catalog.py`` can resolve LiteLLM pricing entries for those
-providers too (LiteLLM ships their pricing under ``""`` / ``""`` /
-``"gemini/"`` namespaces respectively).
+OpenRouter sits in ``"primary"`` despite its 5–10% markup because a
+single OpenRouter key reaches hundreds of models — the persistent
+``:gray-badge[marked-up gateway]`` label + the ``notes`` caption keep
+the trade-off visible without burying the option.
 """
 from __future__ import annotations
 
@@ -67,7 +72,9 @@ ProviderKind = Literal[
     "openai_native",
     "anthropic_native",
     "google_native",
-    "litellm_compat",
+    "mistral_native",
+    "xai_native",
+    "openai_compat",
 ]
 ProviderTier = Literal["primary", "more"]
 
@@ -78,26 +85,11 @@ class Provider:
 
     ``id`` is the canonical, lower-case slug used everywhere — as the dict
     key in ``PROVIDERS``, as the prefix in qualified model ids
-    (``<id>:<raw_model_id>``), as the dict key in ``ss.provider_keys`` /
-    ``ss.clients`` / ``ss.provider_models`` / ``ss.connect_errors``, and
-    as the LiteLLM ``litellm_provider`` field for the cross-provider
-    pricing-substitution check.
+    (``<id>:<raw_model_id>``), and as the dict key in ``ss.provider_keys`` /
+    ``ss.clients`` / ``ss.provider_models`` / ``ss.connect_errors``.
 
-    ``litellm_prefix`` follows LiteLLM's own naming convention:
-
-    - OpenAI / Anthropic / W&B's "wandb/..." entries are bare (no prefix).
-    - Together is ``"together_ai/"``, Groq is ``"groq/"``, Fireworks is
-      ``"fireworks_ai/"``, Mistral is ``"mistral/"``, etc.
-
-    The string is concatenated with the model's raw id at call time:
-    ``model=f"{provider.litellm_prefix}{raw_id}"``. When LiteLLM ships
-    no entry for a particular ``<prefix><raw_id>`` combination, the
-    catalog falls through to other sources (curated > OpenRouter > the
-    provider's own ``/v1/models``); pricing is never substituted across
-    providers.
-
-    ``base_url`` is consumed only by ``litellm_compat`` providers (passed
-    as ``base_url=`` to ``litellm.completion``). Native providers leave
+    ``base_url`` is consumed only by ``openai_compat`` providers (passed
+    as ``base_url=`` to ``openai.OpenAI(...)``). Native providers leave
     it as the empty string because their SDKs hard-code their endpoints.
 
     ``key_url`` is rendered as an ``st.link_button`` in the provider's
@@ -115,50 +107,51 @@ class Provider:
     key_url: str = ""
     tier: ProviderTier = "primary"
     notes: str = ""
-    litellm_prefix: str = ""
     extra_fields: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# The 12-provider catalog.
+# The 7-provider catalog (all primary tier).
 #
-# Tier rationale (5 primary + 7 more): the default Settings body shows
-# the providers that together give you almost everything you'd want to
-# do in this app with the smallest number of API keys to manage.
-#
-# Primary (5):
+# Every entry earns its top-of-page card on a different axis:
 #
 # - **W&B Inference** — first because it's the home provider AND
 #   because Weave tracing only kicks in when W&B is connected,
 #   regardless of which provider you use for inference. So even users
 #   who plan to call OpenAI / Anthropic / Google directly want a W&B
 #   key for observability.
-# - **OpenAI**, **Anthropic**, **Google Gemini** — the three frontier
-#   providers, each with native-SDK features the LiteLLM library
-#   only passes through generically (Anthropic prompt caching is the
-#   killer feature for an agent that re-sends a long system prompt
-#   every turn).
-# - **OpenRouter** — labeled as a marked-up gateway, but elevated to
-#   the primary tier because it's the cheapest "everything else"
-#   option for users who don't want to manage seven separate keys
-#   for the open-model clouds. Together / Groq / Fireworks / etc.
-#   models are all reachable through OpenRouter at a 5-10% premium.
+# - **OpenAI**, **Anthropic**, **Google Gemini** — three frontier
+#   providers, each with native-SDK feature wiring (OpenAI
+#   ``reasoning_effort``, Anthropic auto-prompt-caching, Google
+#   Search grounding) that OpenAI-compat HTTP can't model.
+# - **Mistral**, **xAI** — two more frontier labs (they train and
+#   release their own foundation models — Mistral Large, Codestral,
+#   Grok-4, Grok 4 Fast). Worth a direct key for users who lean on
+#   those labs' models heavily; OpenRouter also routes to both at a
+#   5-10% markup.
+# - **OpenRouter** — labeled as a marked-up gateway, but kept in the
+#   primary tier because it's the cheapest "everything else" option
+#   for users who don't want to manage a separate key per open-model
+#   lab. Llama / DeepSeek / Qwen / etc. are all reachable through
+#   OpenRouter at a 5-10% premium.
 #
-# More (7): Together, Groq, Fireworks, Mistral, xAI, Cerebras,
-# DeepInfra. All direct-host, no markup. Worth a direct key when you
-# use that provider heavily; otherwise OpenRouter covers them.
+# We do NOT list pure inference servers (Together, Groq, Fireworks,
+# DeepInfra, Cerebras, etc.) because OpenRouter already routes to
+# those backends and the direct-key value-add over OpenRouter is
+# purely the markup — simpler to point users at OpenRouter than to
+# maintain a card per inference cloud. If a future use case needs a
+# specific inference cloud that OpenRouter doesn't carry, add a
+# Provider entry here.
 # ---------------------------------------------------------------------------
 PROVIDERS: dict[str, Provider] = {
     # -- Primary tier (5) ---------------------------------------------------
     "wandb": Provider(
         id="wandb",
         label="W&B Inference",
-        kind="litellm_compat",
+        kind="openai_compat",
         base_url="https://api.inference.wandb.ai/v1",
         key_url="https://wandb.ai/settings",
         tier="primary",
-        # LiteLLM uses ``wandb/...`` for the W&B Inference namespace.
-        litellm_prefix="wandb/",
         # The optional ``team/project`` field the user pastes alongside the
         # API key — used for usage attribution and Weave tracing. The
         # widget reads this dict to decide whether to render the field.
@@ -171,8 +164,6 @@ PROVIDERS: dict[str, Provider] = {
         # Native SDK hard-codes the endpoint; base_url left empty.
         key_url="https://platform.openai.com/api-keys",
         tier="primary",
-        # OpenAI ids in LiteLLM are bare (``gpt-4o``, ``o3-mini``, etc.).
-        litellm_prefix="",
     ),
     "anthropic": Provider(
         id="anthropic",
@@ -180,8 +171,6 @@ PROVIDERS: dict[str, Provider] = {
         kind="anthropic_native",
         key_url="https://console.anthropic.com/settings/keys",
         tier="primary",
-        # Anthropic ids in LiteLLM are bare (``claude-3-5-sonnet-...``).
-        litellm_prefix="",
     ),
     "gemini": Provider(
         id="gemini",
@@ -189,14 +178,11 @@ PROVIDERS: dict[str, Provider] = {
         kind="google_native",
         key_url="https://aistudio.google.com/app/apikey",
         tier="primary",
-        # LiteLLM ships Gemini entries under ``gemini/`` for the public
-        # AI Studio endpoint (vs ``vertex_ai/`` for Vertex).
-        litellm_prefix="gemini/",
     ),
     "openrouter": Provider(
         id="openrouter",
         label="OpenRouter",
-        kind="litellm_compat",
+        kind="openai_compat",
         base_url="https://openrouter.ai/api/v1",
         key_url="https://openrouter.ai/keys",
         tier="primary",
@@ -210,71 +196,30 @@ PROVIDERS: dict[str, Provider] = {
             "models you use heavily, prefer the provider's own card under "
             "**More providers** for native pricing."
         ),
-        litellm_prefix="openrouter/",
-    ),
-    # -- More tier (7) ------------------------------------------------------
-    "together": Provider(
-        id="together",
-        label="Together AI",
-        kind="litellm_compat",
-        base_url="https://api.together.xyz/v1",
-        key_url="https://api.together.xyz/settings/api-keys",
-        tier="more",
-        litellm_prefix="together_ai/",
-    ),
-    "groq": Provider(
-        id="groq",
-        label="Groq",
-        kind="litellm_compat",
-        base_url="https://api.groq.com/openai/v1",
-        key_url="https://console.groq.com/keys",
-        tier="more",
-        litellm_prefix="groq/",
-    ),
-    "fireworks": Provider(
-        id="fireworks",
-        label="Fireworks AI",
-        kind="litellm_compat",
-        base_url="https://api.fireworks.ai/inference/v1",
-        key_url="https://fireworks.ai/account/api-keys",
-        tier="more",
-        litellm_prefix="fireworks_ai/",
     ),
     "mistral": Provider(
         id="mistral",
         label="Mistral",
-        kind="litellm_compat",
+        kind="mistral_native",
+        # Native ``mistralai`` SDK hard-codes the endpoint internally;
+        # ``base_url`` is documented for reference only and not used at
+        # client-construction time.
         base_url="https://api.mistral.ai/v1",
         key_url="https://console.mistral.ai/api-keys",
-        tier="more",
-        litellm_prefix="mistral/",
+        tier="primary",
     ),
     "xai": Provider(
         id="xai",
         label="xAI (Grok)",
-        kind="litellm_compat",
+        kind="xai_native",
+        # Used at client construction time — xAI's REST endpoint is
+        # OpenAI-compatible per docs.x.ai, and ``make_provider_client``
+        # builds an ``openai.OpenAI(base_url=...)`` against this URL.
+        # The native dispatch path adds Live Search via ``extra_body``
+        # without affecting the openai_compat 2.
         base_url="https://api.x.ai/v1",
         key_url="https://console.x.ai/",
-        tier="more",
-        litellm_prefix="xai/",
-    ),
-    "cerebras": Provider(
-        id="cerebras",
-        label="Cerebras",
-        kind="litellm_compat",
-        base_url="https://api.cerebras.ai/v1",
-        key_url="https://cloud.cerebras.ai/platform/",
-        tier="more",
-        litellm_prefix="cerebras/",
-    ),
-    "deepinfra": Provider(
-        id="deepinfra",
-        label="DeepInfra",
-        kind="litellm_compat",
-        base_url="https://api.deepinfra.com/v1/openai",
-        key_url="https://deepinfra.com/dash/api_keys",
-        tier="more",
-        litellm_prefix="deepinfra/",
+        tier="primary",
     ),
 }
 
@@ -293,12 +238,12 @@ def get_provider(provider_id: str) -> Provider | None:
 
 
 def primary_providers() -> list[Provider]:
-    """Return the 7 ``tier == "primary"`` providers, in catalog order."""
+    """Return the ``tier == "primary"`` providers, in catalog order."""
     return [p for p in PROVIDERS.values() if p.tier == "primary"]
 
 
 def more_providers() -> list[Provider]:
-    """Return the 5 ``tier == "more"`` providers, in catalog order."""
+    """Return the ``tier == "more"`` providers, in catalog order."""
     return [p for p in PROVIDERS.values() if p.tier == "more"]
 
 
@@ -306,8 +251,8 @@ def make_provider_client(
     provider_id: str,
     api_key: str,
     **extra: Any,
-) -> Any | None:
-    """Build the persistent client object for ``provider_id`` if any.
+) -> Any:
+    """Build the persistent client object for ``provider_id``.
 
     Returns:
 
@@ -317,16 +262,23 @@ def make_provider_client(
       published by OpenAI.
     - For ``anthropic_native``: an ``anthropic.Anthropic(api_key=...)``.
     - For ``google_native``: a ``google.genai.Client(api_key=...)``.
-    - For ``litellm_compat``: ``None``. LiteLLM is stateless — calls
-      happen via ``litellm.completion(model=..., api_key=..., base_url=...)``
-      with no persistent client object. ``ss.clients[provider_id]``
-      holds ``None`` for these and the API key is read from
-      ``ss.provider_keys[provider_id]`` at call time.
+    - For ``mistral_native``: a ``mistralai.Mistral(api_key=...)``.
+    - For ``xai_native``: an ``openai.OpenAI(base_url="https://api.x.ai/v1",
+      api_key=...)``. xAI's REST endpoint is officially OpenAI-compatible
+      per docs.x.ai, so we reuse the OpenAI SDK; the dispatch route is
+      kept separate from ``openai_compat`` so xAI-specific kwargs
+      (Live Search ``search_parameters``, future reasoning kwargs)
+      can land in one branch without affecting other providers.
+    - For ``openai_compat``: an ``openai.OpenAI(base_url=provider.base_url,
+      api_key=...)`` pointed at the provider's OpenAI-shape
+      ``/v1/chat/completions`` endpoint. Same SDK as ``openai_native``,
+      different ``base_url`` per provider — currently W&B Inference and
+      OpenRouter.
 
     ``extra`` is reserved for per-provider quirks. Today nothing in
-    ``extra_fields`` flows through to native client construction (W&B's
-    ``project`` is forwarded by the LiteLLM call layer at request time,
-    not at client-construction time).
+    ``extra_fields`` flows through to client construction (W&B's
+    ``project`` is forwarded to Weave init at connect time, not to the
+    OpenAI client constructor).
 
     Raises:
 
@@ -351,6 +303,10 @@ def make_provider_client(
         from openai import OpenAI
         return OpenAI(api_key=api_key)
 
+    if provider.kind == "openai_compat":
+        from openai import OpenAI
+        return OpenAI(api_key=api_key, base_url=provider.base_url)
+
     if provider.kind == "anthropic_native":
         from anthropic import Anthropic
         return Anthropic(api_key=api_key)
@@ -359,11 +315,22 @@ def make_provider_client(
         from google import genai
         return genai.Client(api_key=api_key)
 
-    if provider.kind == "litellm_compat":
-        # Stateless — the call layer reads the API key from session
-        # state on every request. Returning None makes the contract
-        # explicit ("there is no persistent client to disconnect").
-        return None
+    if provider.kind == "mistral_native":
+        # Lazy import — keeps the rest of the app importable even if
+        # ``mistralai`` isn't installed (e.g. lean dev shells). The
+        # SDK exposes its main client at ``mistralai.client.Mistral``;
+        # the top-level ``mistralai`` package has no ``__init__``
+        # re-export so the dotted import path is required.
+        from mistralai.client import Mistral
+        return Mistral(api_key=api_key)
+
+    if provider.kind == "xai_native":
+        # Use the OpenAI SDK against xAI's OpenAI-compatible REST
+        # endpoint. The dedicated dispatch path in ``chat_streams``
+        # adds Live Search via ``extra_body``; the gRPC ``xai-sdk`` is
+        # not used — the REST surface covers everything we need.
+        from openai import OpenAI
+        return OpenAI(api_key=api_key, base_url=provider.base_url)
 
     # Defensive: an exhaustive Literal would catch this at typecheck
     # time, but a stray future ``kind`` value should land here loudly.
