@@ -1,28 +1,55 @@
-"""Slash-command autocomplete enhancer for Streamlit's chat input.
+"""Chat-input enhancer: slash-command autocomplete + draft persistence.
 
-Owns a single CCv2 component (``mount_slash_autocomplete``) that injects a
-keyboard-navigable autocomplete dropdown over the page's existing
-``st.chat_input`` textarea. The component itself renders nothing visible -
-its JS attaches an ``input`` listener to the chat input's ``<textarea>``,
-shows a floating panel of skill suggestions while the user types
-``/<query>``, and rewrites the textarea's value (in a React-aware way) when
-the user accepts a suggestion.
+Owns a single CCv2 component (``mount_slash_autocomplete``) that latches
+onto the page's existing ``st.chat_input`` ``<textarea>`` and adds two
+otherwise-unavailable behaviors:
+
+1. **Slash-command autocomplete** — typing ``/`` pops a floating
+   keyboard-navigable palette of skill suggestions over the textarea.
+   The dropdown is rendered into ``document.body`` (not into the
+   component's shadow root) so it can overlay the chat input from
+   anywhere on the page without z-index battles.
+2. **Draft persistence per chat** — every keystroke is debounced
+   (~200ms) and forwarded to Python via ``setStateValue("draft", {...})``
+   so the active chat's ``draft_text`` field is saved to disk on the
+   next Streamlit rerun (which any natural interaction triggers — chat
+   switch, tab navigation, button click, etc.). The component also
+   *restores* the saved draft into the textarea whenever the active
+   chat changes, so navigating Chat → Settings → Chat (or clicking a
+   different chat in the sidebar) brings the user's in-progress text
+   back instead of silently dropping it.
 
 Why a side-by-side enhancer instead of a chat-input replacement?
 ----------------------------------------------------------------
 ``st.chat_input`` ships with sticky-to-bottom layout, theme-aware styling,
 and built-in submit + file/audio plumbing. Re-implementing those would
 quadruple the size of this module for no user-visible gain. Instead the
-enhancer keeps ``st.chat_input`` exactly as it is and adds one concern -
-the slash-command palette - through a small, scoped piece of JS that:
+enhancer keeps ``st.chat_input`` exactly as it is and adds the two
+concerns above through a small, scoped piece of JS that:
 
 1. Locates the chat input's ``<textarea>`` via ``document.querySelector``
    (the component runs in shadow DOM but shares the page's ``document``).
 2. Attaches a single set of listeners per textarea, idempotent across
    Streamlit reruns thanks to a marker property on the element.
-3. Renders the floating dropdown directly under ``document.body`` (not in
-   the component's shadow root) so it can overlay the chat input from
-   anywhere on the page without z-index battles.
+3. Maintains per-tab singleton state under
+   ``window.__wbSlashAutocomplete`` so reruns / multi-mount sequences
+   don't pile up duplicate listeners or duplicate dropdown elements.
+
+Draft persistence contract:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each ``setStateValue("draft", payload)`` call sends a payload of shape
+``{"chat_id": <str>, "text": <str>}`` rather than a bare string. Callers
+on the Python side resolve the chat by ``chat_id`` (not by the active
+chat) so a typed-then-immediately-switched flow saves the draft to the
+*chat the user was typing in*, even if ``ss.active_chat_id`` has
+already moved on by the time the ``on_draft_change`` callback fires.
+
+Restoration is gated on chat-id changes: the JS singleton tracks the
+last-applied ``chat_id``, and only force-rewrites the textarea value
+when the next render passes a different ``chat_id`` (or on the very
+first attach). This avoids overwriting the user's in-progress typing
+on every Streamlit rerun.
 
 The skill list is delivered every run via ``data={"skills": [...]}`` so
 edits to ``AGENTS.md`` or new ``.cursor/skills/`` / ``.claude/skills/``
@@ -31,6 +58,7 @@ directories show up on the next rerun without a page refresh.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 import streamlit as st
 
@@ -92,7 +120,7 @@ _DROPDOWN_CSS = """
 #wb-slash-autocomplete .wb-item:hover,
 #wb-slash-autocomplete .wb-item.is-active {
   background: var(--st-background-color, #ffffff);
-  border-left-color: var(--st-primary-color, #ff4b4b);
+  border-left-color: var(--st-primary-color, #0080ff);
 }
 #wb-slash-autocomplete .wb-row {
   display: flex;
@@ -102,7 +130,7 @@ _DROPDOWN_CSS = """
 }
 #wb-slash-autocomplete .wb-slug {
   font-family: var(--st-code-font, "Source Code Pro", monospace);
-  color: var(--st-primary-color, #ff4b4b);
+  color: var(--st-primary-color, #0080ff);
   font-weight: 600;
   font-size: 0.85rem;
 }
@@ -155,11 +183,31 @@ _DROPDOWN_CSS = """
 # the previous textarea was removed from the DOM (e.g. the user
 # disconnected and the chat input was unmounted), the next mount finds
 # the new one.
+#
+# Draft persistence:
+# ------------------
+# On every render, ``data.chatId`` + ``data.draft`` come down from
+# Python. We track the last-applied chat id in ``state.appliedChatId``;
+# when the next render's chat id differs (or on the very first attach),
+# we force-rewrite the textarea value to ``data.draft`` so navigating
+# away and coming back, or switching to a different chat in the
+# sidebar, restores the user's in-progress text. On every keystroke
+# we debounce ~200ms and then call ``setStateValue("draft", payload)``
+# where ``payload = {chat_id, text}`` — sending the chat id alongside
+# the text lets the Python ``on_draft_change`` callback save to the
+# right chat even if ``ss.active_chat_id`` has already moved on by the
+# time the rerun fires the callback (e.g. user typed in chat A, then
+# clicked chat B in the sidebar before the debounce fired). Before
+# applying a draft from a different chat we flush any pending debounce
+# for the previous chat so fast switches don't lose the last few
+# characters of typing.
 _JS = r"""
 export default function (component) {
   const data = component.data || {};
   const skills = Array.isArray(data.skills) ? data.skills : [];
   const placeholderHint = typeof data.placeholderHint === "string" ? data.placeholderHint : "";
+  const chatId = typeof data.chatId === "string" ? data.chatId : "";
+  const draft = typeof data.draft === "string" ? data.draft : "";
 
   const win = window;
   const doc = document;
@@ -188,11 +236,41 @@ export default function (component) {
       onScroll: null,
       onResize: null,
       cleanupHooked: false,
+      // --- Draft persistence state ---------------------------------
+      // Latest values pushed down from Python (refreshed every render
+      // by the assignments at the top of the function below).
+      expectedChatId: "",
+      expectedDraft: "",
+      // The chat id whose draft we most recently wrote into the
+      // textarea. Used to detect chat switches: when expectedChatId
+      // diverges from this we restore the new chat's draft.
+      appliedChatId: "",
+      // True once we've applied a draft at least once. Distinguishes
+      // "first attach" (apply even if expected matches applied) from
+      // "subsequent renders within the same chat" (do nothing).
+      draftEverApplied: false,
+      // The last value we sent up via setStateValue OR pushed down
+      // from Python. Used to skip redundant setStateValue calls and
+      // to skip overwriting the textarea when nothing changed.
+      lastSentDraft: "",
+      // Pending debounce timer id, or null. Cleared on flush / fresh
+      // typing / chat switch.
+      draftDebounce: null,
+      // The setStateValue function from the latest render. Stored
+      // because input listeners attached on first attach fire on
+      // every keystroke later, when the original render's `component`
+      // closure is stale.
+      setStateValueFn: null,
     };
   }
   const state = win.__wbSlashAutocomplete;
   state.skills = skills;
   state.placeholderHint = placeholderHint;
+  state.expectedChatId = chatId;
+  state.expectedDraft = draft;
+  // Refresh the bound setStateValue every render so it's always the
+  // latest one (each render gets a fresh ``component`` object).
+  state.setStateValueFn = component.setStateValue || state.setStateValueFn;
 
   function injectStyles() {
     if (state.stylesInjected) return;
@@ -446,7 +524,68 @@ export default function (component) {
     const proto = win.HTMLTextAreaElement.prototype;
     const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value").set;
     nativeSetter.call(textarea, newValue);
+    // Mark the next 'input' event as programmatic so our own listener
+    // doesn't echo the value back to Python via setStateValue (and so
+    // the autocomplete doesn't hide/reshow).
+    state.suppressNextInput = true;
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function sendDraft(text) {
+    // Push the textarea contents up to Python under the chat id we
+    // most recently restored. Skips the websocket round-trip when
+    // nothing changed since the last send, and refuses to send when
+    // we have no chat id to attribute the typing to (e.g. the chat
+    // page hasn't finished its first render yet).
+    if (!state.appliedChatId) return;
+    if (text === state.lastSentDraft) return;
+    state.lastSentDraft = text;
+    if (state.setStateValueFn) {
+      state.setStateValueFn("draft", { chat_id: state.appliedChatId, text: text });
+    }
+  }
+
+  function flushPendingDraft() {
+    // Cancel the in-flight debounce and immediately push the textarea
+    // contents up. Used when the chat is about to switch under us so
+    // the previous chat's last few keystrokes still get attributed to
+    // it instead of silently dropped.
+    if (state.draftDebounce) {
+      clearTimeout(state.draftDebounce);
+      state.draftDebounce = null;
+    }
+    const ta = state.textarea;
+    if (!ta) return;
+    sendDraft(ta.value || "");
+  }
+
+  function applyDraftIfNeeded() {
+    // Force the textarea value to match the draft Python sent down,
+    // but only when (a) we've never applied a draft yet (first attach)
+    // or (b) the chat id changed since we last applied. Otherwise the
+    // user is mid-typing inside the same chat and the textarea is the
+    // source of truth — overwriting it would jump the cursor.
+    const ta = state.textarea;
+    if (!ta) return;
+    const expectedChatId = state.expectedChatId || "";
+    const expectedDraft = state.expectedDraft || "";
+    const chatChanged = expectedChatId !== state.appliedChatId;
+    if (!chatChanged && state.draftEverApplied) {
+      return;
+    }
+    // Flush any pending typing for the previous chat before we
+    // overwrite the textarea with the new chat's draft. ``sendDraft``
+    // is a no-op when nothing changed, so this is cheap when there's
+    // no pending typing.
+    if (state.draftEverApplied && state.appliedChatId && state.appliedChatId !== expectedChatId) {
+      flushPendingDraft();
+    }
+    if (ta.value !== expectedDraft) {
+      setTextareaValue(ta, expectedDraft);
+    }
+    state.appliedChatId = expectedChatId;
+    state.draftEverApplied = true;
+    state.lastSentDraft = expectedDraft;
   }
 
   function acceptSelection() {
@@ -477,6 +616,15 @@ export default function (component) {
       hideDropdown();
       return;
     }
+    // No skills configured at all -> don't ever show the dropdown.
+    // Mirrors the historical "only mount the component when there are
+    // skills" behavior; we now mount unconditionally (so draft
+    // persistence still works in skill-less projects), but the
+    // autocomplete still degrades to a no-op visually.
+    if (!state.skills || state.skills.length === 0) {
+      hideDropdown();
+      return;
+    }
     const range = getQueryRange(ta);
     if (!range) {
       hideDropdown();
@@ -503,6 +651,17 @@ export default function (component) {
     delete ta.__wbSlashAutocompleteAttached;
     state.textarea = null;
     state.onInput = state.onKeyDown = state.onBlur = null;
+    if (state.draftDebounce) {
+      clearTimeout(state.draftDebounce);
+      state.draftDebounce = null;
+    }
+    // Clear the "applied" tracking so the next attach (which is a
+    // fresh DOM element) re-applies the current draft. Without this,
+    // a Chat -> Settings -> Chat round-trip would leave the new
+    // textarea empty even though we still have a draft on file.
+    state.draftEverApplied = false;
+    state.appliedChatId = "";
+    state.lastSentDraft = "";
   }
 
   function attach(textarea) {
@@ -513,7 +672,34 @@ export default function (component) {
     textarea.__wbSlashAutocompleteAttached = true;
     state.textarea = textarea;
 
-    state.onInput = () => refreshMatches();
+    state.onInput = () => {
+      // Programmatic textarea updates (slash insert, draft restore,
+      // submit clear) dispatch an 'input' event we don't want to
+      // round-trip back to Python. ``setTextareaValue`` flips the
+      // suppress flag for exactly one event.
+      if (state.suppressNextInput) {
+        state.suppressNextInput = false;
+        // Slash autocomplete still needs to recompute against the
+        // new value (a slash insert leaves the textarea in a state
+        // where the dropdown should hide).
+        refreshMatches();
+        return;
+      }
+      refreshMatches();
+      // Debounced draft save. Each keystroke restarts the timer; we
+      // only push to Python after the user pauses typing for ~200ms.
+      // The debounce keeps websocket traffic tiny without leaving the
+      // draft persistently stale — any Streamlit rerun (chat switch,
+      // tab navigation, button click) flushes the latest text via
+      // applyDraftIfNeeded -> flushPendingDraft below.
+      if (state.draftDebounce) clearTimeout(state.draftDebounce);
+      state.draftDebounce = setTimeout(() => {
+        state.draftDebounce = null;
+        const ta = state.textarea;
+        if (!ta) return;
+        sendDraft(ta.value || "");
+      }, 200);
+    };
     state.onKeyDown = (e) => {
       if (!isOpen()) return;
       if (e.key === "ArrowDown") {
@@ -560,6 +746,12 @@ export default function (component) {
       // If we previously had a different textarea reference, drop it.
       if (state.textarea && state.textarea !== ta) detach();
       attach(ta);
+      // Restore the active chat's draft into the (possibly fresh)
+      // textarea. ``applyDraftIfNeeded`` is safe to call repeatedly
+      // — it only writes when the chat id changed (or on first
+      // attach), so re-renders within the same chat don't disturb
+      // the user's in-progress typing.
+      applyDraftIfNeeded();
       return;
     }
     if (remaining > 0) setTimeout(() => tryAttachLoop(remaining - 1), 150);
@@ -570,6 +762,12 @@ export default function (component) {
   // again from scratch.
   if (state.textarea && !doc.body.contains(state.textarea)) detach();
   tryAttachLoop(20);
+  // The textarea was already attached on a previous render; we still
+  // need to re-check the draft on every render in case the chat id
+  // changed since last time (e.g. user clicked a different chat in the
+  // sidebar — the textarea is the same DOM node, but ``data.chatId``
+  // / ``data.draft`` are now for a different chat).
+  if (state.textarea) applyDraftIfNeeded();
 
   injectStyles();
 
@@ -593,17 +791,38 @@ _COMPONENT = st.components.v2.component(
     js=_JS,
 )
 
+# Python-side session-state key under which Streamlit stores the
+# component instance's state. Exposed as a module constant so the chat
+# page's ``on_draft_change`` callback can read the latest draft payload
+# (``st.session_state[STATE_KEY].draft`` -> ``{"chat_id": str,
+# "text": str}``) without hard-coding the string in two places.
+STATE_KEY = "wb_slash_autocomplete"
+
 
 def mount_slash_autocomplete(
     skills: list[dict[str, object]],
     *,
     placeholder_hint: str = "",
+    chat_id: str = "",
+    draft: str = "",
+    on_draft_change: Callable[[], None] | None = None,
 ) -> None:
-    """Mount the autocomplete enhancer on the page's ``st.chat_input``.
+    """Mount the chat-input enhancer on the page's ``st.chat_input``.
 
     Should be rendered on every script run (the JS is idempotent across
     reruns, but Streamlit needs to re-mount the component each time so it
-    receives the latest ``skills`` list).
+    receives the latest ``skills`` list, ``chat_id``, and ``draft``).
+
+    Two responsibilities (see this module's docstring for the full
+    contract):
+
+    1. Slash-command autocomplete keyed off ``skills``.
+    2. Per-chat draft persistence keyed off ``chat_id`` + ``draft``: the
+       JS restores ``draft`` into the textarea on chat switch / first
+       attach, and pushes typing back up via
+       ``setStateValue("draft", {chat_id, text})`` after a ~200ms
+       debounce. The Python callback ``on_draft_change`` (when wired)
+       fires on the next rerun to persist the typing to disk.
 
     Args:
         skills: Skill dicts produced by :func:`project_context.summary`,
@@ -612,6 +831,21 @@ def mount_slash_autocomplete(
             user types after a ``/``.
         placeholder_hint: Short text shown in the dropdown body when the
             current query has no matches. Defaults to a generic hint.
+        chat_id: Identifier of the chat the textarea is currently
+            displaying. The JS uses this to detect chat switches (so a
+            sidebar click restores the new chat's draft) and to tag
+            outgoing draft-save events so they're attributed to the
+            right chat even when ``ss.active_chat_id`` has already
+            moved on by the time the rerun fires.
+        draft: The chat's currently-saved draft text — the JS restores
+            this into the textarea on chat switch / first attach.
+            Empty string means "leave the textarea empty" (used after
+            a submit when the chat's ``draft_text`` was cleared).
+        on_draft_change: Optional callback fired by Streamlit on the
+            next rerun whenever the JS pushed up a new draft via
+            ``setStateValue``. Read the payload from the component
+            instance's session-state entry (keyed
+            ``"wb_slash_autocomplete"``) and persist it.
     """
     payload_skills: list[dict[str, object]] = []
     for s in skills or []:
@@ -623,9 +857,27 @@ def mount_slash_autocomplete(
                 "triggers": list(s.get("triggers", []) or [])[:24],
             }
         )
-    _COMPONENT(
-        data={
+    kwargs: dict[str, object] = {
+        # Stable Python-side key so the on-change callback only fires
+        # when the JS-reported value actually changes, and so callers
+        # can look up the latest payload via
+        # ``st.session_state[STATE_KEY]["draft"]``. Without a key the
+        # component instance state resets every rerun and the callback
+        # would refuse to fire (or fire spuriously, depending on
+        # Streamlit version).
+        "key": STATE_KEY,
+        "data": {
             "skills": payload_skills,
             "placeholderHint": placeholder_hint,
+            "chatId": chat_id or "",
+            "draft": draft or "",
         },
-    )
+    }
+    # Wiring ``on_draft_change`` is what guarantees Streamlit fires the
+    # callback when the JS-side ``setStateValue("draft", ...)`` lands a
+    # new payload — without it the value still arrives in session
+    # state, but the callback wouldn't run and the disk write would
+    # be deferred until some other code path noticed the new value.
+    if on_draft_change is not None:
+        kwargs["on_draft_change"] = on_draft_change
+    _COMPONENT(**kwargs)

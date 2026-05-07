@@ -32,6 +32,7 @@ import streamlit as st
 import account
 import chats
 import git_ops
+import providers
 from actions import (
     load_recent_dirs as _load_recent_dirs,
     on_connect as _auto_on_connect,
@@ -63,11 +64,64 @@ def _init_state() -> None:
 
     profile = account.load_profile()
     creds = account.load_credentials()
+    saved_provider_keys = account.load_provider_keys()
+    saved_provider_remember = account.load_provider_remember()
 
-    # Pre-fill the API key from disk if the user opted in to "remember on
-    # this machine"; the box stays editable.
-    ss.setdefault("api_key", creds.get("wb_api_key", ""))
+    # ------------------------------------------------------------------
+    # Multi-provider session state (Phase 1).
+    #
+    # ``provider_keys[provider_id] -> str``: API keys for every persisted
+    #   provider, pre-filled from disk for users who opted in to
+    #   "Remember on this machine" per provider. Empty string means the
+    #   user hasn't entered a key for that provider yet (or has cleared
+    #   it). The dual-key pattern in the Settings card mirrors each
+    #   widget back into this dict via the `_<id>_key_input` widget key.
+    # ``provider_remember[provider_id] -> bool``: per-provider opt-in
+    #   for persistence across sessions. Default False; flipped to True
+    #   when the user ticks "Remember on this machine" before clicking
+    #   Connect.
+    # ``clients[provider_id] -> Any | None``: the persistent client
+    #   object. ``openai.OpenAI`` for ``openai_native``, ``anthropic.
+    #   Anthropic`` for ``anthropic_native``, ``google.genai.Client`` for
+    #   ``google_native``, and ``None`` for the 9 ``litellm_compat``
+    #   providers (LiteLLM is stateless — only the API key is needed
+    #   at call time and it's read out of ``provider_keys``).
+    # ``provider_models[provider_id] -> list[str]``: raw model ids
+    #   returned by ``client.models.list()`` for each provider, sorted
+    #   by display label (the chat picker shows qualified
+    #   ``<provider>:<raw>`` ids; this dict holds just the raw ids). The
+    #   model catalog (Phase 2) populates richer ``ModelInfo`` objects
+    #   on the side; this list is the lightweight per-provider view.
+    # ``connect_errors[provider_id] -> str | None``: most recent connect
+    #   error per provider, surfaced as ``st.error`` inside that
+    #   provider's Settings card.
+    # ------------------------------------------------------------------
+    if "provider_keys" not in ss:
+        ss.provider_keys = {pid: saved_provider_keys.get(pid, "") for pid in providers.PROVIDERS}
+    if "provider_remember" not in ss:
+        ss.provider_remember = {
+            pid: bool(saved_provider_remember.get(pid, bool(saved_provider_keys.get(pid))))
+            for pid in providers.PROVIDERS
+        }
+    if "clients" not in ss:
+        ss.clients = {pid: None for pid in providers.PROVIDERS}
+    if "provider_models" not in ss:
+        ss.provider_models = {pid: [] for pid in providers.PROVIDERS}
+    if "connect_errors" not in ss:
+        ss.connect_errors = {pid: None for pid in providers.PROVIDERS}
+
+    # Pre-fill the W&B API key field from disk if the user opted in to
+    # "remember on this machine"; the box stays editable. ``ss.api_key``
+    # is kept as a back-compat alias for ``ss.provider_keys["wandb"]``
+    # so any code path that still reads it sees the same value.
+    ss.setdefault("api_key", ss.provider_keys.get("wandb", ""))
     ss.setdefault("project", "")
+    # ``ss.client`` is the W&B-specific legacy alias retained for one
+    # release; the multi-provider ``ss.clients["wandb"]`` is the
+    # canonical key going forward. The W&B path is ``litellm_compat``,
+    # so the canonical value is always ``None``; the legacy alias is
+    # kept as a lightweight "is W&B connected" flag (``None`` vs a
+    # truthy sentinel set after a successful connect).
     ss.setdefault("client", None)
     ss.setdefault("models", [])
     ss.setdefault("model", None)
@@ -110,11 +164,35 @@ def _init_state() -> None:
     # button on the chat page (the only entry point); cleared by the
     # dialog's Close handler.
     ss.setdefault("diff_dialog_open", False)
+    # Legacy W&B-only alias kept around for one release; the canonical
+    # value lives in ``ss.connect_errors["wandb"]``.
     ss.setdefault("connect_error", None)
     ss.setdefault("weave_project", None)
     ss.setdefault("weave_url", None)
     ss.setdefault("weave_error", None)
     ss.setdefault("conn_open", False)
+    # Multi-provider model-picker modal state. ``model_picker_open``
+    # gates the @st.dialog("Choose a model") modal mounted from the
+    # chat page; ``_model_picker_search`` carries the user's filter
+    # string across reruns; ``model_catalog_refreshing`` is True
+    # while a daemon-thread refresh is in flight (the chat page
+    # polls a 0.5s @st.fragment to re-render once it flips back);
+    # ``model_catalog_last_refreshed_at`` holds a monotonic
+    # timestamp for the "Last refreshed Nm ago" caption (the on-disk
+    # cache holds the wall-clock equivalent).
+    ss.setdefault("model_picker_open", False)
+    ss.setdefault("_model_picker_search", "")
+    ss.setdefault("model_catalog_refreshing", False)
+    ss.setdefault("model_catalog_last_refreshed_at", None)
+    # Phase 5: lightbox modal state for inline image / audio / video
+    # previews. ``lightbox_open`` gates the @st.dialog("Preview")
+    # modal mounted from the chat page; ``lightbox_payload`` is the
+    # ``{"kind", "path", "alt", "caption"}`` dict the dialog reads.
+    ss.setdefault("lightbox_open", False)
+    ss.setdefault("lightbox_payload", None)
+    # Phase 6: pending attachments staged for the next chat-input
+    # submission. Cleared after the user sends or removes them.
+    ss.setdefault("pending_attachments", [])
     # Tracks whether we've already attempted the one-shot auto-connect at
     # session startup. See ``_maybe_auto_connect`` for the contract — the
     # flag is set *before* the connect call so a transient failure can't
@@ -131,8 +209,11 @@ def _init_state() -> None:
     ss.setdefault("new_project_dialog_open", False)
     ss.setdefault("new_proj_parent", str(Path.home()))
 
-    # Settings state.
-    ss.setdefault("remember_wb_key", bool(creds.get("wb_api_key")))
+    # Settings state. ``remember_wb_key`` is the legacy W&B-only flag;
+    # the multi-provider ``ss.provider_remember["wandb"]`` is the
+    # canonical key going forward but the legacy alias is kept around
+    # for one release so existing call sites keep working.
+    ss.setdefault("remember_wb_key", bool(ss.provider_remember.get("wandb", False)))
     # Theme preference. ``theme_pref`` carries the user's explicit Light /
     # Dark / System choice (mirrors :data:`Profile.theme`); ``theme_explicit``
     # is True iff the user has actually picked. The theme switcher
@@ -202,28 +283,82 @@ def _identity_from_profile(profile: account.Profile) -> dict[str, Any] | None:
 
 
 def _maybe_auto_connect() -> None:
-    """Auto-connect on the first script run when a saved API key is present.
+    """Auto-connect every provider with a saved key on the first script run.
 
-    Runs exactly once per session: ``auto_connect_attempted`` is flipped to
-    ``True`` *before* the connect call so a transient failure (e.g. an
-    expired key, a network blip) does not re-trigger on every rerun. The
-    user can still manually click **Connect** on the Settings page if the
-    auto-attempt failed — the error surfaces there via ``ss.connect_error``.
+    Runs exactly once per session: ``auto_connect_attempted`` is flipped
+    to ``True`` *before* any connect calls so a transient failure
+    (e.g. an expired key, a network blip) does not re-trigger on every
+    rerun. The user can still manually click **Connect** in Settings
+    after a failure — the error surfaces in the relevant provider's
+    ``ss.connect_errors`` slot.
+
+    Auto-connect order: every provider with a saved API key is
+    connected synchronously (so the chat picker has at least one
+    provider's models populated by the time the first render
+    completes). After that, :func:`model_catalog.refresh_all_async`
+    runs in a daemon thread to top up the catalog with LiteLLM +
+    OpenRouter enrichment without blocking the UI.
     """
     ss = st.session_state
     if ss.auto_connect_attempted:
         return
     ss.auto_connect_attempted = True
-    if ss.client is not None:
-        return
-    if not (ss.api_key or "").strip():
-        return
-    _auto_on_connect()
-    if ss.client is not None and ss.connect_error is None:
-        n = len(ss.models)
+
+    from actions import connect_provider
+
+    saved = account.load_provider_keys()
+    connected_count = 0
+    for pid, key in saved.items():
+        if not key:
+            continue
+        if pid not in providers.PROVIDERS:
+            continue
+        # Mirror the saved key into session state so the connect
+        # callback finds it (the connect helper reads from
+        # ``ss.provider_keys`` after syncing).
+        keys = dict(ss.provider_keys)
+        keys[pid] = key
+        ss.provider_keys = keys
+        flags = dict(ss.provider_remember)
+        flags[pid] = True
+        ss.provider_remember = flags
+        try:
+            connect_provider(pid)
+        except Exception:  # noqa: BLE001 — auto-connect must never crash startup
+            continue
+        if not ss.connect_errors.get(pid):
+            connected_count += 1
+
+    if connected_count > 0:
         st.toast(
-            f"Connected — {n} model{'s' if n != 1 else ''} available.",
+            f"Connected {connected_count} provider"
+            f"{'s' if connected_count != 1 else ''}.",
             icon=":material/check_circle:",
+        )
+        # Kick off a background refresh so providers we successfully
+        # auto-connected get their LiteLLM + OpenRouter enrichment
+        # without blocking the first render. The chat page's polling
+        # @st.fragment will re-render the modal once
+        # ``model_catalog_refreshing`` flips back to False.
+        import model_catalog
+        ss.model_catalog_refreshing = True
+
+        def _on_done() -> None:
+            # Background callback — can't touch ss directly from here
+            # because Streamlit's session-state proxy is bound to the
+            # script thread. The flag flip happens on the next rerun
+            # via the polling fragment that watches the catalog's
+            # ``newest_refresh()`` timestamp; we just record completion
+            # via a module-level flag inside model_catalog. The
+            # fragment in app_pages/chat.py reads
+            # ``model_catalog.newest_refresh()`` and rerruns when it
+            # changes.
+            pass
+
+        keys_for_refresh = dict(ss.provider_keys)
+        clients_for_refresh = dict(ss.clients)
+        model_catalog.refresh_all_async(
+            clients_for_refresh, keys_for_refresh, on_done=_on_done
         )
 
 
@@ -289,12 +424,13 @@ def _bump_git_nonce() -> None:
 
 # Per-file diff rendering and the push flow both live on the chat page
 # (``app_pages/chat.py``): the unified-diff modal is opened by the
-# "Changes" button just above the chat input, and the new bottom-of-chat
-# git row owns branch switching, new-branch creation, fetch, and the
-# one-click "generate commit message + commit + push" pipeline. This
-# module is responsible only for the cross-page sidebar warning when
-# the working tree is mid-merge/rebase (so users see it from any page);
-# everything else moved into the chat page.
+# "Changes" button below the chat input (sitting directly under the
+# bottom-of-chat git row), and that git row owns branch switching,
+# new-branch creation, fetch, and the one-click "generate commit
+# message + commit + push" pipeline. This module is responsible only
+# for the cross-page sidebar warning when the working tree is
+# mid-merge/rebase (so users see it from any page); everything else
+# moved into the chat page.
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +563,26 @@ def _sorted_chats(*, archived: bool) -> list[chats.Chat]:
 
 
 def _activate_chat(chat_id: str) -> None:
-    """Sidebar row callback: mark this chat as the active one."""
+    """Sidebar row callback: mark this chat as the active one.
+
+    Also queues a page switch to the Agent tab (``app_pages/chat.py``)
+    via ``ss["_pending_page_switch"]`` so a click from any other tab
+    (Settings / Usage / Docs) lands the user on the chat itself rather
+    than leaving them looking at the chat list while the actual chat
+    history is on a different page. The drain in :func:`main` (after
+    :func:`st.navigation` registers the pages) runs the actual
+    :func:`st.switch_page` call.
+
+    We can't call :func:`st.switch_page` directly from this callback:
+    it raises ``RerunException`` internally (after queueing the rerun
+    and yielding via ``st.empty()``) and Streamlit surfaces a yellow
+    "Calling st.rerun() within a callback is a no-op." warning at the
+    top of the page when a callback raises that. The navigation
+    *does* still work in that flow, but the warning is loud and
+    confusing to users. Routing through ``_pending_page_switch``
+    avoids the warning entirely while preserving the cross-tab
+    navigation UX.
+    """
     if chat_id in st.session_state.chats:
         st.session_state.active_chat_id = chat_id
         chats.save_active_chat_id(chat_id)
@@ -435,6 +590,16 @@ def _activate_chat(chat_id: str) -> None:
         # re-copies the chat's model / mode / working_dir into the flat
         # ss.* keys driving the dropdowns. See app_pages/chat.py.
         st.session_state.pop("_last_active_chat_id", None)
+        # Queue a page switch to the Agent tab for this same rerun so a
+        # click from any other tab (Settings / Usage / Docs) lands the
+        # user on the chat itself. Calling :func:`st.switch_page`
+        # directly from a callback raises ``RerunException`` which
+        # Streamlit catches and surfaces as a "Calling st.rerun() within
+        # a callback is a no-op" warning at the top of the page (it
+        # **does** still navigate, but the warning is loud); deferring
+        # to ``main()`` (after ``st.navigation`` registers the pages)
+        # keeps the navigation working without the warning.
+        st.session_state["_pending_page_switch"] = "app_pages/chat.py"
 
 
 def _new_chat() -> None:
@@ -448,6 +613,16 @@ def _new_chat() -> None:
     dropdown picks so it behaves like a freshly seeded chat.
 
     Otherwise creates a new chat seeded with the current dropdown values.
+
+    On either path, the callback queues a page switch to the Agent tab
+    via ``ss["_pending_page_switch"]`` so a click from a non-Agent tab
+    (Settings / Usage / Docs) lands the user on the chat input
+    immediately. The drain in :func:`main` runs the actual
+    :func:`st.switch_page` call after :func:`st.navigation` has
+    registered the pages, sidestepping the "Calling st.rerun() within
+    a callback is a no-op" warning that direct ``st.switch_page``
+    calls from this callback would trigger. See :func:`_activate_chat`
+    for the full rationale.
     """
     ss = st.session_state
     blank_id = chats.find_blank_chat(ss.chats)
@@ -461,16 +636,23 @@ def _new_chat() -> None:
         ss.active_chat_id = blank_id
         chats.save_active_chat_id(blank_id)
         ss.pop("_last_active_chat_id", None)
-        return
-    chat = chats.new_chat(
-        model=ss.model or "",
-        mode=ss.mode or "agent",
-        working_dir=ss.working_dir or "",
-    )
-    ss.chats[chat.id] = chat
-    ss.active_chat_id = chat.id
-    chats.save_active_chat_id(chat.id)
-    ss.pop("_last_active_chat_id", None)
+    else:
+        chat = chats.new_chat(
+            model=ss.model or "",
+            mode=ss.mode or "agent",
+            working_dir=ss.working_dir or "",
+        )
+        ss.chats[chat.id] = chat
+        ss.active_chat_id = chat.id
+        chats.save_active_chat_id(chat.id)
+        ss.pop("_last_active_chat_id", None)
+    # Same deferred page-switch pattern as :func:`_activate_chat` —
+    # calling :func:`st.switch_page` directly from a callback raises
+    # ``RerunException`` and Streamlit shows a "Calling st.rerun()
+    # within a callback is a no-op" warning. The drain in :func:`main`
+    # runs the switch after :func:`st.navigation` has registered the
+    # pages, so navigation still works but the warning never fires.
+    ss["_pending_page_switch"] = "app_pages/chat.py"
 
 
 def _seed_default_chat() -> str:
@@ -530,20 +712,54 @@ def _close_delete_chat_dialog() -> None:
     without this, the dialog re-opens on the very next rerun (e.g.
     the next chat submission on the chat page) because
     ``delete_chat_confirm_id`` stays set. The Cancel / Delete /
-    "OK on running" handlers inside the dialog body clear the same
+    Stop-and-delete handlers inside the dialog body clear the same
     id and call ``st.rerun()`` directly.
     """
     st.session_state.delete_chat_confirm_id = None
+
+
+def _finalize_chat_deletion(chat_id: str) -> None:
+    """Pick a successor active chat after ``chat_id`` has been deleted.
+
+    Shared between the idle and running delete paths so they don't
+    drift. Caller is expected to have already removed ``chat_id``
+    from ``ss.chats`` via :func:`chats.delete_chat`. When the deleted
+    chat was the active one we hand the chat page over to the most
+    recent surviving live chat, falling back to a fresh placeholder
+    when the sidebar has been drained empty.
+    """
+    ss = st.session_state
+    successors = _sorted_chats(archived=False)
+    if successors:
+        ss.active_chat_id = successors[0].id
+    else:
+        ss.active_chat_id = _seed_default_chat()
+    chats.save_active_chat_id(ss.active_chat_id)
+    ss.pop("_last_active_chat_id", None)
 
 
 @st.dialog("Delete chat?", width="small", on_dismiss=_close_delete_chat_dialog)
 def _delete_chat_dialog() -> None:
     """Confirm modal for the per-chat delete icon.
 
-    Refuses to delete a running chat (the background thread is still
-    holding the chat's lock + its on-disk file is its only persistence
-    handle). Otherwise removes the chat from the session dict + its
-    JSON file, picks a successor active chat, and reruns.
+    Two body shapes depending on the chat's status:
+
+    - **Idle / errored / new**: a plain "Delete `<title>`?" prompt
+      with Cancel and Delete buttons. Calls
+      :func:`chats.delete_chat` which unlinks the on-disk JSON file.
+    - **Running**: a warning that deleting will stop the in-flight
+      turn (interrupting the streamed chat-completion call so we
+      stop spending tokens) plus Cancel and **Stop and delete**
+      buttons. Stop and delete calls
+      :func:`chats.delete_chat` with ``force=True``, which signals
+      :func:`chats.request_cancel` before unlinking the file. The
+      background thread checks the cancel event between agent events
+      and before every persistence call, so the file we just unlinked
+      stays gone.
+
+    In both cases, when the deleted chat was the active one we pick
+    a successor (most recent surviving live chat, falling back to a
+    fresh ``+ New chat`` placeholder when the sidebar drains empty).
 
     ``on_dismiss=_close_delete_chat_dialog`` is mandatory so X / Esc /
     click-outside dismissal clears ``ss.delete_chat_confirm_id``;
@@ -558,20 +774,27 @@ def _delete_chat_dialog() -> None:
         ss.delete_chat_confirm_id = None
         return
 
-    if chat.status == chats.STATUS_RUNNING:
-        st.warning(
-            "This chat is still running a turn. Wait for it to finish "
-            "before deleting.",
-            icon=":material/hourglass:",
-        )
-        if st.button("OK", width="stretch", key="delete_chat_running_ok"):
-            ss.delete_chat_confirm_id = None
-            st.rerun()
-        return
-
     title = chat.title or "(untitled)"
-    st.markdown(f"Delete **{title}**?")
-    st.caption("This permanently removes the chat from disk. It cannot be undone.")
+    is_running = chat.status == chats.STATUS_RUNNING
+
+    if is_running:
+        st.markdown(f"Stop turn and delete **{title}**?")
+        st.warning(
+            "This chat is still running a turn. Deleting will stop the "
+            "model immediately so you don't spend more tokens, but you'll "
+            "lose any in-flight reply. This cannot be undone.",
+            icon=":material/warning:",
+        )
+        confirm_label = "Stop and delete"
+        confirm_icon = ":material/cancel:"
+    else:
+        st.markdown(f"Delete **{title}**?")
+        st.caption(
+            "This permanently removes the chat from disk. It cannot be undone."
+        )
+        confirm_label = "Delete"
+        confirm_icon = ":material/delete:"
+
     cols = st.columns([1, 1])
     if cols[0].button(
         "Cancel",
@@ -582,26 +805,26 @@ def _delete_chat_dialog() -> None:
         ss.delete_chat_confirm_id = None
         st.rerun()
     if cols[1].button(
-        "Delete",
-        icon=":material/delete:",
+        confirm_label,
+        icon=confirm_icon,
         type="primary",
         width="stretch",
         key="delete_chat_confirm_btn",
     ):
         was_active = ss.active_chat_id == chat_id
         try:
-            chats.delete_chat(ss.chats, chat_id)
+            chats.delete_chat(ss.chats, chat_id, force=is_running)
         except RuntimeError as e:
+            # Defensive: ``force=True`` should never raise on the
+            # running path, and idle chats can't transition into
+            # ``STATUS_RUNNING`` from a different page (turns are only
+            # spawned from the chat page). Surface anything that
+            # slips through so the user can retry rather than the
+            # dialog silently no-op'ing.
             st.error(str(e), icon=":material/error:")
             return
         if was_active:
-            successors = _sorted_chats(archived=False)
-            if successors:
-                ss.active_chat_id = successors[0].id
-            else:
-                ss.active_chat_id = _seed_default_chat()
-            chats.save_active_chat_id(ss.active_chat_id)
-            ss.pop("_last_active_chat_id", None)
+            _finalize_chat_deletion(chat_id)
         ss.delete_chat_confirm_id = None
         st.rerun()
 
@@ -613,48 +836,22 @@ def _truncate(text: str, limit: int) -> str:
     return text[: max(1, limit - 1)].rstrip() + "\u2026"
 
 
-def _render_active_chat_body(chat: chats.Chat) -> None:
-    """The body block rendered directly under the active chat's row.
-
-    Contents (in order): the AI-generated description, and a status
-    caption when the chat is running or last-errored. The archive +
-    delete icons used to render here as a separate row but moved
-    inline into the chat row itself (see :func:`_render_chat_row`),
-    so this body now stays focused on read-only context. Branch
-    switching, fetch, new branch, and push all live in the
-    bottom-of-chat git row in ``app_pages/chat.py`` — the sidebar just
-    has to track which chat is active so the chat page points at the
-    right working directory.
-
-    Only ever called for the **active** chat; inactive live rows render
-    just the header row so a long chat list collapses cleanly.
-    """
-    description = (chat.description or "").strip()
-    if description:
-        st.caption(description)
-
-    if chat.status == chats.STATUS_ERROR and chat.error_message:
-        st.caption(f":red[:material/error: {chat.error_message}]")
-    elif chat.status == chats.STATUS_RUNNING:
-        st.caption(":material/progress_activity: Running a turn...")
-
-
 def _render_chat_row(chat: chats.Chat, *, archived: bool) -> None:
     """One sidebar row.
 
     Both live and archived rows share the same 3-column layout:
     ``[main control | archive/unarchive icon | delete icon]``. Putting
     the destructive icons inline with the main control means they're
-    reachable from any chat without first activating it, and keeps the
-    active chat's body focused on read-only context (description +
-    status caption) instead of repeating action buttons.
+    reachable from any chat without first activating it.
 
     For **live** rows the main control is a stretched ``st.button``;
     clicking it activates the chat (which loads its history into the
-    chat page) and, since the body only renders for the active chat,
-    simultaneously expands the row. The active row's main button is
-    rendered as ``type="primary"`` so the user can see at a glance which
-    chat the chat page is showing.
+    chat page). The currently-active row is rendered as
+    ``type="secondary"`` (outlined) and ``disabled=True`` so the user
+    can see at a glance which chat the chat page is showing **and**
+    can't re-click their own selection. Inactive rows are
+    ``type="tertiary"`` (borderless / text-only) so a long chat list
+    reads as a tidy list of titles rather than a wall of buttons.
 
     For **archived** rows the main control is plain markdown (no
     activate affordance) — archived chats are intentionally minimized;
@@ -698,7 +895,8 @@ def _render_chat_row(chat: chats.Chat, *, archived: bool) -> None:
             title,
             icon=icon,
             key=f"chat_row_{chat.id}",
-            type="primary" if is_active else "tertiary",
+            type="secondary" if is_active else "tertiary",
+            disabled=is_active,
             width="stretch",
             on_click=_activate_chat,
             args=(chat.id,),
@@ -726,8 +924,6 @@ def _render_chat_row(chat: chats.Chat, *, archived: bool) -> None:
             on_click=_open_delete_confirm,
             args=(chat.id,),
         )
-    if is_active:
-        _render_active_chat_body(chat)
 
 
 # CSS scoped to the chat-row buttons in the sidebar. Streamlit centers
@@ -879,6 +1075,23 @@ def main() -> None:
         [chat_page, usage_page, settings_page, docs_page],
         position="top",
     )
+
+    # Drain any deferred page-switch request from sidebar callbacks
+    # (``_activate_chat`` / ``_new_chat``). They can't call
+    # :func:`st.switch_page` directly because Streamlit raises a
+    # ``RerunException`` from inside ``switch_page`` and surfaces a
+    # "Calling st.rerun() within a callback is a no-op" warning when
+    # that happens inside a widget callback. Running the switch here
+    # — after :func:`st.navigation` has registered the pages, but
+    # before :func:`page.run` paints anything — keeps the cross-tab
+    # "click chat row from Settings / Usage / Docs jumps you to the
+    # Agent page" UX intact, without the warning. ``st.switch_page``
+    # itself raises after queueing the rerun, so anything below is
+    # only reached on the no-pending-switch path.
+    pending_switch = st.session_state.pop("_pending_page_switch", None)
+    if pending_switch:
+        st.switch_page(pending_switch)
+
     page.run()
 
 

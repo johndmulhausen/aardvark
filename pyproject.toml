@@ -11,7 +11,34 @@ dependencies = [
     # dialog re-opens on the very next rerun (e.g. when the user presses
     # Enter to send a chat message), because the gating flag is still True.
     "streamlit>=1.56.0",
+    # OpenAI SDK is used directly for the OpenAI native provider AND under
+    # the hood by litellm for the OpenAI-compat 9 (W&B Inference, Together,
+    # Groq, Fireworks, Mistral, xAI, OpenRouter, DeepInfra, Cerebras) AND
+    # by ``model_catalog.py`` for ``/v1/models`` listing on every
+    # LiteLLM-routed provider.
     "openai>=1.40.0",
+    # Anthropic native SDK — Phase 3. Unlocks prompt caching via
+    # ``cache_control`` blocks (~90% repeat-cost savings), extended
+    # thinking, computer use / bash / text-editor pre-built tools, and
+    # ``client.messages.count_tokens``. LiteLLM only passes these through
+    # generically.
+    "anthropic>=0.40",
+    # Google Gemini native SDK — Phase 3. Unlocks grounding with Google
+    # Search, code execution, ``client.caches.create`` for context caching,
+    # and native Imagen / Veo for image / video generation.
+    "google-genai>=1.0",
+    # LiteLLM PyPI library — Phase 3 unified call layer for the 9
+    # OpenAI-compat providers. MIT-licensed, no-markup: makes direct
+    # provider HTTPS calls with the user's keys (the LiteLLM Cloud proxy
+    # is a SEPARATE commercial product we never use). Also ships
+    # ``model_prices_and_context_window.json`` which ``model_catalog.py``
+    # uses as the primary pricing source for non-curated models.
+    "litellm>=1.50",
+    # pypdf — Phase 6 PDF text extraction for non-native-PDF providers
+    # (everything except Anthropic Claude 3.5+ and Google Gemini 1.5+).
+    # Pure Python, ~500KB, only invoked when a user attaches a PDF to a
+    # model that can't handle PDFs natively.
+    "pypdf>=5.0",
     # 0.52.24+ is required for ``kind=`` / ``color=`` kwargs on ``@weave.op``.
     # Older 0.52.x installs reject those kwargs with ``TypeError`` at module
     # import time. agent.py / tools.py / mcp_servers.py also include a runtime
@@ -35,4 +62,20 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-include = ["streamlit_app.py", "agent.py", "tools.py", "wb_client.py", "mcp_servers.py", "project_context.py", "chat_input.py", "theme_switcher.py"]
+include = [
+    "streamlit_app.py",
+    "agent.py",
+    "tools.py",
+    "wb_client.py",
+    "mcp_servers.py",
+    "project_context.py",
+    "chat_input.py",
+    "theme_switcher.py",
+    "providers.py",
+    "chat_streams.py",
+    "model_catalog.py",
+    "fullscreen_trigger.py",
+    "attachments.py",
+    "_artifact_paths.py",
+    "data/litellm_model_registry.json",
+]

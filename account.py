@@ -4,9 +4,27 @@ Pure-stdlib helpers backing the settings popover in ``streamlit_app.py``. This
 module owns *every* read and write of the on-disk account state so the UI
 layer never has to know the file layout. Specifically:
 
-- ``~/.wb_coding_agent/credentials.json`` (mode 0600) — opt-in saved W&B API
-  key and the GitHub personal access token. Either field is omitted when not
-  saved.
+- ``~/.wb_coding_agent/credentials.json`` (mode 0600) — opt-in saved provider
+  API keys and the GitHub personal access token. Schema (all fields optional)::
+
+      {
+        "github_pat": "ghp_...",
+        "wb_api_key": "wandb-...",                 # legacy, migrated below
+        "provider_keys": {                          # multi-provider keys
+          "wandb": "wandb-...",
+          "openai": "sk-...",
+          "anthropic": "sk-ant-...",
+          ...
+        },
+        "provider_remember": {                      # per-provider opt-in
+          "wandb": true,
+          ...
+        }
+      }
+
+  ``wb_api_key`` is the legacy single-provider field; it is read on load
+  for back-compat and rewritten into ``provider_keys["wandb"]`` on the
+  next save (one-line migration in :func:`save_credentials`).
 - ``~/.wb_coding_agent/preferences.json`` (default mode) — non-secret profile
   data: GitHub display fields and scopes. (Avatars are sourced live from
   GitHub on PAT verify and cached only for the current session — there is
@@ -133,11 +151,28 @@ def save_profile(profile: Profile) -> None:
     )
 
 
-def load_credentials() -> dict[str, str]:
+def load_credentials() -> dict[str, Any]:
     """Read the credentials file, returning ``{}`` on any failure.
 
-    Possible keys: ``wb_api_key``, ``github_pat``. Missing keys mean the user
-    has not opted in to persisting that secret.
+    Possible keys:
+
+    - ``github_pat: str`` — verified GitHub personal access token.
+    - ``wb_api_key: str`` — **legacy** single-provider field. Surfaced
+      here as a back-compat alias for ``provider_keys["wandb"]``: if the
+      on-disk file has either, ``load_credentials()`` returns BOTH keys
+      pointing at the same value so existing callers (e.g. the auto-
+      connect path that reads ``creds.get("wb_api_key")``) continue to
+      work without changes.
+    - ``provider_keys: dict[str, str]`` — per-provider API keys keyed by
+      provider id (matching :data:`providers.PROVIDERS`). Missing entries
+      mean the user has not opted in to persisting that provider's key.
+    - ``provider_remember: dict[str, bool]`` — per-provider "Remember on
+      this machine" flag.
+
+    The string-only filtering of the previous schema has been relaxed
+    so the dict-shaped ``provider_keys`` / ``provider_remember`` round-
+    trip; non-conforming top-level entries are dropped so a malformed
+    file still produces a usable dict.
     """
     try:
         raw = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
@@ -145,20 +180,117 @@ def load_credentials() -> dict[str, str]:
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {k: str(v) for k, v in raw.items() if isinstance(v, str) and v}
+
+    out: dict[str, Any] = {}
+
+    # Top-level string secrets.
+    for k in ("github_pat", "wb_api_key"):
+        v = raw.get(k)
+        if isinstance(v, str) and v:
+            out[k] = v
+
+    # Provider keys (validated as ``dict[str, str]``).
+    pk_raw = raw.get("provider_keys")
+    if isinstance(pk_raw, dict):
+        pk: dict[str, str] = {}
+        for pid, val in pk_raw.items():
+            if isinstance(pid, str) and isinstance(val, str) and val:
+                pk[pid] = val
+        if pk:
+            out["provider_keys"] = pk
+
+    # Per-provider remember-on-this-machine flags (``dict[str, bool]``).
+    pr_raw = raw.get("provider_remember")
+    if isinstance(pr_raw, dict):
+        pr: dict[str, bool] = {}
+        for pid, val in pr_raw.items():
+            if isinstance(pid, str):
+                pr[pid] = bool(val)
+        if pr:
+            out["provider_remember"] = pr
+
+    # Back-compat: surface ``wb_api_key`` <-> ``provider_keys["wandb"]``
+    # in both directions on read so existing callers see one consistent
+    # view. The on-disk file is migrated lazily on the next save (see
+    # :func:`save_credentials` below).
+    pks = out.get("provider_keys", {})
+    if isinstance(pks, dict):
+        if "wandb" not in pks and out.get("wb_api_key"):
+            # Legacy file: expose the legacy value via the modern path
+            # so callers that were already updated to read provider_keys
+            # see it without forcing a save.
+            pks["wandb"] = out["wb_api_key"]
+            out["provider_keys"] = pks
+        elif "wandb" in pks and not out.get("wb_api_key"):
+            # Modern file with no legacy field: keep the legacy alias
+            # populated for any code path still reading ``wb_api_key``.
+            out["wb_api_key"] = pks["wandb"]
+
+    return out
 
 
-def save_credentials(creds: dict[str, str]) -> None:
+def save_credentials(creds: dict[str, Any]) -> None:
     """Write ``creds`` atomically with ``0600`` permissions.
 
-    Empty values are dropped so calling ``save_credentials({"wb_api_key": ""})``
-    effectively unsets that key. The file is created with mode 0600 from the
-    start by writing into a temp file with that mode and renaming over the
-    target — this avoids a window where the file exists with the umask's
-    default permissions.
+    Accepts the schema documented under :func:`load_credentials`:
+
+    - String values for ``github_pat`` (and the legacy ``wb_api_key``,
+      see migration note below).
+    - Dict values for ``provider_keys`` and ``provider_remember``.
+
+    Empty / falsy values are dropped so calling
+    ``save_credentials({"github_pat": ""})`` effectively unsets that key.
+
+    **Legacy migration** (the one-shot referenced in the module docstring):
+    if the input dict carries ``wb_api_key`` but no ``provider_keys``,
+    we transparently fold it into ``provider_keys["wandb"]`` and drop
+    the legacy top-level field on disk. This means on the next read,
+    the file's canonical layout matches the new schema; callers reading
+    ``wb_api_key`` continue to work because :func:`load_credentials`
+    surfaces the alias.
+
+    The file is created with mode 0600 from the start by writing into a
+    temp file with that mode and renaming over the target — this avoids
+    a window where the file exists with the umask's default permissions.
     """
     _ensure_config_dir()
-    cleaned = {k: v for k, v in creds.items() if isinstance(v, str) and v}
+
+    cleaned: dict[str, Any] = {}
+
+    # Migrate legacy wb_api_key into provider_keys before normalizing.
+    incoming = dict(creds)
+    legacy_wb = incoming.pop("wb_api_key", None)
+    pk_in = incoming.get("provider_keys")
+    if not isinstance(pk_in, dict):
+        pk_in = {}
+    pk_in = dict(pk_in)
+    if isinstance(legacy_wb, str) and legacy_wb and not pk_in.get("wandb"):
+        pk_in["wandb"] = legacy_wb
+    if pk_in:
+        # Drop empty / non-string entries so an explicit `""` clears the
+        # provider's saved key.
+        normalized_pk: dict[str, str] = {}
+        for pid, val in pk_in.items():
+            if isinstance(pid, str) and isinstance(val, str) and val:
+                normalized_pk[pid] = val
+        if normalized_pk:
+            cleaned["provider_keys"] = normalized_pk
+
+    # provider_remember (boolean flags).
+    pr_in = incoming.get("provider_remember")
+    if isinstance(pr_in, dict):
+        normalized_pr: dict[str, bool] = {}
+        for pid, val in pr_in.items():
+            if isinstance(pid, str):
+                normalized_pr[pid] = bool(val)
+        if normalized_pr:
+            cleaned["provider_remember"] = normalized_pr
+
+    # github_pat (top-level string secret).
+    gh = incoming.get("github_pat")
+    if isinstance(gh, str) and gh:
+        cleaned["github_pat"] = gh
+
     tmp = CREDENTIALS_FILE.with_suffix(".json.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -179,19 +311,55 @@ def save_credentials(creds: dict[str, str]) -> None:
         pass
 
 
-def clear_credentials(*, wb: bool = False, github: bool = False) -> None:
-    """Drop one or both stored secrets.
+def clear_credentials(
+    *,
+    wb: bool = False,
+    github: bool = False,
+    provider_id: str | None = None,
+) -> None:
+    """Drop one or more stored secrets.
 
-    Pass ``wb=True`` to forget the W&B API key, ``github=True`` to forget the
-    GitHub PAT. With both False this is a no-op.
+    Pass ``wb=True`` to forget the W&B API key (clears both the legacy
+    ``wb_api_key`` field and ``provider_keys["wandb"]``), ``github=True``
+    to forget the GitHub PAT, or ``provider_id="<id>"`` to forget any
+    single provider's saved key. Combinations are supported. With no
+    flags this is a no-op.
     """
-    if not (wb or github):
+    if not (wb or github or provider_id):
         return
     creds = load_credentials()
     if wb:
         creds.pop("wb_api_key", None)
+        pk = creds.get("provider_keys")
+        if isinstance(pk, dict):
+            pk.pop("wandb", None)
+            if not pk:
+                creds.pop("provider_keys", None)
+        pr = creds.get("provider_remember")
+        if isinstance(pr, dict):
+            pr.pop("wandb", None)
     if github:
         creds.pop("github_pat", None)
+    if provider_id:
+        pk = creds.get("provider_keys")
+        if isinstance(pk, dict):
+            pk.pop(provider_id, None)
+            if not pk:
+                creds.pop("provider_keys", None)
+        pr = creds.get("provider_remember")
+        if isinstance(pr, dict):
+            pr.pop(provider_id, None)
+        # Legacy alias for the W&B-only case.
+        if provider_id == "wandb":
+            creds.pop("wb_api_key", None)
+    # Drop empty container fields so the file shape stays clean.
+    pk = creds.get("provider_keys")
+    if isinstance(pk, dict) and not pk:
+        creds.pop("provider_keys", None)
+    pr = creds.get("provider_remember")
+    if isinstance(pr, dict) and not pr:
+        creds.pop("provider_remember", None)
+
     if creds:
         save_credentials(creds)
     else:
@@ -199,6 +367,55 @@ def clear_credentials(*, wb: bool = False, github: bool = False) -> None:
             CREDENTIALS_FILE.unlink()
         except FileNotFoundError:
             pass
+
+
+def load_provider_keys() -> dict[str, str]:
+    """Return ``{provider_id: api_key}`` for every persisted provider.
+
+    Convenience accessor on top of :func:`load_credentials`. Includes
+    the legacy ``wb_api_key`` field promoted to ``"wandb"`` when the
+    user has not yet been migrated to the new schema.
+    """
+    creds = load_credentials()
+    pk = creds.get("provider_keys")
+    if isinstance(pk, dict):
+        return {k: v for k, v in pk.items() if isinstance(k, str) and isinstance(v, str) and v}
+    return {}
+
+
+def load_provider_remember() -> dict[str, bool]:
+    """Return ``{provider_id: remember_flag}`` for every persisted provider."""
+    creds = load_credentials()
+    pr = creds.get("provider_remember")
+    if isinstance(pr, dict):
+        return {k: bool(v) for k, v in pr.items() if isinstance(k, str)}
+    return {}
+
+
+def save_provider_key(
+    provider_id: str,
+    api_key: str,
+    *,
+    remember: bool = True,
+) -> None:
+    """Persist ``api_key`` for ``provider_id`` and optionally remember it.
+
+    A no-op when ``api_key`` is empty or ``remember`` is False — in that
+    case any persisted entry for ``provider_id`` is cleared instead so
+    the on-disk file matches the user's stated intent.
+    """
+    api_key = (api_key or "").strip()
+    if not api_key or not remember:
+        clear_credentials(provider_id=provider_id)
+        return
+    creds = load_credentials()
+    pk = dict(creds.get("provider_keys") or {})
+    pk[provider_id] = api_key
+    creds["provider_keys"] = pk
+    pr = dict(creds.get("provider_remember") or {})
+    pr[provider_id] = True
+    creds["provider_remember"] = pr
+    save_credentials(creds)
 
 
 def verify_github_pat(pat: str, *, timeout: float = 10.0) -> dict[str, Any]:

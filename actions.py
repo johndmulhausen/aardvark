@@ -13,8 +13,13 @@ Owns:
 
 - The on-disk recent-working-directories list (``recent_dirs.json``).
 - The native folder picker (``osascript`` / ``tkinter`` subprocess).
-- The W&B Inference Connect / Disconnect / Forget callbacks (which build
-  the OpenAI client, list models, and bootstrap Weave).
+- The multi-provider Connect / Disconnect / Forget callbacks
+  (:func:`connect_provider`, :func:`disconnect_provider`,
+  :func:`forget_provider_key`) — generalized in Phase 1 from the
+  W&B-only flow. ``on_connect`` is retained as a thin shim that calls
+  ``connect_provider("wandb", ...)`` so the auto-connect path in
+  ``streamlit_app._maybe_auto_connect`` and the legacy callers in
+  ``app_pages/settings.py`` keep working unchanged.
 - The GitHub PAT verify-and-save / sign-out callbacks.
 - The theme-switcher callbacks (segmented-control ``on_change`` +
   the migration-detection callback fired by ``theme_switcher``).
@@ -34,7 +39,9 @@ from pathlib import Path
 import streamlit as st
 
 import account
-from wb_client import init_weave, list_models, make_client
+import model_catalog
+import providers
+from wb_client import init_weave
 
 
 # ---------------------------------------------------------------------------
@@ -121,112 +128,350 @@ def pick_directory(initial: str | None = None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# W&B Inference connection
+# Multi-provider Connect / Disconnect / Forget callbacks
 # ---------------------------------------------------------------------------
 def _sort_models(models: list[str]) -> list[str]:
-    """Sort model ids by their display label, case-insensitive."""
+    """Sort model ids by their display label, case-insensitive.
+
+    Used for the legacy W&B-only ``ss.models`` list that the chat page
+    previously read. The multi-provider model picker (Phase 2) sorts
+    qualified ids via ``models.model_label(...)`` separately.
+    """
     from models import model_label
     return sorted(models, key=lambda m: model_label(m).casefold())
 
 
-def _connect(api_key: str, project: str) -> None:
-    """Build the OpenAI client + bootstrap Weave. Mutates session state in place."""
-    api_key = api_key.strip()
-    project = project.strip()
-    if not api_key:
-        st.session_state.connect_error = "Enter a W&B API key first."
-        return
-    try:
-        client = make_client(api_key=api_key, project=project or None)
-        models = list_models(client)
-    except Exception as e:
-        st.session_state.client = None
-        st.session_state.models = []
-        st.session_state.connect_error = f"Could not connect: {e}"
-        return
-    st.session_state.client = client
-    st.session_state.models = _sort_models(models)
-    st.session_state.connect_error = None
-    if st.session_state.model not in st.session_state.models:
-        st.session_state.model = (
-            st.session_state.models[0] if st.session_state.models else None
-        )
+def _sync_provider_widgets(provider_id: str) -> None:
+    """Mirror the Settings page's per-provider widget keys into canonical state.
 
+    The Settings page uses the dual-key pattern (per AGENTS.md) so the
+    canonical ``ss.provider_keys[<id>]`` / ``ss.provider_remember[<id>]``
+    survive page navigation while widgets bind to private
+    ``_<id>_key_input`` / ``_<id>_remember_input`` keys. Each widget has
+    an ``on_change`` sync callback, but we re-sync defensively here so
+    a Connect click that fires *without* a prior ``on_change`` event
+    (e.g. user clicks Connect immediately after typing without blurring
+    the field) still picks up the latest typed value.
+
+    For the W&B-specific ``project`` field we mirror an additional
+    ``_wandb_project_input`` widget back into ``ss.project`` (the
+    legacy single-source-of-truth key); future per-provider extras
+    follow the same naming convention.
+    """
+    ss = st.session_state
+    key_widget = f"_{provider_id}_key_input"
+    if key_widget in ss:
+        keys = dict(ss.provider_keys)
+        keys[provider_id] = (ss[key_widget] or "").strip()
+        ss.provider_keys = keys
+    remember_widget = f"_{provider_id}_remember_input"
+    if remember_widget in ss:
+        flags = dict(ss.provider_remember)
+        flags[provider_id] = bool(ss[remember_widget])
+        ss.provider_remember = flags
+    # W&B's optional team/project field uses its own widget key per the
+    # ``extra_fields`` contract on :class:`providers.Provider`.
+    if provider_id == "wandb":
+        if "_wandb_project_input" in ss:
+            ss.project = (ss["_wandb_project_input"] or "").strip()
+        # Legacy alias used by the auto-connect path + older settings
+        # widgets that pre-date the dual-key rename.
+        if "_api_key_input" in ss:
+            keys = dict(ss.provider_keys)
+            keys["wandb"] = (ss._api_key_input or "").strip()
+            ss.provider_keys = keys
+            ss.api_key = keys["wandb"]
+        if "_project_input" in ss:
+            ss.project = (ss._project_input or "").strip()
+        if "_remember_input" in ss:
+            ss.remember_wb_key = bool(ss._remember_input)
+
+
+def _persist_provider_key(provider_id: str) -> None:
+    """Persist or clear ``ss.provider_keys[provider_id]`` based on the remember flag."""
+    ss = st.session_state
+    api_key = ss.provider_keys.get(provider_id, "").strip()
+    remember = bool(ss.provider_remember.get(provider_id, False))
+    account.save_provider_key(provider_id, api_key, remember=remember)
+
+
+def connect_provider(provider_id: str) -> None:
+    """Connect a single provider: build client (if any), list models, persist.
+
+    Reads from ``ss.provider_keys[provider_id]`` (already synced by
+    :func:`_sync_provider_widgets`), constructs the per-kind client via
+    :func:`providers.make_provider_client` (returns ``None`` for
+    ``litellm_compat`` providers — LiteLLM is stateless), and validates
+    connectivity by listing the provider's models through
+    :func:`model_catalog.list_raw_models`.
+
+    On success:
+
+    - ``ss.clients[provider_id]`` carries the client object (or
+      ``None`` for ``litellm_compat`` — the API key is enough).
+    - ``ss.provider_models[provider_id]`` carries the raw model ids
+      sorted alphabetically.
+    - ``ss.connect_errors[provider_id]`` is cleared.
+    - For W&B specifically, :func:`init_weave` is called with the
+      same key + project so chat-completion calls show up as Weave
+      traces.
+    - The per-provider key is persisted to ``credentials.json`` when
+      the user has ticked "Remember on this machine" for that provider.
+
+    On failure the client / models are dropped and the error message is
+    stashed for the Settings card to render.
+
+    The model catalog refresh (with LiteLLM + OpenRouter enrichment)
+    runs separately in :mod:`model_catalog` once that path lands in
+    Phase 2 — this Phase 1 connect just covers raw-id listing for
+    connectivity validation + the chat picker's "is this provider
+    connected" check.
+    """
+    ss = st.session_state
+    provider = providers.get_provider(provider_id)
+    if provider is None:
+        ss.connect_errors[provider_id] = f"Unknown provider: {provider_id!r}"
+        return
+
+    _sync_provider_widgets(provider_id)
+    api_key = ss.provider_keys.get(provider_id, "").strip()
+
+    # Mirror back into the (now-cleaned) dict so other code paths see
+    # the trimmed value.
+    keys = dict(ss.provider_keys)
+    keys[provider_id] = api_key
+    ss.provider_keys = keys
+
+    if not api_key:
+        ss.connect_errors[provider_id] = f"Enter your {provider.label} API key first."
+        ss.clients[provider_id] = None
+        ss.provider_models[provider_id] = []
+        if provider_id == "wandb":
+            # Mirror into the legacy back-compat fields so existing
+            # zero-state UI keeps working.
+            ss.client = None
+            ss.models = []
+            ss.connect_error = ss.connect_errors[provider_id]
+        return
+
+    # Build the client. ``make_provider_client`` raises on bad input;
+    # surface the message verbatim.
     try:
-        _, resolved_project, weave_url = init_weave(
-            api_key=api_key, project=project or None
-        )
-        st.session_state.weave_project = resolved_project
-        st.session_state.weave_url = weave_url
-        st.session_state.weave_error = None
+        client = providers.make_provider_client(provider_id, api_key)
     except Exception as e:
-        st.session_state.weave_project = None
-        st.session_state.weave_url = None
-        st.session_state.weave_error = str(e)
+        ss.clients[provider_id] = None
+        ss.provider_models[provider_id] = []
+        ss.connect_errors[provider_id] = f"Could not initialize {provider.label} client: {e}"
+        if provider_id == "wandb":
+            ss.client = None
+            ss.models = []
+            ss.connect_error = ss.connect_errors[provider_id]
+        return
+
+    # Validate connectivity AND refresh the model catalog in one pass.
+    # ``model_catalog.refresh`` lists models (the de-facto "is this API
+    # key live" connectivity check — /v1/models endpoints return 401 /
+    # 403 on a bad key) and folds in LiteLLM + OpenRouter enrichment,
+    # populating the picker with fresh data immediately. The synchronous
+    # call here is fine — it's only run on user-initiated Connect
+    # clicks, not at startup; the startup path uses ``refresh_all_async``.
+    try:
+        infos = model_catalog.refresh(provider_id, client, api_key)
+    except Exception as e:
+        ss.clients[provider_id] = None
+        ss.provider_models[provider_id] = []
+        ss.connect_errors[provider_id] = f"Could not connect to {provider.label}: {e}"
+        if provider_id == "wandb":
+            ss.client = None
+            ss.models = []
+            ss.connect_error = ss.connect_errors[provider_id]
+        return
+
+    # The Settings card status caption + chat picker both consume the
+    # raw-id list, while the picker's row layout reads the full
+    # ``ModelInfo`` from ``model_catalog``. We keep ``provider_models``
+    # populated with the raw ids so the Settings card's "N models
+    # available" caption stays accurate even when some models were
+    # dropped by the completeness gate.
+    raw_ids = model_catalog._state.raw_ids_per_provider.get(provider_id, [])  # noqa: SLF001
+    sorted_ids = _sort_models(raw_ids)
+    # Touch the refreshing flag's monotonic timestamp so the modal
+    # caption can show "Last refreshed Nm ago" without the daemon-
+    # thread path having run yet (the synchronous connect path also
+    # counts as a refresh from the user's perspective).
+    import time as _time
+    ss.model_catalog_last_refreshed_at = _time.monotonic()
+    clients = dict(ss.clients)
+    clients[provider_id] = client
+    ss.clients = clients
+    pm = dict(ss.provider_models)
+    pm[provider_id] = sorted_ids
+    ss.provider_models = pm
+    errors = dict(ss.connect_errors)
+    errors[provider_id] = None
+    ss.connect_errors = errors
+
+    # Legacy back-compat fields for the W&B path until the chat page
+    # fully migrates to qualified ids in Phase 2.
+    if provider_id == "wandb":
+        # ``ss.client`` is the legacy alias the chat page reads; keep
+        # it in sync. The actual call layer will eventually go through
+        # ``chat_streams.stream_chat`` with no client object, but the
+        # one-release alias keeps existing code paths working.
+        ss.client = client if client is not None else _LegacyWandbConnected()
+        ss.models = sorted_ids
+        if ss.model not in ss.models:
+            ss.model = ss.models[0] if ss.models else None
+        ss.connect_error = None
+
+    # W&B Inference also bootstraps Weave so chat completions get traced.
+    # The other providers' Weave integrations attach via
+    # ``weave-anthropic`` / ``weave-openai`` / ``weave-google-genai``
+    # auto-patching on import, so they don't need a per-provider init.
+    if provider_id == "wandb":
+        try:
+            _, resolved_project, weave_url = init_weave(
+                api_key=api_key,
+                project=ss.project.strip() or None,
+            )
+            ss.weave_project = resolved_project
+            ss.weave_url = weave_url
+            ss.weave_error = None
+        except Exception as e:
+            ss.weave_project = None
+            ss.weave_url = None
+            ss.weave_error = str(e)
+
+    # Persist the key (or clear it if the user un-ticked Remember).
+    _persist_provider_key(provider_id)
+
+
+class _LegacyWandbConnected:
+    """Sentinel object stashed into ``ss.client`` when W&B is connected.
+
+    The legacy W&B-only ``ss.client`` was an actual ``openai.OpenAI``
+    instance. Now that W&B routes through ``litellm.completion(...)``
+    (no persistent client), we still need a truthy value in
+    ``ss.client`` so any code path that does ``if ss.client is not
+    None`` continues to behave as "W&B is connected and ready". This
+    sentinel never makes a network call; the real call layer reads
+    ``ss.provider_keys["wandb"]`` directly through ``chat_streams``.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover — debug aid only
+        return "<LegacyWandbConnected sentinel>"
+
+
+def disconnect_provider(provider_id: str) -> None:
+    """Drop the live client + listed models for ``provider_id`` (key persists).
+
+    Intentional design: clicking Disconnect removes the *runtime*
+    connection (client, listed models, error message) but keeps the
+    saved API key on disk if the user had ticked "Remember on this
+    machine". To wipe the saved key from disk, call
+    :func:`forget_provider_key` instead.
+    """
+    ss = st.session_state
+    clients = dict(ss.clients)
+    clients[provider_id] = None
+    ss.clients = clients
+    pm = dict(ss.provider_models)
+    pm[provider_id] = []
+    ss.provider_models = pm
+    errors = dict(ss.connect_errors)
+    errors[provider_id] = None
+    ss.connect_errors = errors
+
+    if provider_id == "wandb":
+        ss.client = None
+        ss.models = []
+        ss.model = None
+        ss.weave_project = None
+        ss.weave_url = None
+        ss.weave_error = None
+        ss.connect_error = None
+
+
+def forget_provider_key(provider_id: str) -> None:
+    """Remove the persisted API key for ``provider_id`` from disk.
+
+    Also clears the in-session value + un-ticks the "Remember on this
+    machine" flag so the Settings card visibly reflects the change on
+    the next render. If the provider is currently connected, the
+    runtime client stays live until the user explicitly clicks
+    Disconnect — forget_provider_key is "stop persisting", not
+    "disconnect right now".
+    """
+    ss = st.session_state
+    account.clear_credentials(provider_id=provider_id)
+    keys = dict(ss.provider_keys)
+    keys[provider_id] = ""
+    ss.provider_keys = keys
+    flags = dict(ss.provider_remember)
+    flags[provider_id] = False
+    ss.provider_remember = flags
+    # Drop the dual-key widget values so the visible form clears on
+    # rerun (per the dual-key pattern in AGENTS.md).
+    for k in (f"_{provider_id}_key_input", f"_{provider_id}_remember_input"):
+        if k in ss:
+            del ss[k]
+    # Legacy aliases for the W&B path.
+    if provider_id == "wandb":
+        ss.api_key = ""
+        ss.remember_wb_key = False
+        for k in ("_api_key_input", "_remember_input"):
+            if k in ss:
+                del ss[k]
+
+
+# ---------------------------------------------------------------------------
+# Legacy W&B-only callbacks (one-release shim layer)
+# ---------------------------------------------------------------------------
+# These keep ``streamlit_app._maybe_auto_connect`` and any settings code
+# that hasn't been ported to the per-provider naming scheme working
+# unchanged. Internally they all delegate to the multi-provider
+# functions above.
 
 
 def _sync_inference_inputs() -> None:
-    """Pull the latest values from the settings widget keys into the canonical
-    state keys.
+    """Pull the latest W&B widget values into canonical state.
 
-    The settings page uses the dual-key pattern (canonical state in
-    ``api_key`` / ``project`` / ``remember_wb_key``; widget instances in
-    ``_api_key_input`` / ``_project_input`` / ``_remember_input``) so the
-    canonical values survive page navigation. Each widget has an
-    ``on_change`` sync callback, but we re-sync defensively here so a
-    Connect click that fires *without* a prior on_change (e.g. when the
-    user clicks Connect immediately after typing without blurring) still
-    sees the latest typed value.
+    Legacy shim retained for one release. The per-provider equivalent is
+    :func:`_sync_provider_widgets`, which this function delegates to
+    after also handling the legacy ``_api_key_input`` / ``_project_input``
+    / ``_remember_input`` widget keys.
     """
-    ss = st.session_state
-    if "_api_key_input" in ss:
-        ss.api_key = ss._api_key_input
-    if "_project_input" in ss:
-        ss.project = ss._project_input
-    if "_remember_input" in ss:
-        ss.remember_wb_key = bool(ss._remember_input)
+    _sync_provider_widgets("wandb")
 
 
 def on_connect() -> None:
-    """Connect button callback. Honors the ``Remember on this machine`` toggle."""
+    """Connect the W&B Inference provider. Legacy shim for the auto-connect path.
+
+    Honors the legacy ``ss.remember_wb_key`` flag by mirroring it into
+    the per-provider ``ss.provider_remember["wandb"]`` before
+    delegating to :func:`connect_provider`.
+    """
     ss = st.session_state
     _sync_inference_inputs()
-    _connect(ss.api_key, ss.project)
-    if ss.client is not None and ss.connect_error is None:
+    # Mirror the legacy flag onto the per-provider one if a Settings
+    # page from a previous build is still in use.
+    if "remember_wb_key" in ss and "_remember_input" not in ss:
+        flags = dict(ss.provider_remember)
+        flags["wandb"] = bool(ss.remember_wb_key)
+        ss.provider_remember = flags
+    connect_provider("wandb")
+    if ss.connect_errors.get("wandb") is None and ss.clients.get("wandb") is not None:
         ss.conn_open = False
-        creds = account.load_credentials()
-        if ss.remember_wb_key and ss.api_key.strip():
-            creds["wb_api_key"] = ss.api_key.strip()
-            account.save_credentials(creds)
-        elif not ss.remember_wb_key:
-            account.clear_credentials(wb=True)
 
 
 def disconnect() -> None:
-    """Drop the live client + models without forgetting the saved API key."""
-    ss = st.session_state
-    ss.client = None
-    ss.models = []
-    ss.model = None
-    ss.weave_project = None
-    ss.weave_url = None
-    ss.weave_error = None
-    ss.connect_error = None
+    """Legacy shim — disconnect the W&B Inference provider."""
+    disconnect_provider("wandb")
 
 
 def forget_saved_wb_key() -> None:
-    """Remove the persisted W&B API key from disk and clear the session value."""
-    account.clear_credentials(wb=True)
-    ss = st.session_state
-    ss.api_key = ""
-    ss.remember_wb_key = False
-    # Drop the underlying widget keys so the visible form clears on rerun
-    # (without this, the text input would still show the previously typed
-    # value because Streamlit keeps the widget key as the source of truth
-    # once it has been instantiated).
-    for k in ("_api_key_input", "_remember_input"):
-        if k in ss:
-            del ss[k]
+    """Legacy shim — forget the persisted W&B API key from disk."""
+    forget_provider_key("wandb")
 
 
 # ---------------------------------------------------------------------------

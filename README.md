@@ -192,7 +192,7 @@ The application is organized into several specialized modules with clear respons
 
 #### Core Application Modules
 - **`streamlit_app.py`** - Main entry point with shared sidebar and navigation
-- **`app_pages/chat.py`** - Chat interface with real-time agent interaction; also hosts the live working-tree diff in a "Changes" modal opened from above the chat input
+- **`app_pages/chat.py`** - Chat interface with real-time agent interaction; also hosts the live working-tree diff in a "Changes" modal opened from below the chat input
 - **`app_pages/usage.py`** - Token usage and cost dashboard
 - **`app_pages/settings.py`** - User preferences and connection management
 - **`app_pages/docs.py`** - In-app user guide (the user-facing companion to `AGENTS.md`)

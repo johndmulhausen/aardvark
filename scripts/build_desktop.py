@@ -62,11 +62,26 @@ BUNDLED_MODULES: tuple[str, ...] = (
     "usage.py",
     "git_ops.py",
     "chats.py",
+    "commit_ai.py",
+    # Phase 1–6 multi-provider modules.
+    "providers.py",
+    "chat_streams.py",
+    "model_catalog.py",
+    "fullscreen_trigger.py",
+    "attachments.py",
+    "_artifact_paths.py",
     "app_pages/__init__.py",
     "app_pages/chat.py",
     "app_pages/usage.py",
     "app_pages/settings.py",
     "app_pages/docs.py",
+    # Repo-bundled LiteLLM pricing snapshot — the offline floor for
+    # ``model_catalog._load_litellm_registry``. Without this, a fresh
+    # install with no network connectivity would have no pricing data
+    # for any model; the strict completeness gate would hide
+    # everything from the picker until the first online refresh.
+    "data/litellm_model_registry.json",
+    "data/LITELLM_REGISTRY_SHA.txt",
 )
 
 # Third-party packages imported by ``BUNDLED_MODULES`` (not by
@@ -80,6 +95,18 @@ COLLECT_ALL_PACKAGES: tuple[str, ...] = (
     "weave",
     "mcp",
     "httpx",
+    # Phase 1–6 deps. ``litellm`` is the call layer for 9 of the 12
+    # providers; ``anthropic`` and ``google.genai`` are the native SDKs
+    # for the other two; ``pypdf`` is used by ``attachments.extract_text``
+    # for non-native PDF-input models; ``PIL`` is needed by
+    # ``attachments.preprocess_image`` (transitive Streamlit dep, but
+    # we collect it explicitly so PyInstaller picks up the bundled
+    # image codecs).
+    "anthropic",
+    "google.genai",
+    "litellm",
+    "pypdf",
+    "PIL",
 )
 
 # Streamlit CLI options forwarded to the bundled app at launch. These mirror
@@ -106,6 +133,13 @@ STREAMLIT_OPTIONS: tuple[tuple[str, str], ...] = (
     ("client.toolbarMode", "minimal"),
     ("browser.gatherUsageStats", "false"),
     ("theme.baseFontSize", "12"),
+    # Primary accent color. Mirrors the ``[theme.light].primaryColor``
+    # / ``[theme.dark].primaryColor`` values in
+    # ``.streamlit/config.toml``. Streamlit exposes per-mode CLI flags
+    # for color options (unlike ``baseFontSize``), so we forward both
+    # so Light and Dark modes stay in sync inside the packaged build.
+    ("theme.light.primaryColor", "#0080FF"),
+    ("theme.dark.primaryColor", "#0080FF"),
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

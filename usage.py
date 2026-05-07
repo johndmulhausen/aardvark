@@ -10,7 +10,7 @@ Schema of one log entry::
 
     {
         "ts": "2026-05-06T14:32:11.123456+00:00",  # ISO-8601 UTC, "Z" or +00:00
-        "model": "openai/gpt-oss-120b",
+        "model": "wandb:openai/gpt-oss-120b",      # qualified id (provider:raw)
         "prompt_tokens": 1842,
         "completion_tokens": 312,
         "total_tokens": 2154,
@@ -19,8 +19,16 @@ Schema of one log entry::
         "output_cost_usd": 0.000187,
         "rounds": 3,                  # number of inference rounds in the turn
         "duration_seconds": 4.812,    # wall-clock latency of the turn
-        "mode": "agent"               # or "ask"
+        "mode": "agent",              # or "ask" (the agent UI mode)
+        "model_mode": "chat",         # Phase 5: model-mode discriminator
+        "kind": "",                   # Phase 5: "image" / "audio" / "video" / "" for chat
+        "unit_count": null,           # Phase 5: count for non-token modes
+        "unit": ""                    # Phase 5: "image" / "audio_seconds" / "video_seconds" / "characters"
     }
+
+Backward compatibility: pre-Phase-5 entries lack the four trailing
+fields. The dashboard reads them with ``.get(...)`` defaults so
+historical rows still render.
 
 This module has no Streamlit imports so non-UI code (the agent loop, future
 CLIs) can record turns without dragging in Streamlit.
@@ -107,23 +115,47 @@ def record_usage(entry: dict[str, Any]) -> None:
 def build_entry(
     *,
     model: str,
-    prompt_tokens: int,
-    completion_tokens: int,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
     total_tokens: int | None = None,
     rounds: int = 1,
     duration_seconds: float | None = None,
     mode: str | None = None,
     timestamp: datetime | None = None,
+    # Phase 5 media-mode fields (optional; default to None for back-compat
+    # with chat-only callers). When ``model_mode`` is non-chat the
+    # token fields are typically zero and ``unit_count`` carries the
+    # mode-specific count (images / audio seconds / video seconds /
+    # characters).
+    model_mode: str | None = None,
+    kind: str | None = None,
+    unit_count: int | None = None,
+    unit: str | None = None,
+    cost_usd_override: float | None = None,
 ) -> dict[str, Any]:
     """Build a fully-populated log entry from raw counts.
 
     Centralizes the schema so callers don't accidentally drop fields. The
     returned dict is what the dashboard expects to find in
     :data:`USAGE_FILE`; pass it straight to :func:`record_usage`.
+
+    Token-based callers (the chat path) leave the new
+    ``model_mode`` / ``kind`` / ``unit_count`` / ``unit`` fields empty
+    and the entry's shape matches the previous schema verbatim — the
+    Usage dashboard's existing aggregations continue to work.
+    Media-mode callers pass ``model_mode="image_generation"`` (etc.),
+    ``kind="image"``, ``unit_count=2``, ``unit="image"``, and
+    ``cost_usd_override=<computed>`` (because chat-style
+    ``compute_cost`` doesn't apply to media pricing — the caller
+    already has the dollar figure from the tool result).
     """
     if total_tokens is None:
         total_tokens = prompt_tokens + completion_tokens
     inp_cost, out_cost, total_cost = compute_cost(model, prompt_tokens, completion_tokens)
+    if cost_usd_override is not None:
+        total_cost = float(cost_usd_override)
+        inp_cost = None
+        out_cost = None
     ts = (timestamp or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     return {
         "ts": ts,
@@ -139,7 +171,64 @@ def build_entry(
             float(duration_seconds) if duration_seconds is not None else None
         ),
         "mode": mode or "",
+        # Multi-modality fields (Phase 5). Default-empty for chat
+        # entries so the dashboard's existing readers keep working.
+        "model_mode": model_mode or "chat",
+        "kind": kind or "",
+        "unit_count": int(unit_count) if unit_count is not None else None,
+        "unit": unit or "",
     }
+
+
+def compute_cost_for_mode(
+    *,
+    qualified_model: str,
+    mode: str,
+    units: int,
+    dimensions: dict[str, str] | None = None,
+) -> float | None:
+    """Compute USD cost for a media-mode call.
+
+    Reads pricing out of :mod:`model_catalog`'s in-memory catalog
+    (which the chat-page tool calls have already populated by the
+    time the usage record is built). Returns ``None`` when no
+    matching :class:`model_catalog.ModelInfo` exists or pricing for
+    the requested mode is missing.
+
+    Parameters:
+    - ``qualified_model``: ``"<provider>:<raw>"``. Falls back to the
+      curated MODEL_METADATA pricing slot for chat-mode lookups.
+    - ``mode``: ``"image_generation"`` / ``"audio_speech"`` /
+      ``"audio_transcription"`` / ``"video_generation"`` /
+      ``"embedding"``.
+    - ``units``: how many units to bill for. Image gen = number of
+      images; TTS = number of input characters; STT = number of
+      audio seconds; video = generated seconds; embedding = input
+      tokens.
+    - ``dimensions``: extra discriminators for image gen
+      (``{"size": "1024x1024", "quality": "standard"}``); ignored
+      for other modes.
+    """
+    import model_catalog
+
+    info = model_catalog.get_info(qualified_model)
+    if info is None:
+        return None
+    if mode == "image_generation" and info.image_pricing:
+        dims = dimensions or {}
+        size = dims.get("size") or "1024x1024"
+        quality = dims.get("quality") or "standard"
+        per_image = info.image_pricing.get(f"{size}/{quality}") or min(info.image_pricing.values())
+        return round(per_image * units, 6)
+    if mode == "audio_speech" and info.tts_pricing_per_1m_chars is not None:
+        return round(info.tts_pricing_per_1m_chars * units / 1_000_000, 6)
+    if mode == "audio_transcription" and info.stt_pricing_per_1m_seconds is not None:
+        return round(info.stt_pricing_per_1m_seconds * units / 1_000_000, 6)
+    if mode == "video_generation" and info.video_pricing_per_second is not None:
+        return round(info.video_pricing_per_second * units, 6)
+    if mode == "embedding" and info.embedding_pricing_per_1m is not None:
+        return round(info.embedding_pricing_per_1m * units / 1_000_000, 6)
+    return None
 
 
 def load_usage(since: datetime | None = None) -> list[dict[str, Any]]:

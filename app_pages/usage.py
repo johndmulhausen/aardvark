@@ -166,6 +166,47 @@ def render() -> None:
             help="Trailing 7-day cost. Delta compares against the prior 7 days.",
         )
 
+    # ----- Phase 5: Media KPI strip -----
+    media_today = [
+        e for e in today_entries
+        if e.get("model_mode") and e.get("model_mode") != "chat"
+    ]
+    if media_today:
+        # Per-mode aggregations for the strip.
+        img_count = sum(int(e.get("unit_count") or 0) for e in media_today if e.get("kind") == "image")
+        audio_seconds = sum(int(e.get("unit_count") or 0) for e in media_today if e.get("kind") == "audio")
+        video_seconds = sum(int(e.get("unit_count") or 0) for e in media_today if e.get("kind") == "video")
+        media_cost = sum(
+            float(e["cost_usd"]) for e in media_today
+            if isinstance(e.get("cost_usd"), (int, float))
+        )
+        st.subheader("Media today")
+        media_cols = st.columns(4, border=True)
+        with media_cols[0]:
+            st.metric(
+                label="Images",
+                value=str(img_count),
+                help="Images generated in the current UTC day across all providers.",
+            )
+        with media_cols[1]:
+            st.metric(
+                label="Audio (sec)",
+                value=str(audio_seconds),
+                help="Audio seconds synthesized today.",
+            )
+        with media_cols[2]:
+            st.metric(
+                label="Video (sec)",
+                value=str(video_seconds),
+                help="Video seconds generated today.",
+            )
+        with media_cols[3]:
+            st.metric(
+                label="Media cost",
+                value=usage_log.format_cost(media_cost),
+                help="Total USD spent on media generation today.",
+            )
+
     st.subheader("Tokens per day")
     st.caption("Last 30 days. Stacked: prompt tokens vs completion tokens.")
     daily_tok = _build_daily_token_chart_data(entries, days=30)
@@ -218,10 +259,20 @@ def render() -> None:
     table_rows = []
     for e in recent:
         cost = e.get("cost_usd")
+        # Phase 5: media-mode rows. ``model_mode`` defaults to "chat"
+        # for back-compat (older entries lack the field entirely).
+        model_mode = e.get("model_mode") or "chat"
+        unit_count = e.get("unit_count")
+        unit = e.get("unit") or ""
         table_rows.append({
             "Time": _format_iso_for_table(e.get("ts", "")),
             "Model": model_label(e.get("model", "")),
             "Mode": e.get("mode") or "",
+            "Output": (
+                f"{unit_count} {unit}".strip()
+                if isinstance(unit_count, (int, float)) and model_mode != "chat"
+                else f"{int(e.get('total_tokens') or 0)} tokens"
+            ),
             "Prompt tokens": int(e.get("prompt_tokens") or 0),
             "Completion tokens": int(e.get("completion_tokens") or 0),
             "Total tokens": int(e.get("total_tokens") or 0),

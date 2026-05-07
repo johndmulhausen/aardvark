@@ -110,6 +110,7 @@ def _render_overview_tab() -> None:
         "- **Your MCP servers** — list of external tool servers you've "
         "added on the Settings page. Saved so only you can read it.\n"
         "- **Your chat history** — one file per conversation, so chats "
+        "(including any half-typed message you haven't sent yet) "
         "stick around between launches."
     )
 
@@ -178,31 +179,58 @@ def _render_agent_tab() -> None:
         "It's locked until you've connected to W&B Inference and "
         "picked a folder. Hit Enter to send."
     )
+    st.markdown(
+        "**Your draft is saved as you type.** If you switch to another "
+        "chat, jump to the Settings or Usage tab, or close and reopen "
+        "the app, the text you typed (but didn't send) comes back the "
+        "next time you open that chat. Each chat keeps its own draft, "
+        "so you can have one half-written message in one conversation "
+        "and a different one in another without them mixing up."
+    )
     st.caption(
         "Tip: type `/` to pop up a list of skills (covered below)."
     )
 
-    st.markdown("##### The Changes button")
+    st.markdown("##### The Stop button")
     st.markdown(
-        "Just above the chat input, when your folder has unsaved "
-        "changes, you'll see a **Changes** button with a red badge "
-        "showing how many files have changed. Click it to open a "
-        "window listing every changed file. Each file has its own "
-        "collapsible section with a green-and-red view of what was "
-        "added or removed."
+        "While the agent is working on a reply, a red **Stop** button "
+        "appears right above the chat input and the input itself "
+        "locks. Click **Stop** any time you want to interrupt the "
+        "model — the connection to the AI service drops right away "
+        "so you don't get charged for any more tokens."
+    )
+    st.markdown(
+        "Anything the model already wrote stays in the chat (with a "
+        "small grey **Stopped by user** caption underneath so you can "
+        "see where it cut off), and the chat input unlocks so you "
+        "can send a new message right away."
     )
     st.caption(
-        "The button is hidden when nothing has changed, when your "
-        "folder isn't a git project, or when git isn't installed."
+        "The Stop button is only visible while a reply is in flight. "
+        "Once the chat is idle again it disappears on its own."
     )
 
     st.markdown("##### The git row")
     st.markdown(
-        "When your folder is a git project, the strip just above the "
-        "Changes button holds your git controls: a branch picker, a "
-        "**+** button for a new branch, a cloud-arrow button to fetch "
-        "from the remote, and a **Push** button. The Git tab in this "
-        "guide covers each of these in detail."
+        "Just below the chat input, when your folder is a git project, "
+        "you'll see a strip of git controls: a branch picker, a **+** "
+        "button for a new branch, a cloud-arrow button to fetch from "
+        "the remote, and a **Push** button. The Git tab in this guide "
+        "covers each of these in detail."
+    )
+
+    st.markdown("##### The Changes button")
+    st.markdown(
+        "Right below the git row, when your folder has unsaved "
+        "changes, you'll see a **Changes** button showing how many "
+        "files have changed and how many lines were added or removed. "
+        "Click it to open a window listing every changed file. Each "
+        "file has its own collapsible section with a green-and-red "
+        "view of what was added or removed."
+    )
+    st.caption(
+        "The button is hidden when nothing has changed, when your "
+        "folder isn't a git project, or when git isn't installed."
     )
 
     st.markdown("##### The Working directory dropdown")
@@ -284,9 +312,10 @@ def _render_agent_tab() -> None:
         "under the card. That means the model is known to *describe* "
         "edits in plain text without actually making them — you'll get "
         "a reply like \"I'll update the file...\" but no diff and no "
-        "real change on disk. If that happens, switch to a model "
-        "built for coding or agent work. Good first picks are "
-        "**Qwen3 Coder 480B**, **DeepSeek V3.1**, and **GPT OSS 120B**."
+        "real change on disk. The warning links to the public bug "
+        "report for that model so you can read the source and decide "
+        "for yourself. If you hit it, just pick a different model "
+        "from the dropdown."
     )
 
     st.markdown("##### The Skills popover")
@@ -295,6 +324,67 @@ def _render_agent_tab() -> None:
         "the skill count, like `5 skills`. Click it to see every "
         "skill available in this folder, each with a one-line "
         "description and the keywords that turn it on."
+    )
+
+    st.subheader("Attaching files to a message")
+    st.markdown(
+        "The chat input has a paperclip icon on the right. Click it "
+        "(or drag files onto the chat input) to attach files to your "
+        "next message. Supported types:"
+    )
+    st.markdown(
+        "- **Images** (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) — "
+        "the agent can describe them, transcribe text, compare them, "
+        "or use them as references when writing code. Only models "
+        "that support images can read them; if you've picked a "
+        "text-only model, the agent will tell you it didn't see the "
+        "image.\n"
+        "- **PDFs** — Anthropic Claude 3.5+ and Google Gemini 1.5+ "
+        "read PDFs natively, including tables and figures. For the "
+        "other providers, the app extracts text from the PDF before "
+        "sending so the agent at least sees the words. A small chip "
+        "next to the file shows which path was used (`native PDF` "
+        "vs `text-extracted`).\n"
+        "- **Plain text and code files** (`.py`, `.md`, `.json`, "
+        "`.csv`, etc.) — inlined as a code block in your message so "
+        "the agent can read the contents directly."
+    )
+    st.markdown(
+        "Attached files are saved into a folder called "
+        "`.wb_artifacts/<chat-id>/inbox/` inside your project. The "
+        "first time the app uses that folder, it adds it to your "
+        "project's `.gitignore` so you don't accidentally commit "
+        "uploads. Files stay on disk until you delete them yourself."
+    )
+
+    st.subheader("Media output: image, audio, and video generation")
+    st.markdown(
+        "Some models can generate images, audio, or video instead of "
+        "(or in addition to) text. The agent has three built-in tools "
+        "it can call when it makes sense:"
+    )
+    st.markdown(
+        "- **`generate_image`** — text-to-image. Saves PNG files "
+        "into `.wb_artifacts/<chat-id>/`. The reply shows the image "
+        "right inside the chat with a **View** button (opens a "
+        "lightbox modal) and a **Download** button.\n"
+        "- **`generate_speech`** — text-to-speech. Saves an MP3 (by "
+        "default; WAV / Opus / FLAC also supported) into the same "
+        "folder. The chat shows an HTML5 audio player so you can "
+        "listen without leaving the page.\n"
+        "- **`generate_video`** — text-to-video (Sora, Veo). Long-"
+        "running operations show a progress caption while they run. "
+        "The reply embeds the video with native browser playback "
+        "(including fullscreen via the player's own button)."
+    )
+    st.markdown(
+        "When you click **View** on an image, a lightbox modal opens "
+        "with the image at full dialog width and a **Fullscreen** "
+        "button that uses your browser's true fullscreen mode. "
+        "Video has the same Fullscreen control built into the "
+        "player. All generated files live in your project folder, "
+        "not on a cloud somewhere — they're yours to keep, move, "
+        "or delete."
     )
 
     st.subheader("Skills and slash commands")
@@ -384,7 +474,10 @@ def _render_chats_tab() -> None:
         "At the top of the sidebar. Click it to start a fresh "
         "conversation. If you already have an empty chat that you "
         "never used, clicking the button brings you back to it "
-        "instead of stacking up empty rows."
+        "instead of stacking up empty rows. If you click it from a "
+        "non-Agent tab (Settings, Usage, or Docs), the app jumps you "
+        "back to the **Agent** tab so you can start typing right "
+        "away."
     )
 
     st.markdown("##### Each row in the list")
@@ -392,7 +485,8 @@ def _render_chats_tab() -> None:
         "Every row has, from left to right: a small icon for the "
         "chat's state, the chat's title, an **archive** button, and a "
         "**delete** button. The chat you're currently looking at is "
-        "highlighted."
+        "shown with an outlined box around it and can't be clicked "
+        "(since you're already on it)."
     )
 
     st.markdown("##### What the icons mean")
@@ -400,7 +494,9 @@ def _render_chats_tab() -> None:
         "- :material/chat_bubble_outline: **Empty bubble** — brand-new "
         "chat, no messages yet.\n"
         "- :material/progress_activity: **Spinner** — the agent is "
-        "working on a reply right now.\n"
+        "working on a reply right now. Open this chat and use the "
+        "**Stop** button above the chat input if you want to "
+        "interrupt it without spending more tokens.\n"
         "- :material/check_circle: **Check mark** — the chat is done "
         "with its last reply and waiting for your next message.\n"
         "- :material/cancel: **Red X** — something went wrong with the "
@@ -415,27 +511,37 @@ def _render_chats_tab() -> None:
         "- **Delete** removes the chat for good. The app asks you to "
         "confirm first. Once it's deleted, it's gone."
     )
+    st.caption(
+        "If you delete a chat while it's still working on a reply (the "
+        "spinner icon is showing), the app warns you and the confirm "
+        "button changes to **Stop and delete**. Clicking it stops the "
+        "AI right away so you don't get charged for any more tokens, "
+        "then removes the chat."
+    )
 
     st.subheader("How chats get titled")
     st.markdown(
         "After you send your first message, the AI picks a short title "
-        "for the chat on its own (about five words). After every "
-        "agent reply, it also writes a one-sentence summary that shows "
-        "up under the active chat in the sidebar."
-    )
-    st.caption(
-        "Both the title and the summary update as the conversation "
-        "grows, so the sidebar always reflects what the chat is "
-        "actually about."
+        "for the chat on its own (about five words) and that title "
+        "stays for the rest of the conversation."
     )
 
     st.subheader("Switching between chats")
     st.markdown(
-        "Click any row in the sidebar to load that chat. Each chat "
-        "remembers its own folder, mode, and model — so you can have "
-        "one chat working in your frontend project on a fast model and "
-        "another chat working in a backend folder on a smarter model. "
-        "Picking a new model in one chat does not change the others."
+        "Click any row in the sidebar to load that chat. If you're "
+        "on a tab other than **Agent** (say, **Settings** or "
+        "**Usage**), the app jumps you back to the Agent tab so you "
+        "can see the chat's history right away. Each chat remembers "
+        "its own folder, mode, and model — so you can have one chat "
+        "working in your frontend project on a fast model and another "
+        "chat working in a backend folder on a smarter model. Picking "
+        "a new model in one chat does not change the others."
+    )
+    st.caption(
+        "Each chat also remembers any half-typed message in its chat "
+        "input. Switch chats, jump tabs, or close the app — when you "
+        "come back to that chat the draft is still there. Sending the "
+        "message clears it."
     )
 
     st.subheader("Two chats at the same time")
@@ -471,7 +577,8 @@ def _render_git_tab() -> None:
     st.subheader("The git row at the bottom of the page")
     st.markdown(
         "When your folder is a git project, you'll see a strip of "
-        "controls just above the **Changes** button:"
+        "controls just below the chat input (and just above the "
+        "**Changes** button):"
     )
 
     st.markdown("##### The branch picker")
@@ -564,11 +671,10 @@ def _render_git_tab() -> None:
 
     st.subheader("The Changes window")
     st.markdown(
-        "The **Changes** button just above the chat input opens a "
-        "modal listing every file that has changed in your folder "
-        "since the last commit. Each file has its own collapsible "
-        "section with a green-and-red diff. Small badges flag files "
-        "that are:"
+        "The **Changes** button just below the git row opens a modal "
+        "listing every file that has changed in your folder since the "
+        "last commit. Each file has its own collapsible section with "
+        "a green-and-red diff. Small badges flag files that are:"
     )
     st.markdown(
         "- **Untracked** — brand-new files git hasn't seen yet.\n"
@@ -656,6 +762,76 @@ def _render_settings_tab() -> None:
     st.caption(
         "Both choices are saved on this computer so they stay between "
         "launches."
+    )
+
+    st.subheader("Providers")
+    st.markdown(
+        "The Settings page lists every AI provider you can use. There "
+        "are 12 in total: **5 visible by default** and 7 more inside "
+        "the **More providers** drop-down. The five up top are picked "
+        "to be the smallest set of API keys that together cover almost "
+        "every model and feature you'd want."
+    )
+    st.markdown(
+        "Each provider card has the same pieces: an **API key** field "
+        "(paste your key from that provider's website), a **Get a key** "
+        "button that opens the provider's key page in your browser, a "
+        "**Remember on this machine** checkbox so the app can re-use "
+        "the key next time, and **Connect / Disconnect / Forget** "
+        "buttons. You only need to add a key for the providers you "
+        "actually want to use — adding even one is enough to start chatting."
+    )
+    st.markdown("##### The 5 first-class providers")
+    st.markdown(
+        "- **W&B Inference** — Weights & Biases' open-model service, "
+        "and the source of **traces** (a recorded timeline of every "
+        "step the agent takes). Tracing only works when W&B is "
+        "connected, even if you use a different provider for the "
+        "actual chat. So most users want a W&B key whatever else "
+        "they pick. Get one at "
+        "[wandb.ai/settings](https://wandb.ai/settings). The optional "
+        "**Project** field tags your usage to a specific W&B team.\n"
+        "- **OpenAI** — GPT-4o, o-series reasoning models, "
+        "GPT-Image-1, native text-to-speech, and Sora video.\n"
+        "- **Anthropic** — the Claude family. **Prompt caching** "
+        "(a feature only the native Anthropic key unlocks) cuts the "
+        "cost of every turn after the first by about 90%, which adds "
+        "up fast for a coding agent that re-sends a long system "
+        "prompt every turn.\n"
+        "- **Google Gemini** — Gemini 2.5 Pro / Flash, Imagen for "
+        "images, Veo for video.\n"
+        "- **OpenRouter** — labeled **marked-up gateway**. OpenRouter "
+        "is one key that reaches hundreds of models from other "
+        "providers, but they add 5–10% on top of the native price. "
+        "Pick this when you want broad model coverage without "
+        "managing seven keys; if you use one of the open-model clouds "
+        "below heavily, save the markup by adding its direct key "
+        "instead."
+    )
+    st.markdown("##### The 7 in **More providers**")
+    st.markdown(
+        "All of these are direct-to-provider with no markup — worth "
+        "adding when you use that one provider heavily, but optional "
+        "if OpenRouter already covers your needs."
+    )
+    st.markdown(
+        "- **Together AI** — open-source models like Llama and "
+        "DeepSeek with strong throughput.\n"
+        "- **Groq** — the same open models, but on extra-fast LPU "
+        "hardware. Good when you want quick replies.\n"
+        "- **Fireworks AI** — production-grade hosted open models "
+        "with an in-house inference engine.\n"
+        "- **Mistral**, **xAI** (Grok), **Cerebras**, **DeepInfra** — "
+        "additional direct-host providers each with their own "
+        "specialty (Mistral's own models, Grok, Cerebras's wafer-"
+        "scale low-latency hardware, DeepInfra's deep-discount "
+        "open-model hosting)."
+    )
+    st.caption(
+        "Pricing in this app is always **direct from the provider** "
+        "— we never mark up tokens. The only exception is OpenRouter, "
+        "which adds the markup itself; we label it clearly so you "
+        "know what you're paying for."
     )
 
     st.subheader("W&B Inference")

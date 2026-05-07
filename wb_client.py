@@ -248,14 +248,25 @@ def _patch_weave_openai_finish_reason() -> None:
 def init_weave(
     api_key: str, project: str | None = None
 ) -> tuple[WeaveClient, str, str]:
-    """Initialize W&B Weave so every OpenAI call gets traced.
+    """Initialize W&B Weave so every chat-completion call gets traced.
 
     Sets ``WANDB_API_KEY`` from ``api_key`` so :func:`weave.init` can
     authenticate non-interactively (it would otherwise prompt on stdin, which
     is broken in a Streamlit/desktop context), then calls
-    ``weave.init(project)``. After this returns, ``openai.OpenAI`` is patched
-    and any chat-completion call from ``agent.py`` is captured as a child of
-    the surrounding ``@weave.op``.
+    ``weave.init(project)``. After this returns, **every supported SDK is
+    auto-patched** — Weave 0.52+ ships native integrations for ``openai``,
+    ``anthropic``, ``google_genai``, ``litellm``, ``groq``, ``cerebras``,
+    and ``mistral`` (verified via the bundled integrations directory).
+
+    All four dispatch paths in :func:`chat_streams.stream_chat` therefore
+    log into the same trace tree without per-provider wiring beyond the
+    existing ``@_op`` decorator on ``_stream_one_call``:
+
+    - ``openai_native`` → patched ``openai.OpenAI`` (one trace per call)
+    - ``anthropic_native`` → patched ``anthropic.Anthropic``
+    - ``google_native`` → patched ``google.genai.Client``
+    - ``litellm_compat`` → patched ``litellm.completion`` (one trace per
+      call, child ops for the underlying HTTP request)
 
     Reuses the same `team/project` string the user pastes in the sidebar (also
     used for W&B Inference usage attribution by ``make_client``); when empty,

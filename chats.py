@@ -31,6 +31,19 @@ Hard rules (mirrored in ``AGENTS.md``):
 - A chat persisted with ``status == "running"`` at app startup is
   rewritten to ``"error"`` on load — the thread that owned it died
   with the previous process.
+- A user-initiated cancel goes through :func:`request_cancel`, which
+  sets a per-chat :class:`threading.Event`. The runner thread checks
+  the event between agent events (and before every ``save_chat``)
+  and routes through :func:`_finalize_cancelled_turn` to flip status
+  back to ``"idle"``, preserve any in-flight streamed text as a
+  proper ``assistant_text`` event for replay, append a
+  ``{"type": "cancelled"}`` marker the renderer surfaces as a
+  "Stopped by user" caption, and ensure ``chat.messages`` stays
+  well-formed (no two consecutive user messages on the next turn).
+  Two call sites today: the chat-page **Stop** button (the active
+  chat stays around, just back at idle) and :func:`delete_chat` with
+  ``force=True`` (the chat is deleted; the finalize call is a no-op
+  for the file because :attr:`Chat._deleted` is set first).
 
 Per-turn usage capture (token counts + cost) still flows through
 :mod:`usage`; we mirror the bookkeeping the old synchronous chat page
@@ -95,7 +108,6 @@ class Chat:
 
     id: str
     title: str = DEFAULT_TITLE
-    description: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
     ui_turns: list[dict[str, Any]] = field(default_factory=list)
     model: str = ""
@@ -104,6 +116,14 @@ class Chat:
     status: str = STATUS_NEW
     error_message: str = ""
     partial_text: str = ""
+    # In-progress chat-input text that hasn't been submitted yet. Saved
+    # to disk on every keystroke (via the JS-side debounce + on-rerun
+    # callback in :mod:`chat_input`) so navigating away from the chat
+    # page, switching chats, reloading the app, or even a hard process
+    # crash never silently drops what the user was typing. Cleared by
+    # the submit handler in ``app_pages/chat.py`` once the prompt is
+    # consumed by :func:`start_turn`.
+    draft_text: str = ""
     archived: bool = False
     created_at: str = ""
     updated_at: str = ""
@@ -111,13 +131,30 @@ class Chat:
     # Runtime-only state — excluded from serialization.
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
+    # Set by :func:`request_cancel` to ask the background turn thread
+    # (if any) to stop ASAP. The runner checks ``is_set()`` between
+    # events yielded by ``agent.run_agent_turn`` and before every
+    # ``save_chat`` call, so once we set the event the runner will
+    # neither spend more tokens nor write more state to disk.
+    # ``start_turn`` clears the event before spawning a thread so a
+    # stale signal from a previous turn doesn't kill a fresh one.
+    _cancel_event: threading.Event = field(
+        default_factory=threading.Event, repr=False
+    )
+    # Set by :func:`delete_chat` (under ``chat._lock``) once the chat
+    # has been popped from session state and unlinked from disk. From
+    # that point on every :func:`save_chat` call against this chat
+    # short-circuits, which closes the race where the runner is
+    # mid-write when delete fires: ``delete_chat`` waits on the lock
+    # so the in-flight save completes before the unlink, and any
+    # subsequent save sees this flag and bails. Runtime-only.
+    _deleted: bool = field(default=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable subset of fields."""
         return {
             "id": self.id,
             "title": self.title,
-            "description": self.description,
             "messages": self.messages,
             "ui_turns": self.ui_turns,
             "model": self.model,
@@ -126,6 +163,7 @@ class Chat:
             "status": self.status,
             "error_message": self.error_message,
             "partial_text": self.partial_text,
+            "draft_text": self.draft_text,
             "archived": self.archived,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -136,13 +174,16 @@ class Chat:
         """Reconstruct a :class:`Chat` from its on-disk JSON.
 
         Tolerant of missing keys so older files (written before a new
-        field was added) still load cleanly.
+        field was added) still load cleanly. Also tolerant of extra
+        keys: any field we used to persist but no longer track (today:
+        a removed AI-generated ``description`` field) is silently
+        dropped — :func:`save_chat` immediately rewrites the file
+        without it on the next persist.
         """
         chat_id = str(raw.get("id") or uuid.uuid4().hex)
         return cls(
             id=chat_id,
             title=str(raw.get("title") or DEFAULT_TITLE),
-            description=str(raw.get("description") or ""),
             messages=list(raw.get("messages") or []),
             ui_turns=list(raw.get("ui_turns") or []),
             model=str(raw.get("model") or ""),
@@ -151,6 +192,7 @@ class Chat:
             status=str(raw.get("status") or STATUS_NEW),
             error_message=str(raw.get("error_message") or ""),
             partial_text=str(raw.get("partial_text") or ""),
+            draft_text=str(raw.get("draft_text") or ""),
             archived=bool(raw.get("archived") or False),
             created_at=str(raw.get("created_at") or ""),
             updated_at=str(raw.get("updated_at") or ""),
@@ -179,21 +221,31 @@ def save_chat(chat: Chat) -> None:
 
     Writes to a sibling ``.tmp`` file and then ``os.replace``\\s it onto
     the target so a crash mid-write can never leave a half-written
-    JSON file on disk. We grab a *snapshot* of the chat under its lock
-    before serialization so a background thread mutating the chat
-    concurrently doesn't produce a torn read.
+    JSON file on disk.
+
+    No-op when :attr:`Chat._deleted` is True — the chat has been
+    removed from session state and its on-disk file unlinked, and we
+    deliberately swallow further writes that would resurrect it.
+    The whole operation (snapshot + write + ``os.replace``) runs
+    under ``chat._lock`` so :func:`delete_chat` (which acquires the
+    same lock to set ``_deleted``) cannot interleave its
+    pop-then-unlink between our snapshot and our rename — without
+    the long-held lock, a concurrent delete could race the rename
+    and leave an orphan file on disk.
     """
     _ensure_chats_dir()
     with chat._lock:
+        if chat._deleted:
+            return
         chat.updated_at = _now_iso()
         if not chat.created_at:
             chat.created_at = chat.updated_at
         snapshot = chat.to_dict()
-    tmp = _chat_path(chat.id).with_suffix(".json.tmp")
-    target = _chat_path(chat.id)
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(snapshot, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, target)
+        tmp = _chat_path(chat.id).with_suffix(".json.tmp")
+        target = _chat_path(chat.id)
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, target)
 
 
 def load_all_chats() -> dict[str, Chat]:
@@ -208,7 +260,18 @@ def load_all_chats() -> dict[str, Chat]:
     rewritten to ``"error"`` because the thread that owned it died
     with the previous process. We immediately persist the rewritten
     record so subsequent loads see the corrected state.
+
+    **Multi-provider migration (Phase 2)**: chats persisted before the
+    qualified-id schema (``<provider>:<raw>``) carry bare model ids
+    in their ``model`` field — those are W&B Inference ids since W&B
+    was the only previously-supported provider. We rewrite them to
+    ``"wandb:<bare_id>"`` on load and persist immediately so the next
+    launch sees the canonical form. The migration is one-shot per
+    chat; subsequent loads short-circuit because the id is already
+    qualified.
     """
+    from models import is_qualified, qualify
+
     _ensure_chats_dir()
     chats: list[Chat] = []
     for p in CHATS_DIR.glob("*.json"):
@@ -219,6 +282,13 @@ def load_all_chats() -> dict[str, Chat]:
         if not isinstance(raw, dict):
             continue
         chat = Chat.from_dict(raw)
+        needs_save = False
+
+        # Migrate bare W&B model ids → ``wandb:<bare>``.
+        if chat.model and not is_qualified(chat.model):
+            chat.model = qualify(chat.model, default_provider="wandb")
+            needs_save = True
+
         # Crash-recovery: a "running" chat at startup means the previous
         # process died mid-turn. Mark it errored so the UI doesn't show
         # a phantom spinner forever, and clear partial state.
@@ -226,6 +296,9 @@ def load_all_chats() -> dict[str, Chat]:
             chat.status = STATUS_ERROR
             chat.error_message = "Interrupted by app restart."
             chat.partial_text = ""
+            needs_save = True
+
+        if needs_save:
             try:
                 save_chat(chat)
             except OSError:
@@ -236,22 +309,162 @@ def load_all_chats() -> dict[str, Chat]:
     return {c.id: c for c in chats}
 
 
-def delete_chat(chats_dict: dict[str, Chat], chat_id: str) -> None:
+def request_cancel(chat: Chat) -> None:
+    """Signal the background turn thread to stop ASAP.
+
+    Sets ``chat._cancel_event``. The runner thread (spawned by
+    :func:`start_turn`) checks the event between every agent event
+    and before every persistence call, then routes through
+    :func:`_finalize_cancelled_turn` to flip status back to
+    ``"idle"`` (so the UI stops showing a phantom spinner), preserve
+    any in-flight streamed text as a proper ``assistant_text`` event,
+    append a ``{"type": "cancelled"}`` marker the renderer surfaces
+    as a "Stopped by user" caption, and keep ``chat.messages``
+    well-formed for the next turn.
+
+    Idempotent: setting an already-set event is a no-op.
+
+    Two call sites today:
+
+    - The chat-page **Stop** button in :mod:`app_pages.chat`. The
+      chat stays around — once the runner finalizes, the user can
+      send a new prompt right away.
+    - :func:`delete_chat` with ``force=True``. The runner still
+      finalizes, but the chat is gone before the user can see it;
+      the finalize call's ``save_chat`` becomes a no-op because
+      :attr:`Chat._deleted` is set first.
+
+    Returns immediately — it does **not** wait for the thread to
+    exit. The streaming chat-completion connection closes shortly
+    after the runner hits its next cancel check (once the OpenAI
+    Stream object is closed via ``GeneratorExit``).
+    """
+    chat._cancel_event.set()
+
+
+def _finalize_cancelled_turn(chat: Chat) -> None:
+    """Common cleanup after the runner detects a cancel signal mid-turn.
+
+    Called from every cancel tripwire in the runner spawned by
+    :func:`start_turn`. Mutates the chat under its lock so the
+    user-visible state ends up consistent regardless of where in
+    the agent loop the cancel landed:
+
+    1. **Preserve any in-flight streamed text.** ``chat.partial_text``
+       carries content that hasn't yet been wrapped in an
+       ``assistant_text`` event. We append a synthesized
+       ``assistant_text`` event so the chat page replays whatever
+       the model said before the stop.
+    2. **Keep ``chat.messages`` well-formed.** When the cancel
+       landed before ``_stream_one_call`` could append the assistant
+       message (i.e., the last message is the user's prompt), we
+       close out the conversation with a stub assistant message so
+       the next turn doesn't send two consecutive user messages to
+       the API. When the last message is ``"assistant"`` or
+       ``"tool"`` the conversation is already in a state the model
+       can naturally continue from, so we leave it alone.
+    3. **Append a ``"cancelled"`` marker.** The chat page renders
+       this as a subtle ":material/stop_circle: Stopped by user."
+       caption inside the assistant turn so the user sees that the
+       partial reply was cut off intentionally.
+    4. **Flip status back to ``"idle"``** so the live fragment
+       stops polling and the static renderer takes over. The user
+       can immediately send a new prompt.
+
+    The trailing ``save_chat`` is a no-op when
+    :attr:`Chat._deleted` is True (the standard path for
+    :func:`delete_chat` with ``force=True``), so the same finalize
+    helper works for both the standalone Stop and the
+    Stop-and-delete paths.
+    """
+    with chat._lock:
+        # The in-flight assistant turn is the last entry in
+        # ``ui_turns`` — start_turn appends user_turn then
+        # assistant_turn, and the runner doesn't add more entries.
+        # Defensive default to a fresh dict so a chat in a weird
+        # state (e.g., manually mutated outside this module) still
+        # gets its status flipped instead of crashing the runner.
+        assistant_turn: dict[str, Any] = {}
+        if chat.ui_turns:
+            last = chat.ui_turns[-1]
+            if isinstance(last, dict) and last.get("role") == "assistant":
+                assistant_turn = last
+        events = assistant_turn.setdefault("events", []) if assistant_turn else []
+
+        partial = chat.partial_text
+        if partial and assistant_turn:
+            events.append({"type": "assistant_text", "content": partial})
+
+        if chat.messages and chat.messages[-1].get("role") == "user":
+            chat.messages.append(
+                {
+                    "role": "assistant",
+                    "content": partial or "[turn cancelled by user]",
+                }
+            )
+
+        if assistant_turn:
+            events.append({"type": "cancelled"})
+
+        chat.status = STATUS_IDLE
+        chat.error_message = ""
+        chat.partial_text = ""
+    try:
+        save_chat(chat)
+    except OSError:
+        pass
+
+
+def delete_chat(
+    chats_dict: dict[str, Chat],
+    chat_id: str,
+    *,
+    force: bool = False,
+) -> None:
     """Drop ``chat_id`` from ``chats_dict`` and unlink its on-disk file.
 
-    Refuses to delete a chat that's currently running a turn. The
-    caller is expected to have already gated this through a confirm
-    dialog; we still raise so the dialog can surface a useful error
-    if the user somehow triggers delete on a freshly-running chat.
+    Refuses by default to delete a chat that's currently running a
+    turn — the caller is expected to gate this through a confirm
+    dialog, and we still raise so the dialog can surface a useful
+    error if the user somehow triggers delete on a freshly-running
+    chat.
+
+    With ``force=True``, the chat's cancel event is set first via
+    :func:`request_cancel` so the background turn stops as soon as
+    it can — the user gets to delete the chat without paying for any
+    further tokens. The runner's :func:`_finalize_cancelled_turn`
+    call's ``save_chat`` becomes a no-op because we then set
+    :attr:`Chat._deleted` (under ``chat._lock``) before the unlink:
+
+    1. Cancel signal goes up; the runner exits its event loop.
+    2. We acquire ``chat._lock`` to set ``_deleted=True``. If the
+       runner is mid-``save_chat`` the acquire blocks until that
+       save's ``os.replace`` has completed.
+    3. We pop from ``chats_dict`` and unlink the on-disk file. By
+       this point any ``save_chat`` that was in flight when (1)
+       fired has finished writing, and any ``save_chat`` that hasn't
+       started yet sees ``_deleted=True`` and short-circuits. The
+       unlink is the last word.
 
     Idempotent: a missing dict entry or missing file is not an error.
     """
     chat = chats_dict.get(chat_id)
     if chat is not None and chat.status == STATUS_RUNNING:
-        raise RuntimeError(
-            "Cannot delete a chat that is still running. "
-            "Wait for the current turn to finish."
-        )
+        if not force:
+            raise RuntimeError(
+                "Cannot delete a chat that is still running. "
+                "Wait for the current turn to finish, or pass force=True "
+                "to abort the turn."
+            )
+        request_cancel(chat)
+    if chat is not None:
+        # Take the lock to set ``_deleted`` so any in-flight
+        # ``save_chat`` finishes its ``os.replace`` BEFORE we get
+        # past this line, and any save_chat that hasn't started
+        # yet sees ``_deleted=True`` and short-circuits. See
+        # ``save_chat`` for the matching half of the contract.
+        with chat._lock:
+            chat._deleted = True
     chats_dict.pop(chat_id, None)
     try:
         _chat_path(chat_id).unlink()
@@ -397,7 +610,18 @@ def new_chat(*, model: str = "", mode: str = "agent", working_dir: str = "") -> 
     The chat starts in ``"new"`` status with an empty conversation; the
     UI seeds it via :func:`new_chat` and then either lets the user type
     or auto-activates it.
+
+    ``model`` is normalized to qualified form (``<provider>:<raw>``)
+    when callers pass a bare id from the legacy schema — see
+    :func:`models.qualify`. New code paths in the UI always pass
+    qualified ids, but defending against the legacy form here means
+    re-using `new_chat()` from a stale call site doesn't silently
+    corrupt the chat file with a non-qualified ``model`` field.
     """
+    from models import qualify
+
+    if model:
+        model = qualify(model, default_provider="wandb")
     now = _now_iso()
     chat = Chat(
         id=uuid.uuid4().hex,
@@ -431,19 +655,26 @@ def derive_title(messages: list[dict[str, Any]], fallback: str = DEFAULT_TITLE) 
     return fallback
 
 
-def generate_title(chat: Chat, client: Any) -> str | None:
+def generate_title(chat: Chat, client: Any, *, api_key: str = "") -> str | None:
     """Ask DeepSeek for a short, descriptive title.
 
-    Returns ``None`` on any failure (no client, model not on the
-    account, network blip, model returned blank). The caller is
-    expected to fall back to :func:`derive_title` in that case.
+    Returns ``None`` on any failure (the W&B-DeepSeek path isn't
+    configured, model not on the account, network blip, model
+    returned blank). The caller is expected to fall back to
+    :func:`derive_title` in that case.
+
+    The ``api_key`` keyword arg is the W&B Inference API key — DeepSeek
+    is currently a W&B-only model, so this should be the user's
+    ``ss.provider_keys["wandb"]``. ``client`` is passed for back-compat
+    but ignored on the LiteLLM-routed W&B path.
 
     We feed the model the first user message plus the first assistant
     text response so it has both the question and the agent's framing
     of the answer — that produces sharper titles than the user message
     alone (which is often a one-liner).
     """
-    if client is None:
+    if not (api_key or "").strip():
+        # No W&B key configured — auto-titling silently disabled.
         return None
     first_user = ""
     first_assistant = ""
@@ -479,6 +710,7 @@ def generate_title(chat: Chat, client: Any) -> str | None:
             user=user_prompt,
             max_tokens=30,
             temperature=0.2,
+            api_key=api_key,
         )
     except Exception:
         return None
@@ -492,67 +724,6 @@ def generate_title(chat: Chat, client: Any) -> str | None:
     return title
 
 
-def generate_description(chat: Chat, client: Any) -> str | None:
-    """Ask DeepSeek for a one-sentence description of the chat.
-
-    Used by the sidebar's collapsible chat row, where the longer
-    description renders inside the expanded body (below the short
-    title in the always-visible header). Re-generated after every
-    successful turn so the description tracks the conversation as
-    it evolves; the call is cheap because it goes to V4-Flash with
-    a tiny prompt.
-
-    Returns ``None`` on any failure (no client, model not on the
-    account, network blip, model returned blank). The caller treats
-    that as "leave the prior description in place".
-    """
-    if client is None:
-        return None
-    first_user = ""
-    last_assistant = ""
-    for msg in chat.messages:
-        role = msg.get("role")
-        content = msg.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        if role == "user" and not first_user:
-            first_user = content
-        elif role == "assistant":
-            last_assistant = content
-    if not first_user:
-        return None
-    user_prompt = (
-        "Write one short sentence (no more than 120 characters) "
-        "describing what this chat is about. Use plain prose, no "
-        "trailing period, no quotes, no preamble.\n\n"
-        f"User: {first_user}\n"
-    )
-    if last_assistant:
-        user_prompt += f"\nAssistant: {last_assistant}\n"
-    try:
-        desc = agent.generate_text(
-            client=client,
-            model=agent.DEEPSEEK_MODEL,
-            system=(
-                "You write concise one-sentence descriptions of coding "
-                "chat sessions. Return only the sentence. At most 120 "
-                "characters. No trailing punctuation."
-            ),
-            user=user_prompt,
-            max_tokens=80,
-            temperature=0.2,
-        )
-    except Exception:
-        return None
-    desc = (desc or "").strip().strip('"').strip("'")
-    desc = re.sub(r"[.\s]+$", "", desc)
-    if not desc:
-        return None
-    if len(desc) > 140:
-        desc = desc[:137].rstrip() + "..."
-    return desc
-
-
 # ---------------------------------------------------------------------------
 # Background turn runner
 # ---------------------------------------------------------------------------
@@ -562,6 +733,14 @@ def start_turn(
     client: Any,
     *,
     override_model: str | None = None,
+    provider_id: str | None = None,
+    api_key: str | None = None,
+    wandb_api_key: str | None = None,
+    provider_keys: dict[str, str] | None = None,
+    clients: dict[str, Any] | None = None,
+    attachments: list[Any] | None = None,
+    supports_vision: bool = False,
+    supports_pdf_input: bool = False,
 ) -> None:
     """Spawn a daemon thread that drives one full agent turn for ``chat``.
 
@@ -582,25 +761,95 @@ def start_turn(
 
     Refuses (raises :class:`RuntimeError`) if ``chat.status ==
     "running"`` so the UI never accidentally double-fires a turn.
+
+    ``provider_id`` and ``api_key`` are the multi-provider routing
+    arguments. When ``provider_id`` is None it's auto-derived from the
+    qualified model id (``<provider>:<raw>``). For ``litellm_compat``
+    providers ``client`` may be ``None`` (LiteLLM is stateless) — only
+    the API key is needed; we permit ``client is None`` for those.
     """
+    from models import is_qualified, model_provider as _model_provider
+
     if chat.status == STATUS_RUNNING:
         raise RuntimeError(
             f"Chat {chat.id} is already running a turn. Wait for it to finish."
         )
-    if client is None:
-        raise RuntimeError("Cannot start a turn without a connected W&B Inference client.")
 
     turn_model = override_model or chat.model
     if not turn_model:
         raise RuntimeError("Chat has no model selected; cannot start a turn.")
 
+    # Auto-derive provider_id from the qualified id when not explicitly
+    # passed. Bare ids fall back to "wandb" (legacy single-provider
+    # default). The chat-file migration in :func:`load_all_chats`
+    # rewrites bare ids to ``wandb:<bare>`` on load, so this fallback
+    # only triggers for chats persisted between processes.
+    if provider_id is None:
+        derived = _model_provider(turn_model) if is_qualified(turn_model) else None
+        provider_id = derived or "wandb"
+
+    # ``litellm_compat`` providers don't need a persistent client
+    # object — the call layer reads the API key at request time. We
+    # only require ``client is not None`` for the three native paths.
+    import providers as _providers
+    provider = _providers.get_provider(provider_id)
+    if provider is None:
+        raise RuntimeError(f"Unknown provider id: {provider_id!r}")
+    if provider.kind != "litellm_compat" and client is None:
+        raise RuntimeError(
+            f"Cannot start a turn for {provider.label}: no connected client."
+        )
+    if provider.kind == "litellm_compat" and not (api_key or "").strip():
+        raise RuntimeError(
+            f"Cannot start a turn for {provider.label}: no API key configured."
+        )
+
+    # Clear any leftover cancel signal from a prior turn. If the
+    # previous turn was cancelled (via :func:`request_cancel`) the
+    # event is still set; if we didn't clear it, the new runner would
+    # exit on its first cancel check.
+    chat._cancel_event.clear()
+
     # Seed the user turn + assistant placeholder synchronously, on the
     # caller's thread, so a freshly-rerendered UI sees the new content
     # immediately even before the background thread schedules.
-    user_turn = {"role": "user", "content": prompt}
+    #
+    # Attachments path: when ``attachments`` is non-empty we route
+    # through :func:`attachments.build_user_message` to build a
+    # multimodal content array for ``chat.messages`` plus a metadata
+    # list for ``chat.ui_turns``. The single-string path (no
+    # attachments) preserves the legacy plain-text shape so
+    # downstream providers without multimodal support keep working.
+    attachment_records: list[dict[str, Any]] = []
+    if attachments:
+        from pathlib import Path as _Path
+
+        import attachments as _attachments
+
+        wd_path = (
+            _Path(chat.working_dir).expanduser().resolve()
+            if chat.working_dir
+            else _Path.cwd()
+        )
+        message, attachment_records = _attachments.build_user_message(
+            prompt,
+            attachments,
+            working_dir=wd_path,
+            supports_vision=supports_vision,
+            supports_pdf_input=supports_pdf_input,
+        )
+        user_turn: dict[str, Any] = {
+            "role": "user",
+            "content": prompt,
+            "attachments": attachment_records,
+        }
+    else:
+        message = {"role": "user", "content": prompt}
+        user_turn = {"role": "user", "content": prompt}
+
     assistant_turn: dict[str, Any] = {"role": "assistant", "events": []}
     with chat._lock:
-        chat.messages.append({"role": "user", "content": prompt})
+        chat.messages.append(message)
         chat.ui_turns.append(user_turn)
         chat.ui_turns.append(assistant_turn)
         if not chat.title or chat.title == DEFAULT_TITLE:
@@ -622,6 +871,21 @@ def start_turn(
             "total_tokens": 0,
             "rounds": 0,
         }
+
+        # Tiny shorthand for the cancel check. ``request_cancel`` sets
+        # this flag; every check site below routes through
+        # :func:`_finalize_cancelled_turn` so the chat ends up at
+        # IDLE (with a "Stopped by user" marker preserving any
+        # partial reply) rather than stuck at RUNNING — the latter
+        # would leave the live fragment polling forever and the
+        # chat input disabled. ``save_chat`` becomes a no-op when
+        # ``chat._deleted`` is True (the standard path for
+        # :func:`delete_chat` with ``force=True``), so the same
+        # finalize call works for the standalone Stop and the
+        # Stop-and-delete paths.
+        def _cancelled() -> bool:
+            return chat._cancel_event.is_set()
+
         try:
             working_dir = (
                 Path(chat.working_dir).expanduser().resolve()
@@ -634,8 +898,30 @@ def start_turn(
                 messages=chat.messages,
                 working_dir=working_dir,
                 mode=chat.mode,
+                provider_id=provider_id,
+                api_key=api_key,
+                chat_id=chat.id,
+                provider_keys=provider_keys,
+                clients=clients,
             )
             for event in events_iter:
+                # Cancellation tripwire #1: between every event from the
+                # agent generator. ``events_iter.close()`` raises
+                # ``GeneratorExit`` inside ``run_agent_turn`` ->
+                # ``_stream_one_call``, which closes the streaming OpenAI
+                # response and drops the W&B Inference connection so the
+                # server stops generating tokens. ``_finalize_cancelled_turn``
+                # then preserves whatever was already streamed as a
+                # proper assistant_text event, appends a "cancelled"
+                # marker, and flips status back to IDLE so the user
+                # can immediately send a new prompt.
+                if _cancelled():
+                    try:
+                        events_iter.close()
+                    except Exception:
+                        pass
+                    _finalize_cancelled_turn(chat)
+                    return
                 etype = event.get("type")
                 if etype == "assistant_text_delta":
                     with chat._lock:
@@ -659,11 +945,29 @@ def start_turn(
                     assistant_turn["events"].append(event)
                 events_seen += 1
                 if events_seen % _PERSIST_EVERY_N_EVENTS == 0:
+                    # Cancellation tripwire #2: every persistence point.
+                    # If we already wrote an event under the lock above
+                    # but a cancel landed before we hit ``save_chat``,
+                    # finalize so the chat ends up at IDLE rather than
+                    # leaving the assistant_turn events list partially
+                    # filled with no closing marker.
+                    if _cancelled():
+                        _finalize_cancelled_turn(chat)
+                        return
                     try:
                         save_chat(chat)
                     except OSError:
                         pass
         except Exception as e:
+            # Cancelling a streaming turn often surfaces as an exception
+            # raised inside the OpenAI SDK as the connection is closed
+            # (e.g. ``APIError`` / ``StreamError``). Route through the
+            # cancel-finalize path when cancelled so we don't persist
+            # a misleading "error" status — the user explicitly asked
+            # to stop.
+            if _cancelled():
+                _finalize_cancelled_turn(chat)
+                return
             with chat._lock:
                 assistant_turn["events"].append({"type": "error", "message": str(e)})
                 chat.status = STATUS_ERROR
@@ -673,6 +977,14 @@ def start_turn(
                 save_chat(chat)
             except OSError:
                 pass
+            return
+
+        # Cancellation tripwire #3: between the agent loop and the
+        # post-turn finalization (usage row, auto-title). Each of
+        # these is itself a small disk write or LLM call, and
+        # "cancelled" means "skip every one".
+        if _cancelled():
+            _finalize_cancelled_turn(chat)
             return
 
         # Persist + emit per-turn usage just like the synchronous loop
@@ -722,8 +1034,17 @@ def start_turn(
             needs_title = chat.title == DEFAULT_TITLE or chat.title.startswith(
                 "Untitled"
             )
-        if had_assistant and needs_title:
-            new_title = generate_title(chat, client)
+        if had_assistant and needs_title and not _cancelled():
+            # Auto-titling pins to the W&B-DeepSeek path (still the
+            # one provider that ships the V4-Flash model). When the
+            # user hasn't configured W&B (or the per-turn provider
+            # is non-W&B and they didn't pass us a W&B key), fall
+            # through to ``derive_title`` instead of trying.
+            new_title = generate_title(
+                chat,
+                client,
+                api_key=(wandb_api_key or "").strip(),
+            )
             if new_title:
                 with chat._lock:
                     chat.title = new_title
@@ -735,16 +1056,10 @@ def start_turn(
                     if not chat.title or chat.title == DEFAULT_TITLE:
                         chat.title = derive_title(chat.messages, fallback="Untitled")
 
-        # Refresh the longer one-sentence description on every successful
-        # turn so the sidebar's expanded chat row tracks the conversation
-        # as it evolves (not just the first turn). Cheap because the
-        # call is V4-Flash with a tiny prompt; failures silently leave
-        # the prior description in place.
-        if had_assistant:
-            new_desc = generate_description(chat, client)
-            if new_desc:
-                with chat._lock:
-                    chat.description = new_desc
+        # Final cancellation tripwire before the status flip + save.
+        if _cancelled():
+            _finalize_cancelled_turn(chat)
+            return
 
         with chat._lock:
             chat.status = STATUS_IDLE
@@ -772,6 +1087,7 @@ __all__ = [
     "save_chat",
     "load_all_chats",
     "delete_chat",
+    "request_cancel",
     "archive_chat",
     "unarchive_chat",
     "save_active_chat_id",
@@ -783,6 +1099,5 @@ __all__ = [
     "new_chat",
     "derive_title",
     "generate_title",
-    "generate_description",
     "start_turn",
 ]

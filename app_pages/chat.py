@@ -39,6 +39,7 @@ from typing import Any
 import streamlit as st
 
 import account
+import chat_input
 import chats
 import commit_ai
 import git_ops
@@ -48,7 +49,17 @@ import usage as usage_log
 from agent import DEEPSEEK_MODEL
 from chat_input import mount_slash_autocomplete
 from git_ops import GitError
-from models import MODEL_METADATA, has_weak_tool_calling, model_label
+import model_catalog
+import providers
+from models import (
+    MODEL_METADATA,
+    RECOMMENDED_MODELS,
+    model_label,
+    model_provider,
+    models_with_tag,
+    unqualified,
+    weak_tool_calling_issue_url,
+)
 
 TOOL_ICONS = {
     "list_files": ":material/folder_open:",
@@ -65,19 +76,21 @@ MCP_TOOL_ICON = ":material/extension:"
 # behaviour we lean on during streaming) when ``height`` is a fixed integer
 # — the ``"stretch"`` variant only matches parent height and does not turn on
 # scrolling, per the [`st.container` docs](https://docs.streamlit.io/develop/api-reference/layout/st.container).
-# 380px is calibrated against a typical desktop viewport (≈900px tall) so
-# the chat input, workdir picker, and model selector below the conversation
-# area stay in view without the user having to scroll the whole page —
-# i.e. the controls "stay pinned at the bottom" of the visible viewport for
-# the common case. On taller viewports there will be empty space below the
-# controls; on shorter viewports the page itself gains a scrollbar. We
-# accept that trade-off because trying to make the height truly responsive
-# via CSS ``calc(100vh - …)`` requires fighting with Streamlit-internal
-# class names on the height-bearing inner element, which is unstable across
-# upgrades — empirically tested and reverted, see git history. Tweak this
-# integer if you change the natural height of anything outside the
-# conversation area on the chat page (title above, chat input + workdir
-# row + project context expander + model row + model card caption below).
+# 330px is calibrated against a typical desktop viewport (≈900px tall) so
+# the chat input + git row + Changes button + workdir picker + model
+# selector below the conversation area stay in view without the user
+# having to scroll the whole page — i.e. the controls "stay pinned at
+# the bottom" of the visible viewport for the common case. On taller
+# viewports there will be empty space below the controls; on shorter
+# viewports the page itself gains a scrollbar. We accept that trade-off
+# because trying to make the height truly responsive via CSS
+# ``calc(100vh - …)`` requires fighting with Streamlit-internal class
+# names on the height-bearing inner element, which is unstable across
+# upgrades — empirically tested and reverted, see git history. Tweak
+# this integer if you change the natural height of anything outside the
+# conversation area on the chat page (title above; chat input +
+# slash-autocomplete slot + git row + Changes button + workdir row +
+# project context expander + model row + model card caption below).
 _CHAT_HISTORY_HEIGHT_PX = 330
 
 
@@ -137,6 +150,15 @@ def _render_tool_event(call_event: dict[str, Any], result_event: dict[str, Any] 
             _render_mcp_result(result)
             return
 
+        # Phase 5: media-generation tool results carry a ``kind`` field
+        # ("image" / "audio" / "video") that drives inline HTML5
+        # preview + lightbox + download affordances. The contract is
+        # documented under ``tools.py``'s ``generate_*`` tools.
+        kind = result.get("kind")
+        if kind in ("image", "audio", "video"):
+            _render_media_result(name, result)
+            return
+
         diff = result.get("diff")
         if diff and diff != "(no change)":
             st.markdown("**Diff**")
@@ -173,6 +195,316 @@ def _render_tool_event(call_event: dict[str, Any], result_event: dict[str, Any] 
                 if "bytes_written" in result:
                     msg_parts.append(f"({result['bytes_written']} bytes)")
                 st.caption(" ".join(msg_parts))
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: media result renderer + lightbox dialog
+# ---------------------------------------------------------------------------
+def _format_cost_usd(value: Any) -> str:
+    """Format ``cost_usd`` consistently with the per-turn caption."""
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if v < 0.01:
+        return f"${v:.4f}"
+    if v < 1:
+        return f"${v:.3f}"
+    return f"${v:.2f}"
+
+
+def _open_lightbox(payload: dict[str, Any]) -> None:
+    """Set the lightbox payload + flip the gating flag for the next render."""
+    st.session_state.lightbox_payload = payload
+    st.session_state.lightbox_open = True
+
+
+def _close_lightbox() -> None:
+    """Drop the gating flag + payload so the modal stops re-mounting.
+
+    Wired to ``@st.dialog(..., on_dismiss=_close_lightbox)`` per the
+    AGENTS.md @st.dialog rule — without this, X / Esc / click-outside
+    dismissals leave ``lightbox_open=True`` and the modal re-opens on
+    the next rerun (e.g. when the user sends another chat message).
+    """
+    st.session_state.lightbox_open = False
+    st.session_state.lightbox_payload = None
+
+
+def _kick_fullscreen() -> None:
+    """Bump the fullscreen request counter so the CCv2 trigger fires."""
+    st.session_state["_lightbox_fullscreen_counter"] = (
+        int(st.session_state.get("_lightbox_fullscreen_counter") or 0) + 1
+    )
+
+
+@st.dialog("Preview", width="large", on_dismiss=_close_lightbox)
+def _lightbox_dialog() -> None:
+    """Lightbox modal for inline image / audio / video previews.
+
+    Mounted from ``render()`` when ``ss.lightbox_open`` is True and
+    ``ss.lightbox_payload`` carries the asset to display. The payload
+    shape is::
+
+        {
+          "kind": "image" | "audio" | "video",
+          "path": "<absolute or workdir-relative path>",
+          "alt": "<accessibility label>",
+          "caption": "<inline caption shown below the asset>",
+        }
+
+    For images, a "Fullscreen" button mounts the
+    :mod:`fullscreen_trigger` CCv2 component which calls the HTML5
+    Fullscreen API on the rendered ``<img>``. Video relies on the
+    browser's native ``<video>`` fullscreen control.
+    """
+    payload = st.session_state.get("lightbox_payload") or {}
+    kind = payload.get("kind") or ""
+    path = payload.get("path") or ""
+    caption = payload.get("caption") or ""
+
+    if not path:
+        st.info("No preview available.", icon=":material/info:")
+        return
+
+    # Resolve workdir-relative paths against the active chat's
+    # working directory (the only folder we ever write artifacts to,
+    # per the AGENTS.md hard rule). Absolute paths pass through.
+    abs_path = path
+    if not Path(path).is_absolute():
+        wd = (st.session_state.get("working_dir") or "").strip()
+        if wd:
+            abs_path = str((Path(wd) / path).resolve())
+
+    if not Path(abs_path).exists():
+        st.warning(
+            "The asset is no longer on disk.",
+            icon=":material/visibility_off:",
+        )
+        st.caption(caption)
+        return
+
+    if kind == "image":
+        # Inject a stable id on the rendered <img> so the Fullscreen
+        # CCv2 trigger has a predictable selector.
+        st.html(
+            "<style>"
+            "[data-testid='stMainBlockContainer'] img.wb-lightbox-img"
+            "{display:block;margin:0 auto;max-width:100%;}"
+            "</style>"
+        )
+        st.image(abs_path, use_container_width=True)
+        if caption:
+            st.caption(caption)
+        cols = st.columns([1, 1, 2])
+        with cols[0]:
+            st.button(
+                "Fullscreen",
+                icon=":material/fullscreen:",
+                on_click=_kick_fullscreen,
+                width="stretch",
+                key="_lightbox_fullscreen_btn",
+            )
+        with cols[1]:
+            try:
+                with open(abs_path, "rb") as f:
+                    st.download_button(
+                        "Download",
+                        f.read(),
+                        file_name=Path(abs_path).name,
+                        mime="image/png",
+                        icon=":material/download:",
+                        width="stretch",
+                        key="_lightbox_download_btn",
+                    )
+            except OSError:
+                pass
+        # Mount the fullscreen trigger. Selector targets the most
+        # recent <img> in the dialog's main element — the dialog
+        # contains exactly one image so this is unambiguous.
+        from fullscreen_trigger import mount_fullscreen_trigger
+        mount_fullscreen_trigger(
+            "div[role='dialog'] img",
+            request_id=int(st.session_state.get("_lightbox_fullscreen_counter") or 0),
+        )
+    elif kind == "audio":
+        st.audio(abs_path)
+        if caption:
+            st.caption(caption)
+        try:
+            with open(abs_path, "rb") as f:
+                st.download_button(
+                    "Download",
+                    f.read(),
+                    file_name=Path(abs_path).name,
+                    mime="audio/mpeg",
+                    icon=":material/download:",
+                    key="_lightbox_audio_download_btn",
+                )
+        except OSError:
+            pass
+    elif kind == "video":
+        st.video(abs_path)
+        if caption:
+            st.caption(caption)
+        try:
+            with open(abs_path, "rb") as f:
+                st.download_button(
+                    "Download",
+                    f.read(),
+                    file_name=Path(abs_path).name,
+                    mime="video/mp4",
+                    icon=":material/download:",
+                    key="_lightbox_video_download_btn",
+                )
+        except OSError:
+            pass
+
+
+def _render_media_result(tool_name: str, result: dict[str, Any]) -> None:
+    """Render the inline preview row for a media-generation tool result.
+
+    Dispatches off ``result.kind`` to the appropriate Streamlit
+    HTML5 element. Each row also exposes a "View" button that
+    opens the lightbox modal at full dialog width and a download
+    button so users can grab the file directly. Replay-safe:
+    when the saved file is missing, render a chip + the original
+    prompt + cost so chat history stays informative.
+    """
+    kind = result.get("kind", "")
+    model_used = result.get("model_used") or "—"
+    cost = _format_cost_usd(result.get("cost_usd"))
+    wd = (st.session_state.get("working_dir") or "").strip()
+
+    def _abs(rel: str) -> str:
+        if not rel:
+            return rel
+        return rel if Path(rel).is_absolute() else (
+            str((Path(wd) / rel).resolve()) if wd else rel
+        )
+
+    if kind == "image":
+        paths = result.get("paths") or []
+        if not paths:
+            st.warning("No images returned.", icon=":material/info:")
+            return
+        for idx, rel_path in enumerate(paths):
+            abs_path = _abs(rel_path)
+            if not Path(abs_path).exists():
+                st.markdown(
+                    f":gray-badge[file not found] `{rel_path}`"
+                )
+                continue
+            st.image(abs_path, use_container_width=True)
+            cols = st.columns([1, 1, 4])
+            with cols[0]:
+                st.button(
+                    "View",
+                    icon=":material/zoom_in:",
+                    on_click=_open_lightbox,
+                    args=({
+                        "kind": "image",
+                        "path": rel_path,
+                        "alt": result.get("prompt") or "",
+                        "caption": result.get("prompt") or "",
+                    },),
+                    key=f"_media_view_{tool_name}_{idx}_{rel_path}",
+                    width="stretch",
+                )
+            with cols[1]:
+                try:
+                    with open(abs_path, "rb") as f:
+                        st.download_button(
+                            "Download",
+                            f.read(),
+                            file_name=Path(abs_path).name,
+                            mime=result.get("mime_type") or "image/png",
+                            icon=":material/download:",
+                            key=f"_media_dl_{tool_name}_{idx}_{rel_path}",
+                            width="stretch",
+                        )
+                except OSError:
+                    pass
+        size = result.get("size") or ""
+        quality = result.get("quality") or ""
+        chips = [c for c in [size, quality] if c]
+        suffix = " \u00b7 ".join(chips)
+        suffix = f"{suffix} \u00b7 " if suffix else ""
+        st.caption(f"`{model_used}` \u00b7 {suffix}{cost}")
+
+    elif kind == "audio":
+        rel_path = result.get("path") or ""
+        abs_path = _abs(rel_path)
+        if not rel_path or not Path(abs_path).exists():
+            st.markdown(
+                f":gray-badge[file not found] `{rel_path or 'audio'}`"
+            )
+        else:
+            st.audio(abs_path)
+            try:
+                with open(abs_path, "rb") as f:
+                    st.download_button(
+                        "Download",
+                        f.read(),
+                        file_name=Path(abs_path).name,
+                        mime=result.get("mime_type") or "audio/mpeg",
+                        icon=":material/download:",
+                        key=f"_media_dl_audio_{rel_path}",
+                    )
+            except OSError:
+                pass
+        voice = result.get("voice") or ""
+        chips = [c for c in [voice and f"voice {voice}"] if c]
+        suffix = " \u00b7 ".join(chips)
+        suffix = f"{suffix} \u00b7 " if suffix else ""
+        st.caption(f"`{model_used}` \u00b7 {suffix}{cost}")
+
+    elif kind == "video":
+        rel_path = result.get("path") or ""
+        abs_path = _abs(rel_path)
+        if not rel_path or not Path(abs_path).exists():
+            st.markdown(
+                f":gray-badge[file not found] `{rel_path or 'video'}`"
+            )
+        else:
+            st.video(abs_path)
+            cols = st.columns([1, 1, 4])
+            with cols[0]:
+                st.button(
+                    "View",
+                    icon=":material/zoom_in:",
+                    on_click=_open_lightbox,
+                    args=({
+                        "kind": "video",
+                        "path": rel_path,
+                        "alt": result.get("prompt") or "",
+                        "caption": result.get("prompt") or "",
+                    },),
+                    key=f"_media_view_video_{rel_path}",
+                    width="stretch",
+                )
+            with cols[1]:
+                try:
+                    with open(abs_path, "rb") as f:
+                        st.download_button(
+                            "Download",
+                            f.read(),
+                            file_name=Path(abs_path).name,
+                            mime=result.get("mime_type") or "video/mp4",
+                            icon=":material/download:",
+                            key=f"_media_dl_video_{rel_path}",
+                            width="stretch",
+                        )
+                except OSError:
+                    pass
+        duration = result.get("duration_seconds")
+        ar = result.get("aspect_ratio") or ""
+        chips = [c for c in [duration and f"{duration}s", ar] if c]
+        suffix = " \u00b7 ".join(chips)
+        suffix = f"{suffix} \u00b7 " if suffix else ""
+        st.caption(f"`{model_used}` \u00b7 {suffix}{cost}")
 
 
 def _render_mcp_result(result: dict[str, Any]) -> None:
@@ -320,6 +652,14 @@ def _render_assistant_turn(turn: dict[str, Any]) -> None:
                 # standalone only when no turn_usage was recorded
                 # (handled after the loop).
                 continue
+            elif etype == "cancelled":
+                # Subtle "Stopped by user" caption — appended by
+                # ``chats._finalize_cancelled_turn`` when the user
+                # clicked the Stop button (or "Stop and delete"
+                # before delete-and-go won the race). Rendered as a
+                # plain caption (not ``st.error``) because cancel is
+                # an intentional user action, not a failure mode.
+                st.caption(":material/stop_circle: :grey[Stopped by user.]")
             elif etype == "error":
                 st.error(ev["message"], icon=":material/error:")
         if weave_trace_url and not has_turn_usage:
@@ -328,7 +668,135 @@ def _render_assistant_turn(turn: dict[str, Any]) -> None:
 
 def _render_user_turn(turn: dict[str, Any]) -> None:
     with st.chat_message("user"):
-        st.markdown(turn["content"])
+        # Phase 6: render attachments above the prompt text. Each
+        # attachment is one of the ``Attachment`` dicts persisted by
+        # :func:`attachments.build_user_message`; the renderer
+        # dispatches off ``kind`` for the right HTML5 element +
+        # download / view affordance.
+        attachments = turn.get("attachments") or []
+        if attachments:
+            _render_user_attachments(attachments)
+        content = turn.get("content")
+        if isinstance(content, str) and content:
+            st.markdown(content)
+
+
+def _render_user_attachments(attachments: list[dict[str, Any]]) -> None:
+    """Render the attachments row above the user's prompt text.
+
+    Images: small thumbnails (``st.image(..., width=160)``) with a
+    "View" button that opens the lightbox modal. PDFs: a chip plus a
+    download button. Text/code: a chip that expands an
+    ``st.code`` block with the extracted content. Replay-safe:
+    when a saved file is missing, render ``:gray-badge[file not
+    found]`` plus the original filename.
+    """
+    ss = st.session_state
+    wd = (ss.get("working_dir") or "").strip()
+
+    def _abs(rel: str) -> str:
+        if not rel:
+            return rel
+        return rel if Path(rel).is_absolute() else (
+            str((Path(wd) / rel).resolve()) if wd else rel
+        )
+
+    for idx, att in enumerate(attachments):
+        kind = att.get("kind") or "binary"
+        filename = att.get("filename") or "(unnamed)"
+        size = int(att.get("size_bytes") or 0)
+        rel_path = att.get("path") or ""
+        abs_path = _abs(rel_path)
+        delivery = att.get("delivery") or ""
+
+        if kind == "image":
+            if Path(abs_path).exists():
+                cols = st.columns([1, 4])
+                with cols[0]:
+                    st.image(abs_path, width=160)
+                with cols[1]:
+                    st.caption(f":material/attach_file: `{filename}` ({_human_bytes(size)})")
+                    st.button(
+                        "View",
+                        icon=":material/zoom_in:",
+                        key=f"_user_att_view_{idx}_{rel_path}",
+                        on_click=_open_lightbox,
+                        args=({
+                            "kind": "image",
+                            "path": rel_path,
+                            "alt": filename,
+                            "caption": filename,
+                        },),
+                    )
+            else:
+                st.markdown(
+                    f":gray-badge[file not found] :material/image: `{filename}` ({_human_bytes(size)})"
+                )
+
+        elif kind == "pdf":
+            chip = (
+                ":blue-badge[native PDF]"
+                if delivery == "pdf_native"
+                else ":gray-badge[text-extracted]"
+            )
+            cols = st.columns([3, 1])
+            with cols[0]:
+                if Path(abs_path).exists():
+                    st.markdown(
+                        f":material/picture_as_pdf: `{filename}` "
+                        f"\u00b7 {_human_bytes(size)} \u00b7 {chip}"
+                    )
+                else:
+                    st.markdown(
+                        f":gray-badge[file not found] :material/picture_as_pdf: `{filename}`"
+                    )
+            with cols[1]:
+                if Path(abs_path).exists():
+                    try:
+                        with open(abs_path, "rb") as f:
+                            st.download_button(
+                                "Download",
+                                f.read(),
+                                file_name=filename,
+                                mime="application/pdf",
+                                icon=":material/download:",
+                                key=f"_user_att_dl_{idx}_{rel_path}",
+                                width="stretch",
+                            )
+                    except OSError:
+                        pass
+
+        elif kind == "text":
+            extracted = att.get("extracted_text")
+            with st.expander(
+                f":material/description: {filename} \u00b7 {_human_bytes(size)}",
+                expanded=False,
+            ):
+                if extracted:
+                    # Best-effort language hint based on filename.
+                    ext = Path(filename).suffix.lower()
+                    try:
+                        from attachments import LANGUAGE_FOR_EXT
+                        lang = LANGUAGE_FOR_EXT.get(ext, "text")
+                    except ImportError:
+                        lang = "text"
+                    st.code(extracted, language=lang)
+                else:
+                    st.caption("No extracted text available.")
+
+        else:
+            st.markdown(
+                f":gray-badge[unsupported] :material/attach_file: `{filename}` ({_human_bytes(size)})"
+            )
+
+
+def _human_bytes(n: int) -> str:
+    """Format a byte count as ``"N B"`` / ``"N.N KB"`` / ``"N.N MB"``."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
 
 
 def _maybe_apply_git_identity(working_dir: Path) -> None:
@@ -356,7 +824,12 @@ def _maybe_apply_git_identity(working_dir: Path) -> None:
         applied.add(key)
 
 
-def _start_turn(prompt: str, *, override_model: str | None = None) -> None:
+def _start_turn(
+    prompt: str,
+    *,
+    override_model: str | None = None,
+    attachments: list[Any] | None = None,
+) -> None:
     """Spawn a background turn for the active chat.
 
     Thin wrapper that pulls the active :class:`chats.Chat` out of session
@@ -366,6 +839,13 @@ def _start_turn(prompt: str, *, override_model: str | None = None) -> None:
     stamp, and delegates to :func:`chats.start_turn`. The fragment in
     :func:`_render_active_chat` picks up the streaming events on its
     next 0.25s tick.
+
+    ``attachments`` (Phase 6): when non-empty, the multimodal user
+    message is built via :func:`attachments.build_user_message`
+    instead of the legacy plain-string path. The chosen model's
+    capability flags (``supports_vision`` / ``supports_pdf_input``)
+    drive whether image / PDF parts go through natively or are
+    text-extracted by ``pypdf``.
     """
     ss = st.session_state
     chat = ss.chats.get(ss.active_chat_id)
@@ -381,12 +861,54 @@ def _start_turn(prompt: str, *, override_model: str | None = None) -> None:
     chat.working_dir = ss.working_dir or chat.working_dir
     working_dir = Path(chat.working_dir).expanduser().resolve()
     _maybe_apply_git_identity(working_dir)
+
+    # Resolve which provider to call into based on the qualified id.
+    # ``model_provider`` returns ``None`` for legacy bare ids; in that
+    # case we fall back to W&B (the only previously-supported provider).
+    turn_model = override_model or chat.model
+    provider_id = model_provider(turn_model) if turn_model else None
+    if not provider_id:
+        provider_id = "wandb"
+    client_for_turn = ss.clients.get(provider_id)
+    api_key_for_turn = ss.provider_keys.get(provider_id, "")
+    # Resolve the model's vision / PDF capability flags so
+    # ``attachments.build_user_message`` knows whether to inline
+    # images vs. drop them, and whether to pass PDFs as native
+    # ``document`` blocks vs. running pypdf extraction.
+    supports_vision = False
+    supports_pdf_input = False
+    if turn_model:
+        try:
+            import model_catalog as _mc
+            info = _mc.get_info(turn_model)
+            if info is not None:
+                supports_vision = bool(info.supports_vision)
+                supports_pdf_input = bool(info.supports_pdf_input)
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
         chats.start_turn(
             chat,
             prompt,
-            ss.client,
+            client_for_turn,
             override_model=override_model,
+            provider_id=provider_id,
+            api_key=api_key_for_turn,
+            # Auto-titling uses W&B's DeepSeek; pass the W&B key
+            # along regardless of the per-turn provider so the
+            # title generator can fire on a non-W&B chat too.
+            wandb_api_key=ss.provider_keys.get("wandb", ""),
+            # Phase 5 media tools dispatch through ``ToolContext``;
+            # pass the full provider_keys + clients dicts so e.g.
+            # ``generate_image`` (which routes via OpenAI by default)
+            # can find an OpenAI client even if the chat itself is
+            # configured against W&B.
+            provider_keys=dict(ss.provider_keys),
+            clients=dict(ss.clients),
+            attachments=attachments or [],
+            supports_vision=supports_vision,
+            supports_pdf_input=supports_pdf_input,
         )
     except RuntimeError as e:
         st.error(str(e), icon=":material/error:")
@@ -459,6 +981,52 @@ def _persist_active_chat_setting(field: str, value: str) -> None:
     if chat is None:
         return
     setattr(chat, field, value)
+    try:
+        chats.save_chat(chat)
+    except OSError:
+        pass
+
+
+def _on_draft_change() -> None:
+    """``on_draft_change`` callback for :mod:`chat_input`.
+
+    Drains the latest ``setStateValue("draft", payload)`` push from the
+    chat-input enhancer's JS singleton and persists it to disk. Streamlit
+    fires this once per actual value change at the top of the next rerun
+    (chat switch, tab navigation, button click, submit — every natural
+    interaction triggers a rerun, which flushes the in-flight draft).
+
+    The payload shape is ``{"chat_id": <id>, "text": <text>}`` — we
+    resolve the chat by ``chat_id`` rather than by ``ss.active_chat_id``
+    so a typed-then-immediately-switched flow ("type 'hello' in chat A,
+    click chat B before pausing typing") still attributes the typing to
+    chat A even though the rerun the callback fires under is the one
+    that just made chat B the active chat.
+
+    Race-free vs. background turn runners: the chat input is disabled
+    while a chat is in ``STATUS_RUNNING`` (see ``st.chat_input(...,
+    disabled=...)`` in :func:`render`), so the only chat whose
+    ``draft_text`` this callback ever writes is one whose runner thread
+    is **not** active. Concurrent ``save_chat`` from the runner +
+    callback can't happen on the same chat.
+    """
+    ss = st.session_state
+    state = ss.get(chat_input.STATE_KEY) or {}
+    payload = getattr(state, "draft", None) or (
+        state.get("draft") if isinstance(state, dict) else None
+    )
+    if not isinstance(payload, dict):
+        return
+    chat_id = payload.get("chat_id") or ""
+    text = payload.get("text")
+    if not chat_id or not isinstance(text, str):
+        return
+    chat = ss.chats.get(chat_id)
+    if chat is None:
+        return
+    if chat.draft_text == text:
+        return
+    chat.draft_text = text
     try:
         chats.save_chat(chat)
     except OSError:
@@ -909,18 +1477,458 @@ def _new_project_dialog() -> None:
     st.rerun()
 
 
-def _render_model_controls() -> None:
+# Material badge color per provider. Used by the model picker rows + the
+# inline current-model button. Defaults to gray for unknown providers.
+_PROVIDER_BADGE_COLOR: dict[str, str] = {
+    "wandb": "blue",
+    "openai": "green",
+    "anthropic": "orange",
+    "gemini": "violet",
+    "together": "blue",
+    "groq": "red",
+    "fireworks": "red",
+    "mistral": "violet",
+    "xai": "blue",
+    "cerebras": "orange",
+    "deepinfra": "blue",
+    "openrouter": "gray",
+}
+
+
+def _provider_badge(provider_id: str | None) -> str:
+    """Return a color-coded markdown badge for a provider id."""
+    if not provider_id:
+        return ":gray-badge[unknown]"
+    provider = providers.get_provider(provider_id)
+    label = provider.label if provider else provider_id
+    color = _PROVIDER_BADGE_COLOR.get(provider_id, "gray")
+    return f":{color}-badge[{label}]"
+
+
+def _format_price(value: float | None) -> str:
+    """Format ``$/M`` value tightly. ``None`` → ``-``."""
+    if value is None:
+        return "-"
+    if value < 0.01:
+        return f"${value:.4f}"
+    if value < 1:
+        return f"${value:.3f}"
+    return f"${value:.2f}"
+
+
+def _format_context(n: int | None) -> str:
+    """Format a context-window int as ``128k`` / ``1M`` etc."""
+    if not n:
+        return "—"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:g}M"
+    if n >= 1_000:
+        return f"{n // 1000}k"
+    return str(n)
+
+
+def _open_model_picker() -> None:
+    """Flip the gating flag so the modal mounts on the next render."""
+    st.session_state.model_picker_open = True
+
+
+def _close_model_picker() -> None:
+    """Drop the gating flag so subsequent reruns don't re-mount the modal.
+
+    Wired to ``@st.dialog(..., on_dismiss=_close_model_picker)`` per
+    the AGENTS.md @st.dialog rule — without this, dismissing the modal
+    via X / Esc / click-outside leaves the gating flag set and the
+    modal re-opens on the very next rerun (e.g. when the user presses
+    Enter to send a message).
+    """
+    st.session_state.model_picker_open = False
+
+
+def _select_model(qualified_id: str) -> None:
+    """Pick callback: write ``qualified_id`` to ``ss.model`` + active chat."""
+    st.session_state.model = qualified_id
+    _persist_active_chat_setting("model", qualified_id)
+    _close_model_picker()
+
+
+def _kick_catalog_refresh() -> None:
+    """Header Refresh button: kick a daemon refresh + flip the spinner flag."""
+    ss = st.session_state
+    ss.model_catalog_refreshing = True
+    keys = dict(ss.provider_keys)
+    clients = dict(ss.clients)
+
+    def _on_done() -> None:
+        # Background-thread callback — touching session_state from
+        # here would race; the polling fragment in the chat body
+        # picks up completion via ``model_catalog.newest_refresh()``.
+        pass
+
+    model_catalog.refresh_all_async(clients, keys, on_done=_on_done)
+
+
+def _format_last_refreshed() -> str:
+    """Return a tiny ``Last refreshed Nm ago`` caption string."""
+    last = model_catalog.newest_refresh()
+    if last is None:
+        return "Never refreshed"
+    from datetime import datetime as _dt, timezone as _tz
+    delta = _dt.now(_tz.utc) - last
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return f"Last refreshed {seconds}s ago"
+    if seconds < 3600:
+        return f"Last refreshed {seconds // 60}m ago"
+    if seconds < 86400:
+        return f"Last refreshed {seconds // 3600}h ago"
+    return f"Last refreshed {seconds // 86400}d ago"
+
+
+# Picker tabs. Order is the visual order, left to right. The first
+# group (Recommended → Coding → Reasoning) is curated; the next
+# group (Vision → Image gen → Audio gen → Video gen) is modality-
+# based and auto-derived from LiteLLM + OpenRouter data; the last
+# group (Long context → Fast & cheap → All) is generic-utility.
+#
+# Adding a new tab: append the label to ``_TAB_LABELS`` and (if it
+# corresponds to a tag from ``models.ALLOWED_TAGS``) add it to
+# ``_TAB_TAG_FOR``. The "All" / "Recommended" tabs have their own
+# code paths in ``_filter_by_tab`` and don't use the tag mapping.
+_TAB_LABELS = (
+    "Recommended",
+    "Coding",
+    "Reasoning",
+    "Vision",
+    "Image gen",
+    "Audio gen",
+    "Video gen",
+    "Long context",
+    "Fast & cheap",
+    "All",
+)
+_TAB_TAG_FOR: dict[str, str] = {
+    "Coding": "coding",
+    "Reasoning": "reasoning",
+    "Vision": "vision",
+    "Image gen": "image_gen",
+    "Audio gen": "audio_gen",
+    "Video gen": "video_gen",
+    "Long context": "long_context",
+    "Fast & cheap": "cheap",
+}
+
+
+def _render_model_row(qualified_id: str, *, key_prefix: str) -> None:
+    """Render one model row inside the picker modal.
+
+    ``key_prefix`` disambiguates the row's Select button across tabs —
+    a model can appear in multiple tabs (e.g. a coding *and* reasoning
+    model surfaces in both tab bodies), so the per-row widget key
+    needs the tab as a scope qualifier or Streamlit raises a
+    ``StreamlitDuplicateElementKey`` error.
+
+    A bordered container with three columns:
+    [provider badge + label + description | context + pricing chips | Select button].
+    The Select button is ``type="primary"`` for the currently-selected
+    model so users can see at a glance what they're already using.
+    """
+    info = model_catalog.get_info(qualified_id)
+    if info is None:
+        # Catalog miss — surface the qualified id with a soft skeleton so
+        # the row still renders something. Should be rare because the
+        # picker filter only includes ids surfaced by the catalog.
+        with st.container(border=True):
+            st.caption(f"`{qualified_id}` — metadata not available.")
+        return
+
+    is_current = (st.session_state.model == qualified_id)
+
+    with st.container(border=True):
+        cols = st.columns([5, 2, 1], vertical_alignment="center")
+        with cols[0]:
+            st.markdown(
+                f"{_provider_badge(info.provider_id)} **{info.label}**"
+            )
+            st.caption(info.description)
+        with cols[1]:
+            chips: list[str] = [f":gray-badge[{_format_context(info.context)} context]"]
+            chips.append(f":gray-badge[{_format_price(info.input_price_per_1m)}/M in]")
+            chips.append(f":gray-badge[{_format_price(info.output_price_per_1m)}/M out]")
+            if info.cache_hit_price_per_1m is not None:
+                chips.append(f":gray-badge[{_format_price(info.cache_hit_price_per_1m)}/M cached]")
+            st.markdown(" ".join(chips))
+        with cols[2]:
+            st.button(
+                "Selected" if is_current else "Select",
+                key=f"_pick_{key_prefix}_{qualified_id}",
+                type="primary" if is_current else "secondary",
+                disabled=is_current,
+                on_click=_select_model,
+                args=(qualified_id,),
+                width="stretch",
+            )
+
+
+def _connected_qualified_ids() -> list[str]:
+    """Return qualified ids reachable via a currently-connected provider.
+
+    Combines the catalog membership (cleared the completeness gate)
+    with per-provider connection status. A provider is "connected"
+    when ``ss.provider_models[<id>]`` is non-empty (the connect flow
+    populates this with the live raw-id list).
+    """
+    ss = st.session_state
+    available = model_catalog.available_qualified_ids(ss.clients)
+    # ``available_qualified_ids`` already filters litellm_compat
+    # providers by raw-id presence; for the native trio we additionally
+    # require a non-None ``ss.clients`` entry (which the function
+    # already checks). Sort by recommended order if the qualified id
+    # is in ``RECOMMENDED_MODELS`` so the more-prominent picks surface
+    # first within each tab; otherwise alphabetical.
+    rec_order = {qid: i for i, qid in enumerate(RECOMMENDED_MODELS)}
+    return sorted(
+        available,
+        key=lambda qid: (rec_order.get(qid, len(rec_order)), qid.casefold()),
+    )
+
+
+def _filter_by_tab(qualified_ids: list[str], tab_label: str) -> list[str]:
+    """Filter a qualified-id list to those tagged for the given tab."""
+    if tab_label == "All":
+        return qualified_ids
+    if tab_label == "Recommended":
+        # Intersect RECOMMENDED_MODELS with the connected set.
+        connected = set(qualified_ids)
+        return [m for m in RECOMMENDED_MODELS if m in connected]
+    tag = _TAB_TAG_FOR.get(tab_label, "")
+    if not tag:
+        return qualified_ids
+    out: list[str] = []
+    for qid in qualified_ids:
+        info = model_catalog.get_info(qid)
+        if info is None:
+            continue
+        if tag in info.tags:
+            out.append(qid)
+    return out
+
+
+def _filter_by_search(qualified_ids: list[str], query: str) -> list[str]:
+    """Filter by a substring match on label / description / qualified id."""
+    q = (query or "").strip().casefold()
+    if not q:
+        return qualified_ids
+    out: list[str] = []
+    for qid in qualified_ids:
+        if q in qid.casefold():
+            out.append(qid)
+            continue
+        info = model_catalog.get_info(qid)
+        if info is None:
+            continue
+        if q in info.label.casefold() or q in info.description.casefold():
+            out.append(qid)
+            continue
+        # Also match provider label so e.g. searching "anthropic" finds Claude rows.
+        provider = providers.get_provider(info.provider_id)
+        if provider and q in provider.label.casefold():
+            out.append(qid)
+    return out
+
+
+@st.fragment(run_every="0.5s")
+def _poll_catalog_refresh() -> None:
+    """Poll for catalog-refresh completion and rerun once it lands.
+
+    Runs only while ``ss.model_catalog_refreshing`` is True. The
+    background daemon thread can't safely write to session state,
+    so we watch ``model_catalog.newest_refresh()`` from this
+    polling fragment: when its timestamp advances (or per-source
+    errors accumulate), the refresh is done and we flip the flag
+    back + rerun so the picker modal re-renders with the new
+    catalog.
+    """
+    ss = st.session_state
+    if not ss.get("model_catalog_refreshing"):
+        return
+    last_seen = ss.get("_model_catalog_refresh_baseline")
+    current = model_catalog.newest_refresh()
+    if last_seen is None:
+        # First poll after kick — record the pre-refresh baseline so
+        # we can detect the next bump.
+        ss["_model_catalog_refresh_baseline"] = current
+        return
+    advanced = (current is not None) and (last_seen is None or current > last_seen)
+    error_seen = bool(model_catalog.errors())
+    if advanced or error_seen:
+        ss.model_catalog_refreshing = False
+        ss.pop("_model_catalog_refresh_baseline", None)
+        st.rerun()
+
+
+@st.dialog("Choose a model", width="large", on_dismiss=_close_model_picker)
+def _model_picker_dialog() -> None:
+    """The model-picker modal. Mounted from ``render()``.
+
+    Layout:
+
+    1. Header row: title + Refresh button + last-refreshed caption.
+    2. Search box.
+    3. Tabs over capability buckets.
+    4. Per-tab list of model rows.
+    5. Footer caption surfacing the count of hidden models.
+
+    The modal is gated by ``ss.model_picker_open`` and dismissed via
+    ``on_dismiss=_close_model_picker`` (per AGENTS.md @st.dialog rule).
+    """
     ss = st.session_state
 
-    # Dual-key pattern (per ``AGENTS.md``): the widgets bind to their
-    # own ``_chat_*_input`` keys so Streamlit can freely strip them on
-    # widget unmount, while the canonical ``ss.mode`` / ``ss.model``
-    # keys are non-widget and survive navigation. Re-seed the widget
-    # keys from canonical on every render so a remount after a Diff /
-    # Usage / Settings visit picks the right initial selection.
+    # Compute the connected qualified-id set once — every tab below
+    # filters it, AND the header counts caption reads from it.
+    connected = _connected_qualified_ids()
+    n_connected = len(connected)
+    n_providers = len(set(qid.split(":", 1)[0] for qid in connected))
+
+    # Header row. Title on the left + (counts caption + Refresh button)
+    # on the right. The counts caption gives the user an at-a-glance
+    # "I have N models from M providers" — important when they've
+    # connected a long-tail provider like OpenRouter (300+ models)
+    # and the default Recommended tab only shows curated picks.
+    header_cols = st.columns([4, 2, 2], vertical_alignment="center")
+    with header_cols[0]:
+        st.markdown("**Pick a model for your next message.**")
+        if n_connected > 0:
+            st.caption(
+                f"{n_connected} model{'s' if n_connected != 1 else ''} "
+                f"available across {n_providers} provider"
+                f"{'s' if n_providers != 1 else ''}. The capability tabs "
+                f"below show curated picks; **All** lists everything."
+            )
+    with header_cols[1]:
+        st.caption(_format_last_refreshed())
+    with header_cols[2]:
+        if ss.model_catalog_refreshing:
+            st.button(
+                "Refreshing...",
+                icon=":material/progress_activity:",
+                disabled=True,
+                width="stretch",
+                key="_picker_refresh_disabled",
+            )
+        else:
+            st.button(
+                "Refresh",
+                icon=":material/refresh:",
+                on_click=_kick_catalog_refresh,
+                width="stretch",
+                key="_picker_refresh_btn",
+            )
+
+    # Per-source error chips (LiteLLM / OpenRouter / per-provider).
+    errs = model_catalog.errors()
+    if errs:
+        with st.container(border=False):
+            for source, msg in sorted(errs.items()):
+                st.caption(f":red[:material/error: {source}: {msg}]")
+
+    # Search box.
+    st.text_input(
+        "Search models",
+        key="_model_picker_search",
+        placeholder="Search by name, provider, or capability",
+        label_visibility="collapsed",
+    )
+
+    # ``connected`` is computed at the top of this function; reuse it
+    # so we don't double-walk the catalog.
+    if not connected:
+        st.info(
+            "No connected provider has any picker-ready models. "
+            "Open **Settings** and add a provider key.",
+            icon=":material/info:",
+        )
+    else:
+        searched = _filter_by_search(connected, ss.get("_model_picker_search") or "")
+
+        tabs = st.tabs(list(_TAB_LABELS))
+        for tab_idx, tab_label in enumerate(_TAB_LABELS):
+            with tabs[tab_idx]:
+                tab_ids = _filter_by_tab(searched, tab_label)
+                if not tab_ids:
+                    if tab_label == "All":
+                        st.info(
+                            "No models matched your search.",
+                            icon=":material/search_off:",
+                        )
+                    else:
+                        # Curated tabs (Recommended / Coding / Reasoning)
+                        # only surface models that have those tags in
+                        # ``MODEL_METADATA`` — auto-derived tags are
+                        # limited to ``long_context`` / ``cheap`` /
+                        # ``fast`` / ``multimodal``. So uncurated
+                        # providers like OpenRouter (with 300+ models)
+                        # never appear in Coding / Reasoning even
+                        # though their models can do those things —
+                        # we just don't have a verified opinion on
+                        # which ones. Point users at **All** so they
+                        # don't think their connected provider is
+                        # broken.
+                        n_total = len(connected)
+                        if n_total > 0:
+                            st.info(
+                                f"This tab shows curated picks tagged "
+                                f"**{tab_label.lower()}**. None of your "
+                                f"connected providers' curated models "
+                                f"carry that tag right now. Click "
+                                f"**All** above to browse every "
+                                f"available model "
+                                f"({n_total} total) — or use the "
+                                f"search box to filter by name.",
+                                icon=":material/info:",
+                            )
+                        else:
+                            st.info(
+                                "No connected provider has any "
+                                "picker-ready models yet.",
+                                icon=":material/info:",
+                            )
+                    continue
+                # Slugify the tab label into a stable key prefix.
+                key_prefix = tab_label.replace(" ", "_").replace("&", "and").lower()
+                for qid in tab_ids:
+                    _render_model_row(qid, key_prefix=key_prefix)
+
+    # Footer: hidden-models caption.
+    hidden = model_catalog.hidden_models_summary(ss.clients)
+    total_hidden = sum(hidden.values())
+    if total_hidden > 0:
+        breakdown = ", ".join(
+            f"{providers.get_provider(pid).label if providers.get_provider(pid) else pid}: {n}"
+            for pid, n in sorted(hidden.items())
+            if n > 0
+        )
+        st.caption(
+            f":material/visibility_off: {total_hidden} model"
+            f"{'s' if total_hidden != 1 else ''} hidden — pricing or "
+            f"description not yet verified. Click **Refresh** to retry."
+            + (f"  \nBreakdown: {breakdown}" if breakdown else "")
+        )
+
+
+def _render_model_controls() -> None:
+    """Render the Mode dropdown + the current-model button + skills popover.
+
+    Replaces the old Model selectbox with a button that opens the
+    @st.dialog model picker. The button label shows the current
+    model's provider badge + label so users see at a glance what
+    they're using; clicking opens the modal.
+    """
+    ss = st.session_state
+
+    # Dual-key pattern (per ``AGENTS.md``): the Mode dropdown widget
+    # binds to ``_chat_mode_input``; the canonical ``ss.mode`` key is
+    # non-widget and survives navigation.
     ss["_chat_mode_input"] = ss.mode if ss.mode in ("agent", "ask") else "agent"
-    if ss.models and ss.model in ss.models:
-        ss["_chat_model_input"] = ss.model
 
     cols = st.columns([1, 2, 1], vertical_alignment="bottom")
     with cols[0]:
@@ -937,56 +1945,94 @@ def _render_model_controls() -> None:
             ),
         )
     with cols[1]:
-        if ss.models:
-            st.selectbox(
-                "Model",
-                options=ss.models,
-                key="_chat_model_input",
-                on_change=_on_model_change,
-                format_func=model_label,
-                help="Switch which W&B Inference model handles the next turn.",
+        # Current-model button. Clicking opens the modal picker.
+        any_provider_connected = any(
+            bool(ids) for ids in (ss.provider_models or {}).values()
+        )
+        current_qid = ss.model if isinstance(ss.model, str) else ""
+        if not any_provider_connected:
+            st.button(
+                "Open Settings to add a provider",
+                icon=":material/settings:",
+                disabled=True,
+                width="stretch",
+                key="_model_button_disabled",
             )
         else:
-            st.selectbox(
-                "Model",
-                options=["Connect to load models"],
-                disabled=True,
+            current_provider = model_provider(current_qid)
+            label_parts: list[str] = []
+            if current_qid:
+                label_parts.append(model_label(current_qid))
+            else:
+                label_parts.append("Choose a model")
+            button_label = " ".join(label_parts) if label_parts else "Choose a model"
+            help_text = "Click to switch models across all connected providers."
+            if current_provider:
+                provider = providers.get_provider(current_provider)
+                if provider:
+                    help_text = f"Currently using {provider.label}. " + help_text
+            st.button(
+                button_label,
+                icon=":material/expand_more:",
+                on_click=_open_model_picker,
+                width="stretch",
+                key="_model_button_open_picker",
+                help=help_text,
             )
     with cols[2]:
         _render_skills_popover(ss.working_dir)
 
-    meta = MODEL_METADATA.get(ss.model) if ss.model else None
-    if meta:
-        chips: list[str] = []
-        if meta.get("context"):
-            chips.append(f"{meta['context']} context")
-        if meta.get("params"):
-            chips.append(f"{meta['params']} params")
-        # Pricing chip — surfaces input/output $/M alongside context/params so
-        # the user knows what each turn will cost before sending it.
-        inp = meta.get("input_price_per_1m")
-        out = meta.get("output_price_per_1m")
-        if isinstance(inp, (int, float)) and isinstance(out, (int, float)):
-            chips.append(f"${inp:g}/${out:g} per 1M in/out")
-        header = f":material/info: **{meta['label']}**"
+    # Inline model-card caption — surfaces the chips below the button so
+    # the user has at-a-glance pricing info without opening the modal.
+    info = model_catalog.get_info(ss.model) if ss.model else None
+    if info is not None:
+        chips: list[str] = [f"{_format_context(info.context)} context"]
+        chips.append(
+            f"{_format_price(info.input_price_per_1m)}/"
+            f"{_format_price(info.output_price_per_1m)} per 1M in/out"
+        )
+        header = f":material/info: **{info.label}**"
         if chips:
             header += " \u00b7 " + " \u00b7 ".join(chips)
-        desc = meta.get("description", "")
-        st.caption(f"{header} \u2014 {desc}" if desc else header)
+        st.caption(f"{header} \u2014 {info.description}")
+    else:
+        # Fall back to the curated MODEL_METADATA entry when the catalog
+        # hasn't seen this id yet (first launch + no refresh).
+        meta = MODEL_METADATA.get(ss.model) if ss.model else None
+        if meta:
+            chips: list[str] = []
+            if meta.get("context"):
+                chips.append(f"{meta['context']} context")
+            if meta.get("params"):
+                chips.append(f"{meta['params']} params")
+            inp = meta.get("input_price_per_1m")
+            out = meta.get("output_price_per_1m")
+            if isinstance(inp, (int, float)) and isinstance(out, (int, float)):
+                chips.append(f"${inp:g}/${out:g} per 1M in/out")
+            header = f":material/info: **{meta['label']}**"
+            if chips:
+                header += " \u00b7 " + " \u00b7 ".join(chips)
+            desc = meta.get("description", "")
+            st.caption(f"{header} \u2014 {desc}" if desc else header)
 
     # Soft warning for models documented to mishandle tool calling. These
     # models often *describe* file edits in plain text without ever emitting
     # a structured ``tool_calls`` delta, so the agent loop has nothing to
     # dispatch and the user sees "I'll write the file..." that doesn't
     # actually edit anything. Source-of-truth lives in
-    # ``models.has_weak_tool_calling`` so the flag list stays in one place.
-    # Mode-agnostic on purpose: even Ask mode's read-only flow needs the
-    # model to call ``read_file`` / ``list_files`` to be useful.
-    if has_weak_tool_calling(ss.model):
+    # ``models.weak_tool_calling_issue_url`` so the flag list stays in one
+    # place. We deliberately link to the per-model upstream bug rather than
+    # recommend specific alternative models — alternative recommendations
+    # age poorly as the W&B catalog churns; a public bug URL is durable
+    # and lets the user verify the claim themselves. Mode-agnostic on
+    # purpose: even Ask mode's read-only flow needs the model to call
+    # ``read_file`` / ``list_files`` to be useful.
+    issue_url = weak_tool_calling_issue_url(ss.model)
+    if issue_url:
         st.caption(
             ":orange[:material/warning: This model often *describes* file "
-            "edits without actually making them. For reliable changes try "
-            "**Qwen3 Coder 480B**, **DeepSeek V3.1**, or **GPT OSS 120B**.]"
+            f"edits without actually making them ([known issue]({issue_url}))."
+            "]"
         )
 
 
@@ -995,9 +2041,9 @@ def _render_model_controls() -> None:
 # ---------------------------------------------------------------------------
 # The chat page is the single rendering site for the live working-tree
 # unified diff. Surface area:
-#   - ``_render_chat_diff_button``: a pinned "Changes" button at the top
-#     of the sticky bottom-controls block; hidden when there are no
-#     changes / not a git repo.
+#   - ``_render_chat_diff_button``: a "Changes" button rendered just
+#     below the bottom-of-chat git row (i.e. a couple of rows below the
+#     chat input); hidden when there are no changes / not a git repo.
 #   - ``_diff_dialog`` (mounted from ``render()``): a modal overlay
 #     showing the TOC + per-file diff sections, gated by
 #     ``ss.diff_dialog_open``.
@@ -1241,11 +2287,12 @@ def _diff_dialog() -> None:
 # ---------------------------------------------------------------------------
 # Bottom-of-chat git row: branch picker + new branch + fetch + Push
 # ---------------------------------------------------------------------------
-# Pinned just above the "Changes" button. Owns the per-chat branch
-# switching, new-branch creation, fetch, and the one-click "generate
-# commit message + commit + push" pipeline. Modals (`New branch`,
-# `Publish branch`) are mounted from ``render()`` alongside
-# ``_diff_dialog`` so they overlay the page rather than reflowing it.
+# Rendered directly below the chat input, with the "Changes" button
+# directly below it. Owns the per-chat branch switching, new-branch
+# creation, fetch, and the one-click "generate commit message + commit
+# + push" pipeline. Modals (`New branch`, `Publish branch`) are
+# mounted from ``render()`` alongside ``_diff_dialog`` so they overlay
+# the page rather than reflowing it.
 #
 # This is the **single entry point** for git push in the app — the
 # sidebar's old per-chat git block was removed and the push dialog
@@ -1429,7 +2476,11 @@ def _run_push_pipeline(
     """
     ss = st.session_state
 
-    if not commit_ai.is_deepseek_available(ss.get("models")):
+    # Check W&B-side availability (DeepSeek V4-Flash is W&B-only). Look
+    # in both the legacy ``ss.models`` list (W&B raw ids) and the new
+    # multi-provider ``ss.provider_models["wandb"]`` slot.
+    wandb_models = ss.provider_models.get("wandb") or ss.get("models") or []
+    if not commit_ai.is_deepseek_available(wandb_models):
         st.toast(
             f"Push needs `{DEEPSEEK_MODEL}` for the commit message.",
             icon=":material/error:",
@@ -1456,9 +2507,10 @@ def _run_push_pipeline(
         return
 
     st.toast("Generating commit message...", icon=":material/auto_awesome:")
+    wandb_key = ss.provider_keys.get("wandb", "")
     try:
         commit_msg = commit_ai.generate_commit_message(
-            ss.get("client"), working_dir, paths
+            ss.get("client"), working_dir, paths, api_key=wandb_key
         )
     except Exception as e:
         st.toast(f"DeepSeek failed: {e}", icon=":material/error:")
@@ -1481,7 +2533,8 @@ def _run_push_pipeline(
         try:
             target = git_ops.default_branch(working_dir)
             pr_title, pr_body = commit_ai.generate_pr_description(
-                ss.get("client"), working_dir, paths, branch, target
+                ss.get("client"), working_dir, paths, branch, target,
+                api_key=wandb_key,
             )
         except Exception as e:
             st.toast(f"DeepSeek PR generation failed: {e}", icon=":material/warning:")
@@ -1722,12 +2775,14 @@ def _first_push_dialog() -> None:
 
 
 def _render_chat_git_row() -> None:
-    """The compact bottom-of-chat git row: branch / new / fetch / push.
+    """The compact git row directly below the chat input: branch / new / fetch / push.
 
     Hidden entirely when the active chat has no workdir, when the
     workdir is not a git repo, or when git isn't installed — the
-    Changes button below already degrades the same way, so there's
-    nothing useful for this row to do in those cases.
+    Changes button rendered just below this row degrades the same
+    way, so there's nothing useful for this row to do in those cases
+    and the bottom controls collapse cleanly to just the workdir +
+    model selectors.
 
     On a detached HEAD we render a single caption explaining why the
     full controls are missing instead of an empty row.
@@ -1777,7 +2832,9 @@ def _render_chat_git_row() -> None:
 
     in_progress = bool(state.get("in_merge_or_rebase"))
     dirty = bool(state.get("status"))
-    deepseek_ok = commit_ai.is_deepseek_available(ss.get("models"))
+    deepseek_ok = commit_ai.is_deepseek_available(
+        ss.provider_models.get("wandb") or ss.get("models") or []
+    )
 
     cols = st.columns([4, 1, 1, 4], vertical_alignment="bottom")
 
@@ -1886,7 +2943,7 @@ def _drain_pending_push_request() -> None:
 
 
 def _render_chat_diff_button() -> None:
-    """Render the pinned "Changes" button above the chat input.
+    """Render the "Changes" button just below the bottom-of-chat git row.
 
     Hidden entirely when the chat's working directory is empty / not a
     git repo / has no changes / git is missing — so the bottom controls
@@ -1932,6 +2989,72 @@ def _render_chat_diff_button() -> None:
         width="stretch",
         on_click=_open_diff_dialog,
         help="View the live working-tree diff in an overlay.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stop button: cancel an in-flight turn on demand
+# ---------------------------------------------------------------------------
+# Rendered inside the same ``st.container()`` as the chat input (just
+# above it) so the user's eye lands on the stop affordance the moment
+# they look at the disabled chat input. Hidden entirely when the
+# active chat is not running, which matches the only state where
+# cancellation is meaningful. The callback delegates to
+# :func:`chats.request_cancel`, which is the **only** entry point in
+# the app for asking the runner to stop — see ``AGENTS.md``'s
+# anti-duplication checklist entry on cancellation.
+def _on_chat_stop_clicked() -> None:
+    """Stop button callback: signal the active chat's runner to abort.
+
+    No-op when no chat is active or the chat is not currently running
+    a turn (defensive: the button is hidden in those states, but
+    Streamlit's button-click latency means a user could conceivably
+    double-click during the brief window between the runner finishing
+    and the rerun re-evaluating the button's visibility). The
+    underlying ``chats.request_cancel`` is itself idempotent.
+
+    Surfaces a toast so the user gets immediate feedback even before
+    the runner has had a chance to flip status — the live fragment
+    polls every 250ms, so there's a brief perceptual gap between
+    click and the chat input re-enabling without the toast.
+    """
+    ss = st.session_state
+    chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
+    if chat is None or chat.status != chats.STATUS_RUNNING:
+        return
+    chats.request_cancel(chat)
+    st.toast("Stopping the current turn...", icon=":material/stop_circle:")
+
+
+def _render_chat_stop_button(chat: chats.Chat | None) -> None:
+    """Render the Stop button when the active chat has a turn in flight.
+
+    Hidden entirely when the active chat is not running. Clicking
+    signals the runner via :func:`chats.request_cancel`; the runner
+    closes the streaming W&B Inference connection (so the server
+    stops generating tokens), preserves any partial reply as a
+    proper assistant_text event, appends a "Stopped by user" marker,
+    and flips status back to IDLE so the live fragment stops polling
+    and the chat input re-enables.
+
+    Callers pass the already-resolved ``chat`` to avoid a second
+    ``ss.chats.get(ss.active_chat_id)`` round trip — render() does
+    that lookup once at the top of the page.
+    """
+    if chat is None or chat.status != chats.STATUS_RUNNING:
+        return
+    st.button(
+        "Stop",
+        icon=":material/stop:",
+        type="primary",
+        key="chat_stop_btn",
+        on_click=_on_chat_stop_clicked,
+        width="stretch",
+        help=(
+            "Stop the current turn. The model stops immediately so you "
+            "don't spend more tokens, and any partial reply is kept in "
+            "the chat history."
+        ),
     )
 
 
@@ -2223,44 +3346,97 @@ def render() -> None:
     # Has to run after the active-chat sync above (so it sees the
     # right working_dir) but before the bottom controls render so the
     # toast for "pushed!" / "rebase conflict" appears on the same
-    # rerun rather than the next one.
+    # rerun rather than the next one, and so the git row below picks
+    # up the post-push branch / dirty state on the same render.
     _drain_pending_push_request()
 
-    # Compact git row pinned just above the Changes button: branch
+    # Chat input is wrapped in its own ``st.container()`` so Streamlit
+    # renders it inline (rather than docking it to the viewport bottom
+    # via the default top-level chat-input behaviour) — the *whole*
+    # control stack below the chat history needs to stay together,
+    # not the chat input alone. The Stop button is rendered inside the
+    # same container, just above the input, so the user's eye lands
+    # on the cancel affordance immediately when they look at the
+    # disabled chat input. The placeholder text also flips while a
+    # turn is in flight so it's obvious why typing is locked out.
+    chat_running = chat.status == chats.STATUS_RUNNING
+    chat_input_placeholder = (
+        "Click Stop above to interrupt the running turn..."
+        if chat_running
+        else "Ask the agent to read or modify your code..."
+    )
+    with st.container():
+        _render_chat_stop_button(chat)
+        # Phase 6: ``accept_file="multiple"`` turns the chat input
+        # into a ``ChatInputValue`` dict-like with ``text`` and
+        # ``files: list[UploadedFile]`` keys. The accepted file
+        # extensions cover images (vision-capable models),
+        # PDFs (Anthropic / Google native, others get text-extracted
+        # via pypdf), and a curated set of plain-text + code formats.
+        chat_submission = st.chat_input(
+            chat_input_placeholder,
+            disabled=(not wd_ok) or chat_running,
+            accept_file="multiple",
+            file_type=[
+                "png", "jpg", "jpeg", "webp", "gif",
+                "pdf",
+                "txt", "md", "json", "csv", "yaml", "yml", "toml",
+                "py", "ts", "tsx", "js", "jsx", "html", "css",
+                "sh", "rs", "go", "java", "cpp", "c", "h",
+            ],
+        )
+        # Normalize: ``ChatInputValue`` is a dict-like for new-style
+        # submissions; ``str`` for the legacy single-text path. We
+        # keep both call sites simple by extracting (text, files).
+        prompt: str | None = None
+        submitted_files: list[Any] = []
+        if isinstance(chat_submission, dict):
+            prompt = (chat_submission.get("text") or "").strip() or None
+            submitted_files = list(chat_submission.get("files") or [])
+        elif isinstance(chat_submission, str):
+            prompt = chat_submission
+        elif chat_submission is not None and hasattr(chat_submission, "text"):
+            # ChatInputValue object form
+            prompt = (getattr(chat_submission, "text", "") or "").strip() or None
+            submitted_files = list(getattr(chat_submission, "files", None) or [])
+
+    # Mount the chat-input enhancer on every render. Two responsibilities:
+    # (1) slash-command autocomplete (filters the skills list as the
+    # user types ``/<query>``), and (2) per-chat draft persistence — the
+    # JS restores ``chat.draft_text`` into the textarea on chat switch /
+    # first attach, and pushes typing back via ``setStateValue`` so
+    # ``_on_draft_change`` can save it to disk on the next rerun. We
+    # mount unconditionally (rather than only when ``autocomplete_skills``
+    # is non-empty as the historical code did) because draft persistence
+    # has to work even in projects with no configured skills, and the
+    # autocomplete dropdown silently shows "No matching skills" in that
+    # case which is the right degradation.
+    summary = _scan_project_summary(ss.working_dir or "")
+    autocomplete_skills = summary.get("all_skills", []) or []
+    mount_slash_autocomplete(
+        autocomplete_skills,
+        placeholder_hint=(
+            "Try a different prefix, or open the Skills popover below "
+            "for the full list."
+        ),
+        chat_id=chat.id,
+        draft=chat.draft_text or "",
+        on_draft_change=_on_draft_change,
+    )
+
+    # Compact git row sits directly below the chat input: branch
     # picker + new-branch + fetch + Push. Hidden entirely when the
     # workdir isn't a git repo / git is missing — same degradation the
     # Changes button has, so the bottom controls stay tight when
     # there's nothing useful to show.
     _render_chat_git_row()
 
-    # "Changes" button sits directly above the chat input. Hidden when
+    # "Changes" button sits directly below the git row. Hidden when
     # the working tree is clean / not a git repo so it doesn't take up
     # space when there's nothing to view. Clicking the button opens
     # ``_diff_dialog`` (a modal overlay) so opening the diff never
-    # reflows the chat input or any other control below.
+    # reflows the chat input or any other control.
     _render_chat_diff_button()
-
-    # Chat input is wrapped in its own ``st.container()`` so Streamlit
-    # renders it inline (rather than docking it to the viewport bottom
-    # via the default top-level chat-input behaviour) — the *whole*
-    # control stack below the chat history needs to stay together,
-    # not the chat input alone.
-    with st.container():
-        prompt = st.chat_input(
-            "Ask the agent to read or modify your code...",
-            disabled=(not wd_ok) or chat.status == chats.STATUS_RUNNING,
-        )
-
-    summary = _scan_project_summary(ss.working_dir or "")
-    autocomplete_skills = summary.get("all_skills", []) or []
-    if autocomplete_skills:
-        mount_slash_autocomplete(
-            autocomplete_skills,
-            placeholder_hint=(
-                "Try a different prefix, or open the Skills popover below "
-                "for the full list."
-            ),
-        )
 
     _render_workdir_controls()
 
@@ -2284,8 +3460,46 @@ def render() -> None:
         _start_turn(pending["prompt"], override_model=pending.get("model"))
         st.rerun()
 
-    if prompt and wd_ok and chat.status != chats.STATUS_RUNNING:
-        _start_turn(prompt)
+    if (prompt or submitted_files) and wd_ok and chat.status != chats.STATUS_RUNNING:
+        # Phase 6: persist uploads into the chat's artifacts inbox so
+        # the file metadata can be threaded through ``chats.start_turn``
+        # along with the prompt text. Empty prompts with attachments
+        # are still valid submissions ("look at this image and explain
+        # what you see") so we treat any prompt-or-file combination as
+        # a turn trigger.
+        if submitted_files:
+            try:
+                import attachments as _attachments
+                wd_path = Path(ss.working_dir).expanduser().resolve()
+                saved_attachments = _attachments.save_uploads(
+                    submitted_files, wd_path, chat.id
+                )
+                # Replace ss.pending_attachments with the saved list
+                # so the next-render attachments-chips row reflects
+                # what landed on disk (the chat input clears the
+                # widget-side files automatically).
+                ss.pending_attachments = saved_attachments
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Could not save attachments: {e}", icon=":material/error:")
+                saved_attachments = []
+        else:
+            saved_attachments = list(ss.pending_attachments or [])
+            ss.pending_attachments = []
+
+        # Submitting the prompt consumes the draft — clear ``draft_text``
+        # before we spawn the turn so the next render passes ``draft=""``
+        # down to the chat-input enhancer (which keeps the textarea
+        # empty after st.chat_input has already cleared it). Without
+        # this, the saved draft would re-flow into the textarea on the
+        # next chat switch and the user would see their just-sent
+        # message reappear.
+        if chat.draft_text:
+            chat.draft_text = ""
+            try:
+                chats.save_chat(chat)
+            except OSError:
+                pass
+        _start_turn(prompt or "", attachments=saved_attachments)
         st.rerun()
 
     # Mount the diff dialog last so its modal overlay sits above all
@@ -2303,6 +3517,25 @@ def render() -> None:
         _new_branch_dialog()
     if ss.get("first_push_dialog_open"):
         _first_push_dialog()
+
+    # Model picker modal — mounted alongside the other dialogs, gated
+    # by ``ss.model_picker_open`` (set by the "current model" button
+    # in the controls row, cleared by Select / Cancel / on_dismiss).
+    if ss.get("model_picker_open"):
+        _model_picker_dialog()
+
+    # Phase 5: lightbox modal for media previews. Mounted alongside
+    # the other dialogs at the same render level.
+    if ss.get("lightbox_open"):
+        _lightbox_dialog()
+
+    # While a background catalog refresh is in flight, run a 0.5s
+    # @st.fragment poll that watches the catalog's newest_refresh
+    # timestamp + the per-source error dict for changes. When the
+    # refresh thread finishes (or errors out), flip the flag back so
+    # the modal re-renders with the new data.
+    if ss.get("model_catalog_refreshing"):
+        _poll_catalog_refresh()
 
 
 # Streamlit's st.navigation runs the page module top-to-bottom, so we call

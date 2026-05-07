@@ -43,12 +43,16 @@ baseFontSize = 12
 # the app as multi-mode — that's what makes the in-app theme switcher's
 # ``localStorage`` writes actually drive the rendered theme on boot. The
 # frontend's ``id(e)`` check (in ``streamlit/static/static/js/utils.*.js``)
-# requires each per-mode table to have at least one valid value, so we
-# pin ``primaryColor`` to Streamlit's well-known default red. This
-# preserves the visual identity exactly while enabling Light / Dark /
-# System switching via ``theme_switcher.py``.
+# requires each per-mode table to have at least one valid value, which
+# we use to pin ``primaryColor`` to a vibrant blue (``#0080FF``) —
+# replacing Streamlit's default red across buttons, links, focus rings,
+# and the chat-page chat-row "primary" highlight. Mirror in
+# ``STREAMLIT_OPTIONS`` in ``scripts/build_desktop.py`` (via the
+# per-mode ``--theme.light.primaryColor`` / ``--theme.dark.primaryColor``
+# flags) so packaged builds pick up the same color; the bundled ``.app``
+# does not read this file at runtime.
 [theme.light]
-primaryColor = "#FF4B4B"
+primaryColor = "#0080FF"
 
 [theme.dark]
-primaryColor = "#FF4B4B"
+primaryColor = "#0080FF"

@@ -1,4 +1,4 @@
-"""Settings page: GitHub identity, appearance, W&B Inference, MCP servers.
+"""Settings page: GitHub identity, appearance, providers, MCP servers.
 
 Replaces the old sidebar settings popover and the MCP sidebar expander.
 Rendered in the main column via ``st.navigation`` so the user gets the
@@ -17,8 +17,28 @@ full page width for forms and help text. Layout:
      :func:`actions.set_font_size_pref`).
      The actual at-runtime CSS override is done by
      :mod:`font_size_switcher`, also mounted from the entry script.
-4. **W&B Inference** card — API key + opt-in "Remember on this machine" +
-   project + Connect / Disconnect / Forget.
+4. **Providers** — one card per provider, in two tiers per
+   :data:`providers.PROVIDERS`:
+
+   - 7 ``tier == "primary"`` cards directly in the page body (W&B
+     Inference, OpenAI, Anthropic, Google Gemini, Together AI, Groq,
+     Fireworks AI). These are the most commonly used direct-host
+     providers; native pricing, no markup.
+   - 5 ``tier == "more"`` cards inside a collapsed
+     ``st.expander("More providers")`` (Mistral, xAI, Cerebras,
+     DeepInfra, OpenRouter). OpenRouter is intentionally last and
+     carries a persistent ``:gray-badge[marked-up gateway]`` plus a
+     caveat caption explaining its 5–10% markup so users only route
+     through it for niche models.
+
+   Each card renders the same dual-key-pattern API key field
+   (``_<id>_key_input`` widget key paired with the canonical
+   ``ss.provider_keys[id]``), an ``st.link_button`` to the provider's
+   key console (``provider.key_url``), a "Remember on this machine"
+   checkbox bound to ``ss.provider_remember[id]``, and Connect /
+   Disconnect / Forget buttons. The W&B card additionally renders the
+   optional team/project field plus the Weave tracing caption when
+   ``ss.weave_project`` is set; OpenRouter renders the markup caveat.
 5. **MCP servers** card — list of configured MCP servers with per-server
    enable toggles + edit buttons + an "Add server" button that opens the
    add/edit dialog (an ``@st.dialog`` modal owned by this page). Stdio
@@ -37,10 +57,11 @@ import streamlit as st
 
 import account
 import mcp_servers
+import providers
 from actions import (
-    disconnect as _disconnect,
-    forget_saved_wb_key as _forget_saved_wb_key,
-    on_connect as _on_connect,
+    connect_provider as _connect_provider,
+    disconnect_provider as _disconnect_provider,
+    forget_provider_key as _forget_provider_key,
     set_font_size_pref as _set_font_size_pref,
     set_theme_pref as _set_theme_pref,
     sign_out_github as _sign_out_github,
@@ -48,6 +69,15 @@ from actions import (
 )
 from font_size_switcher import FONT_SIZE_OPTIONS
 from mcp_servers import MCPRegistry, ServerConfig, make_server_id
+
+
+# Provider cards render labels as plain text — no per-provider icons.
+# An earlier iteration mapped each provider id to a Material Symbol
+# (e.g. ``:material/diamond:`` for Gemini) but the icons were purely
+# decorative and crowded the card header without conveying anything
+# the label didn't already say. They've been removed; this comment
+# is the only thing left so future readers don't reintroduce them
+# without a real reason.
 
 
 def _avatar_data_uri() -> str | None:
@@ -231,83 +261,209 @@ def _render_appearance_card() -> None:
         )
 
 
-def _sync_api_key_input() -> None:
-    """Mirror the API-key text input back to the canonical ``ss.api_key``."""
-    st.session_state.api_key = st.session_state.get("_api_key_input", "")
+def _make_sync_key_input(provider_id: str):
+    """Return a no-args callback that mirrors the per-provider key widget."""
+    widget_key = f"_{provider_id}_key_input"
+
+    def _cb() -> None:
+        ss = st.session_state
+        keys = dict(ss.provider_keys)
+        keys[provider_id] = (ss.get(widget_key, "") or "").strip()
+        ss.provider_keys = keys
+        if provider_id == "wandb":
+            ss.api_key = keys[provider_id]
+
+    return _cb
 
 
-def _sync_project_input() -> None:
-    """Mirror the project text input back to the canonical ``ss.project``."""
-    st.session_state.project = st.session_state.get("_project_input", "")
+def _make_sync_remember_input(provider_id: str):
+    """Return a no-args callback that mirrors the per-provider remember widget."""
+    widget_key = f"_{provider_id}_remember_input"
+
+    def _cb() -> None:
+        ss = st.session_state
+        flags = dict(ss.provider_remember)
+        flags[provider_id] = bool(ss.get(widget_key, False))
+        ss.provider_remember = flags
+        if provider_id == "wandb":
+            ss.remember_wb_key = flags[provider_id]
+
+    return _cb
 
 
-def _sync_remember_input() -> None:
-    """Mirror the remember checkbox back to the canonical ``ss.remember_wb_key``."""
-    st.session_state.remember_wb_key = bool(
-        st.session_state.get("_remember_input", False)
-    )
+def _sync_wandb_project_input() -> None:
+    """Mirror the W&B project text input back to ``ss.project``."""
+    st.session_state.project = (st.session_state.get("_wandb_project_input", "") or "").strip()
 
 
-def _render_inference_card() -> None:
-    """Render the W&B Inference connection card.
+def _provider_status(provider_id: str) -> tuple[bool, int, str | None]:
+    """Return ``(is_connected, model_count, error_message)`` for ``provider_id``."""
+    ss = st.session_state
+    error = ss.connect_errors.get(provider_id)
+    models = ss.provider_models.get(provider_id) or []
+    # ``litellm_compat`` providers have ``ss.clients[id] is None`` even
+    # when connected, so connectivity is signalled by the presence of
+    # listed models + no error message.
+    is_connected = (not error) and bool(models)
+    return is_connected, len(models), error
 
-    The API key / project / remember widgets each use an internal widget
-    key (``_api_key_input`` etc.) and seed their value from the canonical
-    session-state key (``api_key`` etc.) via the ``value=`` parameter,
-    syncing back via ``on_change``. The canonical keys are non-widget
-    keys, so they survive Streamlit's "strip unused widget keys on
-    unmount" behavior when the user navigates between pages — without
-    this dance, going Settings -> Chat -> Settings would clear the
-    visible API key field even while ``ss.client`` was still connected.
+
+def _render_provider_card(provider: providers.Provider) -> None:
+    """Render one provider Settings card — compact 3-row layout.
+
+    Row 1: ``**Label**`` + inline status pill (`green-badge[Connected · N models]`,
+    `red-badge[Error]`, `gray-badge[marked-up gateway]` for OpenRouter).
+    The status pill replaces the previous ``st.success`` banner — pills
+    are inline-markdown so they don't introduce a vertical block.
+
+    Row 2: API key field + (W&B only) Project field + a "Get key"
+    icon-button link to the provider's key console. The text inputs
+    use ``label_visibility="collapsed"`` and a ``placeholder`` so the
+    label-row vertical space is reclaimed.
+
+    Row 3: ☑ Remember + Connect/Disconnect + Forget, all inline.
+
+    Below the card body: an ``st.error`` for the most recent connect
+    error (rendered only when present) and the W&B-specific Weave-
+    tracing caption when W&B is connected. Both stay full-width
+    because their content is variable-length.
+
+    The dual-key pattern (per AGENTS.md) is preserved: each widget
+    binds to its own ``_<id>_*_input`` key while the canonical state
+    lives on ``ss.provider_keys[<id>]`` / ``ss.provider_remember[<id>]``.
     """
     ss = st.session_state
-    with st.container(border=True):
-        st.markdown("### :material/sensors: W&B Inference")
+    pid = provider.id
+    key_widget = f"_{pid}_key_input"
+    remember_widget = f"_{pid}_remember_input"
 
-        cols = st.columns([3, 2])
-        with cols[0]:
-            st.text_input(
-                "API key",
-                value=ss.api_key,
-                key="_api_key_input",
-                type="password",
-                on_change=_sync_api_key_input,
+    is_connected, n_models, error = _provider_status(pid)
+    creds_on_disk = bool(account.load_provider_keys().get(pid))
+
+    with st.container(border=True):
+        # ---- Row 1: label + inline status pill ----
+        header_parts: list[str] = [f"**{provider.label}**"]
+        if pid == "openrouter":
+            header_parts.append(":gray-badge[marked-up gateway]")
+        if is_connected:
+            header_parts.append(
+                f":green-badge[Connected \u00b7 {n_models} model"
+                f"{'s' if n_models != 1 else ''}]"
+            )
+        elif error:
+            header_parts.append(":red-badge[Error]")
+        st.markdown(" ".join(header_parts))
+
+        # OpenRouter caveat — single-line caption.
+        if provider.notes:
+            st.caption(provider.notes)
+
+        # ---- Row 2: key field(s) + key-link button ----
+        if pid == "wandb":
+            # W&B has the optional Project field, so the key + project +
+            # link button live in a 3-column row. The link button gets a
+            # narrow 1-unit column at the right.
+            cols = st.columns([4, 3, 1], vertical_alignment="bottom")
+            with cols[0]:
+                st.text_input(
+                    "API key",
+                    value=ss.provider_keys.get(pid, ""),
+                    key=key_widget,
+                    type="password",
+                    on_change=_make_sync_key_input(pid),
+                    placeholder="API key",
+                    label_visibility="collapsed",
+                    help="Held only in session memory unless **Remember** is ticked.",
+                )
+            with cols[1]:
+                st.text_input(
+                    "Project",
+                    value=ss.get("project", ""),
+                    key="_wandb_project_input",
+                    placeholder="team/project (optional)",
+                    on_change=_sync_wandb_project_input,
+                    label_visibility="collapsed",
+                    help="W&B team/project for usage attribution + Weave tracing.",
+                )
+            with cols[2]:
+                if provider.key_url:
+                    st.link_button(
+                        "Get key",
+                        provider.key_url,
+                        icon=":material/open_in_new:",
+                        width="stretch",
+                        help=f"Open {provider.label}'s API key console.",
+                    )
+        else:
+            cols = st.columns([6, 1], vertical_alignment="bottom")
+            with cols[0]:
+                st.text_input(
+                    "API key",
+                    value=ss.provider_keys.get(pid, ""),
+                    key=key_widget,
+                    type="password",
+                    on_change=_make_sync_key_input(pid),
+                    placeholder="API key",
+                    label_visibility="collapsed",
+                    help="Held only in session memory unless **Remember** is ticked.",
+                )
+            with cols[1]:
+                if provider.key_url:
+                    st.link_button(
+                        "Get key",
+                        provider.key_url,
+                        icon=":material/open_in_new:",
+                        width="stretch",
+                        help=f"Open {provider.label}'s API key console.",
+                    )
+
+        # ---- Row 3: Remember + Connect/Disconnect + Forget ----
+        action_cols = st.columns([3, 2, 2], vertical_alignment="center")
+        with action_cols[0]:
+            st.checkbox(
+                "Remember on this machine",
+                value=bool(ss.provider_remember.get(pid, False)),
+                key=remember_widget,
+                on_change=_make_sync_remember_input(pid),
                 help=(
-                    "Get one at [wandb.ai/settings](https://wandb.ai/settings). "
-                    "Held only in session memory unless you tick **Remember on "
-                    "this machine** below."
+                    "Saves to `~/.wb_coding_agent/credentials.json` "
+                    "(mode 0600). Anyone with read access to your home "
+                    "directory could read it."
                 ),
             )
-        with cols[1]:
-            st.text_input(
-                "Project (optional)",
-                value=ss.project,
-                key="_project_input",
-                placeholder="team/project",
-                on_change=_sync_project_input,
-                help="Used for usage attribution and Weave tracing.",
-            )
+        with action_cols[1]:
+            if is_connected:
+                st.button(
+                    "Disconnect",
+                    icon=":material/link_off:",
+                    on_click=_disconnect_provider,
+                    args=(pid,),
+                    key=f"_{pid}_disconnect_btn",
+                    width="stretch",
+                )
+            else:
+                st.button(
+                    "Connect",
+                    icon=":material/link:",
+                    on_click=_connect_provider,
+                    args=(pid,),
+                    type="primary",
+                    key=f"_{pid}_connect_btn",
+                    width="stretch",
+                )
+        with action_cols[2]:
+            if creds_on_disk:
+                st.button(
+                    "Forget key",
+                    icon=":material/delete_sweep:",
+                    on_click=_forget_provider_key,
+                    args=(pid,),
+                    key=f"_{pid}_forget_btn",
+                    width="stretch",
+                )
 
-        st.checkbox(
-            "Remember on this machine",
-            value=ss.remember_wb_key,
-            key="_remember_input",
-            on_change=_sync_remember_input,
-            help=(
-                "Saves to `~/.wb_coding_agent/credentials.json` (mode 0600). "
-                "Anyone with read access to your home directory could read it."
-            ),
-        )
-
-        is_connected = ss.client is not None and ss.connect_error is None
-        creds_on_disk = bool(account.load_credentials().get("wb_api_key"))
-
-        if is_connected:
-            n = len(ss.models)
-            st.success(
-                f"Connected. {n} models available.",
-                icon=":material/check_circle:",
-            )
+        # ---- W&B Weave tracing caption (variable-length, full-width) ----
+        if pid == "wandb" and is_connected:
             if ss.weave_project:
                 if ss.weave_url:
                     st.caption(
@@ -325,34 +481,58 @@ def _render_inference_card() -> None:
                     f"{ss.weave_error}"
                 )
 
-        # Action buttons live in a single horizontal row so Disconnect /
-        # Connect sits next to Forget saved API key. The presence of a
-        # value in the API key field plus the Forget button itself is
-        # enough to convey "this key is saved on disk" without an extra
-        # caption.
-        with st.container(horizontal=True):
-            if is_connected:
-                st.button(
-                    "Disconnect",
-                    icon=":material/link_off:",
-                    on_click=_disconnect,
-                )
-            else:
-                st.button(
-                    "Connect",
-                    icon=":material/link:",
-                    on_click=_on_connect,
-                    type="primary",
-                )
-            if creds_on_disk:
-                st.button(
-                    "Forget saved API key",
-                    icon=":material/delete_sweep:",
-                    on_click=_forget_saved_wb_key,
-                )
+        # ---- Error banner (only on failure; full-width because the
+        # message can be long) ----
+        if not is_connected and error:
+            st.error(error, icon=":material/error:")
 
-        if not is_connected and ss.connect_error:
-            st.error(ss.connect_error, icon=":material/error:")
+
+def _render_providers_section() -> None:
+    """Render the multi-provider section: 5 primary cards + 7 in an expander.
+
+    Tier rationale (same logic as :data:`providers.PROVIDERS` — kept in
+    lockstep): the primary tier is the smallest set of keys that
+    together let you do almost everything in this app.
+
+    - **W&B Inference** (Weave tracing kicks in only when W&B is
+      connected, regardless of which provider you call for inference,
+      so even users who plan to call other providers want a W&B key
+      for observability).
+    - **OpenAI**, **Anthropic**, **Google Gemini** — three frontier
+      providers, each unlocking native-SDK features the LiteLLM
+      library only passes through generically.
+    - **OpenRouter** — labeled as a marked-up gateway, but kept in
+      the primary tier because it's the cheapest one-key-fits-all
+      path to the dozens of open-model clouds (Together, Fireworks,
+      etc.) without managing seven separate keys.
+    """
+    st.markdown("### :material/hub: Providers")
+    st.caption(
+        "Add an API key from any provider you want to use. The five "
+        "below give you the smallest set of keys that together cover "
+        "almost everything: W&B Inference for tracing, OpenAI / "
+        "Anthropic / Google for the native frontier features, and "
+        "OpenRouter as a one-key route to the long tail (with a 5–10% "
+        "markup). For heavy use of any single open-model cloud, you "
+        "can save the markup by adding a direct key from "
+        "**More providers** below."
+    )
+
+    for provider in providers.primary_providers():
+        _render_provider_card(provider)
+
+    # The "More providers" expander — direct-host providers without a
+    # frontier-class native-feature reason to keep them top-of-page.
+    # Collapsed by default so first-time users aren't overwhelmed.
+    with st.expander(":material/expand_more: More providers", expanded=False):
+        st.caption(
+            "Direct-to-provider keys with no markup. Worth adding when "
+            "you use that specific provider heavily; otherwise the "
+            "OpenRouter card above already reaches every model here at "
+            "a small premium."
+        )
+        for provider in providers.more_providers():
+            _render_provider_card(provider)
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +937,7 @@ def render() -> None:
     _render_session_summary()
     _render_github_card(identity if identity else None)
     _render_appearance_card()
-    _render_inference_card()
+    _render_providers_section()
     _render_mcp_card()
 
     # Mount the add/edit dialog last so it overlays whatever else is on

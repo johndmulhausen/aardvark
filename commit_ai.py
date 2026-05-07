@@ -55,23 +55,37 @@ PR_DESC_SYSTEM = (
 
 
 def is_deepseek_available(models: list[str] | None) -> bool:
-    """Return True if DeepSeek V4-Flash is in the connected account's model list."""
-    return bool(models) and DEEPSEEK_MODEL in models
+    """Return True if DeepSeek V4-Flash is in the connected account's model list.
+
+    Accepts either qualified ids (``"wandb:deepseek-ai/DeepSeek-V4-Flash"``)
+    or bare ids (``"deepseek-ai/DeepSeek-V4-Flash"``) — the chat page may
+    pass ``ss.provider_models["wandb"]`` (raw ids) or the catalog's
+    qualified ids depending on which call site is checking.
+    """
+    if not models:
+        return False
+    # ``DEEPSEEK_MODEL`` is the qualified ``wandb:<raw>`` form.
+    raw_id = DEEPSEEK_MODEL.split(":", 1)[1] if ":" in DEEPSEEK_MODEL else DEEPSEEK_MODEL
+    return DEEPSEEK_MODEL in models or raw_id in models
 
 
 def generate_commit_message(
     client: Any,
     working_dir: Path,
     paths: list[str],
+    *,
+    api_key: str = "",
 ) -> str:
     """Ask DeepSeek for a conventional-commit message describing ``paths``.
 
     Returns ``""`` when the diff is empty (nothing to summarize) so the
     caller can fall back to a stub message instead of submitting an
-    empty string.
+    empty string. The W&B route uses LiteLLM under the hood, so
+    ``client`` may be ``None`` here — what matters is ``api_key`` being
+    populated for the W&B provider; we accept ``client=None`` defensively
+    and rely on the ``DEEPSEEK_MODEL`` qualified id (``wandb:...``)
+    routing through the right path.
     """
-    if client is None:
-        return ""
     diff = git_ops.combined_diff_for_paths(working_dir, paths)
     if not diff.strip():
         return ""
@@ -85,6 +99,7 @@ def generate_commit_message(
         system=COMMIT_MSG_SYSTEM,
         user=user,
         max_tokens=500,
+        api_key=api_key,
     )
 
 
@@ -94,6 +109,8 @@ def generate_pr_description(
     paths: list[str],
     branch: str,
     base: str,
+    *,
+    api_key: str = "",
 ) -> tuple[str, str]:
     """Ask DeepSeek for a PR title + body. Returns ``(title, body)``.
 
@@ -103,8 +120,6 @@ def generate_pr_description(
     pre-filled in the GitHub compare URL even on a model misfire —
     they can still edit both fields before submitting the PR.
     """
-    if client is None:
-        return "", ""
     diff = git_ops.combined_diff_for_paths(working_dir, paths)
     if not diff.strip():
         return "", ""
@@ -119,6 +134,7 @@ def generate_pr_description(
         system=PR_DESC_SYSTEM,
         user=user,
         max_tokens=1500,
+        api_key=api_key,
     )
     if not raw:
         return "", ""

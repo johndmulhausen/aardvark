@@ -62,9 +62,12 @@ from typing import Any, Iterator, Literal
 import weave
 from openai import OpenAI
 
+import chat_streams
 import mcp_servers
 import project_context
+import providers
 import wb_client
+from models import is_qualified, model_provider, unqualified
 
 # ---------------------------------------------------------------------------
 # weave.op compat shim
@@ -89,10 +92,17 @@ from tools import ToolContext, dispatch, tools_for_mode
 # DeepSeek model used by the git push flow for commit messages, PR
 # titles/bodies, and merge-conflict resolution. Hard-coded to V4-Flash
 # because its 1M context comfortably fits multi-file diffs and the
-# multi-file conflict-resolution turn. The UI verifies this id is
-# present in the user's ``/v1/models`` list before invoking it; if not,
-# it surfaces a clear "model unavailable" error and disables generation.
-DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+# multi-file conflict-resolution turn. Stored as a fully-qualified id
+# (``wandb:<raw>``) since the multi-provider migration in Phase 2 — the
+# helper :func:`commit_ai.is_deepseek_available` checks this against
+# the user's connected W&B catalog before invoking; if not, the
+# downstream UI surfaces a clear "model unavailable" error and
+# disables generation. The git push / commit-message / conflict-
+# resolution flows still REQUIRE W&B Inference to be configured (and
+# this model present on the user's account) — Phase 3.5's
+# generalization preserves the qualified-id contract; we just no
+# longer assume the OpenAI client object is the one to call against.
+DEEPSEEK_MODEL = "wandb:deepseek-ai/DeepSeek-V4-Flash"
 
 
 def _strip_client(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -252,12 +262,20 @@ def _normalize_tool_call_arguments(raw: str) -> str:
     postprocess_inputs=_strip_client,
 )
 def _stream_one_call(
-    client: OpenAI,
+    client: Any,
     model: str,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
+    *,
+    provider_id: str | None = None,
+    api_key: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Stream a single chat-completion call and yield UI events.
+
+    Dispatches via :func:`chat_streams.stream_chat`, which routes per
+    ``provider.kind`` (``openai_native`` / ``anthropic_native`` /
+    ``google_native`` / ``litellm_compat``). The four-way dispatch
+    is the single outbound chat-completion entry point per AGENTS.md.
 
     Yields ``assistant_text_delta`` events while the model is producing text,
     accumulates any tool-call fragments by index, and at the end yields:
@@ -274,19 +292,29 @@ def _stream_one_call(
     string the model produced) alongside the parsed ``args`` dict so the
     caller can pass ``raw_args`` straight to :func:`tools.dispatch` without
     re-serializing.
+
+    Back-compat: when ``provider_id`` is ``None``, the function assumes
+    a W&B Inference path (legacy callers) and treats ``model`` as a
+    qualified id if it contains a ``:``, otherwise as a bare W&B id.
     """
-    stream = client.chat.completions.create(
-        model=model,
+    # Resolve provider + raw model id. Both pieces are needed by
+    # ``chat_streams.stream_chat`` to pick the right dispatch path.
+    if provider_id is None and is_qualified(model):
+        provider_id = model_provider(model)
+    if provider_id is None:
+        provider_id = "wandb"
+    raw_model = unqualified(model) if is_qualified(model) else model
+    provider = providers.get_provider(provider_id)
+    if provider is None:
+        raise ValueError(f"Unknown provider id: {provider_id!r}")
+
+    stream = chat_streams.stream_chat(
+        provider=provider,
+        api_key=api_key or "",
+        client=client,
+        model=raw_model,
         messages=messages,
         tools=tools,
-        tool_choice="auto",
-        stream=True,
-        # Ask the server to emit a final ``usage`` chunk with prompt /
-        # completion / total token counts. Compatible OpenAI-style providers
-        # (W&B Inference included) only send the usage block when this flag
-        # is set; without it ``chunk.usage`` is always ``None``. We need
-        # those numbers to drive the Usage dashboard.
-        stream_options={"include_usage": True},
     )
 
     content_parts: list[str] = []
@@ -300,36 +328,54 @@ def _stream_one_call(
     # ``not chunk.choices`` short-circuit below.
     usage_obj: Any = None
 
-    for chunk in stream:
-        usage_attr = getattr(chunk, "usage", None)
-        if usage_attr is not None:
-            usage_obj = usage_attr
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
+    # Wrap the chunk loop in try/finally so a cancelled turn (caller
+    # calls ``.close()`` on the agent generator, which propagates
+    # ``GeneratorExit`` down here) closes the streaming response
+    # promptly — without this, the W&B Inference server keeps
+    # generating tokens until the underlying httpx response is GC'd,
+    # which is not deterministic. ``Stream.close()`` is idempotent
+    # and tolerates double-close, so the unconditional call after a
+    # normal loop exit costs nothing.
+    try:
+        for chunk in stream:
+            usage_attr = getattr(chunk, "usage", None)
+            if usage_attr is not None:
+                usage_obj = usage_attr
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
 
-        if delta.content:
-            content_parts.append(delta.content)
-            yield {"type": "assistant_text_delta", "content": delta.content}
+            if delta.content:
+                content_parts.append(delta.content)
+                yield {"type": "assistant_text_delta", "content": delta.content}
 
-        if delta.tool_calls:
-            for tc_delta in delta.tool_calls:
-                idx = tc_delta.index
-                slot = tool_calls_by_index.setdefault(
-                    idx,
-                    {
-                        "id": "",
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    },
-                )
-                if tc_delta.id:
-                    slot["id"] = tc_delta.id
-                if tc_delta.function is not None:
-                    if tc_delta.function.name:
-                        slot["function"]["name"] = tc_delta.function.name
-                    if tc_delta.function.arguments:
-                        slot["function"]["arguments"] += tc_delta.function.arguments
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    slot = tool_calls_by_index.setdefault(
+                        idx,
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    if tc_delta.id:
+                        slot["id"] = tc_delta.id
+                    if tc_delta.function is not None:
+                        if tc_delta.function.name:
+                            slot["function"]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            slot["function"]["arguments"] += tc_delta.function.arguments
+    finally:
+        # Drop the underlying httpx connection so the server stops
+        # generating. Best-effort: a server / client error during the
+        # close would otherwise mask whatever made us exit the loop
+        # in the first place.
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     full_content = "".join(content_parts)
     tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
@@ -397,39 +443,88 @@ def _stream_one_call(
 )
 def generate_text(
     *,
-    client: OpenAI,
+    client: Any,
     model: str,
     system: str,
     user: str,
     max_tokens: int = 1200,
     temperature: float = 0.2,
+    provider_id: str | None = None,
+    api_key: str | None = None,
 ) -> str:
     """One-shot, non-streamed chat completion.
 
-    Used by the git push flow for commit messages and PR titles/bodies
-    where streaming and tool calling are unnecessary. Lives here (rather
-    than in ``streamlit_app.py``) so the architectural rule of "every
-    chat-completion call goes through ``agent.py``" stays intact and the
-    call appears in W&B Weave traces alongside agent turns.
+    Used by the git push flow for commit messages, PR titles/bodies,
+    and chat title / description generation, where streaming and tool
+    calling are unnecessary. Lives here (rather than in any UI
+    module) so the architectural rule of "every chat-completion call
+    goes through ``agent.py``" stays intact and the call appears in
+    W&B Weave traces alongside agent turns.
+
+    Multi-provider routing: ``provider_id`` is auto-derived from the
+    qualified model id (``<provider>:<raw>``) when not explicitly
+    passed. The function consumes the OpenAI-shape stream from
+    :func:`chat_streams.stream_chat` and concatenates the text deltas
+    instead of calling the underlying SDK directly — this keeps the
+    four-way dispatch in one place (``chat_streams.stream_chat``)
+    and means a future provider added there is automatically picked
+    up by ``generate_text`` without further changes.
 
     Returns the trimmed assistant content. Empty string if the model
     produced no text (which the caller should treat as an error and
-    surface to the user).
+    surface to the user). ``max_tokens`` and ``temperature`` are
+    passed via the underlying SDK's standard kwargs only when the
+    provider supports them — for now we ignore them on the
+    non-streaming path since we route through the streaming layer
+    (the agent loop already discards token / temp tuning at that
+    level).
     """
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        stream=False,
-        max_tokens=max_tokens,
-        temperature=temperature,
+    # Resolve the provider + raw model id.
+    if provider_id is None and is_qualified(model):
+        provider_id = model_provider(model)
+    if provider_id is None:
+        provider_id = "wandb"
+    raw_model = unqualified(model) if is_qualified(model) else model
+    provider = providers.get_provider(provider_id)
+    if provider is None:
+        raise ValueError(f"Unknown provider id: {provider_id!r}")
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    # Drain the streaming response and concatenate text deltas. The
+    # native paths in ``chat_streams.stream_chat`` synthesize OpenAI-
+    # shape chunks via SimpleNamespace, so reading
+    # ``chunk.choices[0].delta.content`` works uniformly.
+    parts: list[str] = []
+    stream = chat_streams.stream_chat(
+        provider=provider,
+        api_key=api_key or "",
+        client=client,
+        model=raw_model,
+        messages=messages,
+        tools=None,
     )
-    if not response.choices:
-        return ""
-    content = response.choices[0].message.content or ""
-    return content.strip()
+    try:
+        for chunk in stream:
+            if not getattr(chunk, "choices", None):
+                continue
+            delta = chunk.choices[0].delta
+            content_piece = getattr(delta, "content", None)
+            if content_piece:
+                parts.append(content_piece)
+    finally:
+        # Best-effort close — generators have ``.close()`` and the
+        # OpenAI SDK Stream has it too. Mirrors the cleanup pattern
+        # in ``_stream_one_call``.
+        try:
+            stream.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    return "".join(parts).strip()
 
 
 @_op(
@@ -440,11 +535,16 @@ def generate_text(
 )
 def run_agent_turn(
     *,
-    client: OpenAI,
+    client: Any,
     model: str,
     messages: list[dict[str, Any]],
     working_dir: Path,
     mode: Literal["agent", "ask"] = "agent",
+    provider_id: str | None = None,
+    api_key: str | None = None,
+    chat_id: str | None = None,
+    provider_keys: dict[str, str] | None = None,
+    clients: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Drive one user turn through the model + tool loop.
 
@@ -475,7 +575,12 @@ def run_agent_turn(
     so the UI can show which skills (and via which trigger) were spliced
     into the system prompt for this turn.
     """
-    ctx = ToolContext(working_dir=working_dir)
+    ctx = ToolContext(
+        working_dir=working_dir,
+        chat_id=chat_id,
+        provider_keys=provider_keys,
+        clients=clients,
+    )
 
     proj_ctx = project_context.scan(working_dir)
     last_user = ""
@@ -544,7 +649,14 @@ def run_agent_turn(
     done = False
     while not done:
         try:
-            stream_events = _stream_one_call(client, model, messages, tools)
+            stream_events = _stream_one_call(
+                client,
+                model,
+                messages,
+                tools,
+                provider_id=provider_id,
+                api_key=api_key,
+            )
             pending_tool_calls: list[dict[str, Any]] = []
             saw_final = False
 
