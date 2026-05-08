@@ -19,7 +19,14 @@ Owns:
   W&B-only flow. ``on_connect`` is retained as a thin shim that calls
   ``connect_provider("wandb", ...)`` so the auto-connect path in
   ``streamlit_app._maybe_auto_connect`` and the legacy callers in
-  ``app_pages/settings.py`` keep working unchanged.
+  ``app_pages/settings.py`` keep working unchanged. For the W&B
+  Inference provider specifically, these callbacks also drive the
+  auto-managed W&B Official MCP server lifecycle via
+  :meth:`mcp_servers.MCPRegistry.upsert_wandb_server` /
+  :meth:`disable_wandb_server` / :meth:`remove_wandb_server`, so a
+  single API key gets the user both chat completions and W&B's hosted
+  MCP tools (Weave traces, support bot, run/report helpers) without a
+  second copy-paste step.
 - The GitHub PAT verify-and-save / sign-out callbacks.
 - The theme-switcher callbacks (segmented-control ``on_change`` +
   the migration-detection callback fired by ``theme_switcher``).
@@ -39,6 +46,7 @@ from pathlib import Path
 import streamlit as st
 
 import account
+import mcp_servers
 import model_catalog
 import providers
 from wb_client import init_weave
@@ -311,6 +319,33 @@ def connect_provider(provider_id: str) -> None:
             ss.connect_error = ss.connect_errors[provider_id]
         return
 
+    # ``model_catalog.refresh`` swallows /v1/models failures internally
+    # (it has its own try/except so a flaky provider doesn't blow up
+    # the whole catalog), stashing the error message in
+    # ``model_catalog._state.errors[provider_id]`` and returning the
+    # previously-cached entries (empty on a fresh connect). The outer
+    # ``except`` above never fires in that case, so we explicitly read
+    # the catalog-side error key here and surface it as a connect
+    # failure — without this, a 401 / network blip / SDK-shape
+    # mismatch silently renders as ``Connected · 0 models`` in the
+    # Settings card, which is genuinely confusing.
+    catalog_error = model_catalog.errors().get(provider_id)
+    if catalog_error:
+        clients = dict(ss.clients)
+        clients[provider_id] = None
+        ss.clients = clients
+        pm = dict(ss.provider_models)
+        pm[provider_id] = []
+        ss.provider_models = pm
+        errors = dict(ss.connect_errors)
+        errors[provider_id] = f"Could not connect to {provider.label}: {catalog_error}"
+        ss.connect_errors = errors
+        if provider_id == "wandb":
+            ss.client = None
+            ss.models = []
+            ss.connect_error = ss.connect_errors[provider_id]
+        return
+
     # The Settings card status caption + chat picker both consume the
     # raw-id list, while the picker's row layout reads the full
     # ``ModelInfo`` from ``model_catalog``. We keep ``provider_models``
@@ -366,6 +401,23 @@ def connect_provider(provider_id: str) -> None:
             ss.weave_url = None
             ss.weave_error = str(e)
 
+        # Auto-configure the hosted W&B MCP server using the same API key
+        # as the bearer token. This gives the user W&B's Weave / runs /
+        # SupportBot tools without a second copy-paste; the entry shows
+        # up in the Settings page MCP card with a manual enable/disable
+        # toggle so users who only want chat completions can opt out.
+        # Failure is non-fatal: any startup hiccup (network blip, key
+        # accepted by the inference endpoint but rejected by the MCP
+        # endpoint, MCP server transient outage) surfaces as a
+        # ``ServerStatus.error`` inside the MCP card; the W&B Inference
+        # connection stays live regardless. We swallow exceptions here
+        # so a registry-level oddity (e.g. a failed first-time disk
+        # write) cannot crash the Connect flow.
+        try:
+            mcp_servers.get_registry().upsert_wandb_server(api_key)
+        except Exception:  # noqa: BLE001 — auto-config must never break Connect
+            pass
+
     # Persist the key (or clear it if the user un-ticked Remember).
     _persist_provider_key(provider_id)
 
@@ -390,6 +442,16 @@ def disconnect_provider(provider_id: str) -> None:
     errors[provider_id] = None
     ss.connect_errors = errors
 
+    # Also clear any catalog-side error from a prior failed listing,
+    # so the model picker's per-source error chip stops surfacing
+    # a stale message after the user has explicitly disconnected.
+    # The catalog hangs on to entries from the last successful refresh
+    # (so a flaky provider doesn't blank out the UI on every blip),
+    # but the error chip is meant for the ACTIVE failure path —
+    # disconnect is the user telling us they're done with this
+    # provider for now.
+    model_catalog._state.errors.pop(provider_id, None)  # noqa: SLF001
+
     if provider_id == "wandb":
         ss.client = None
         ss.models = []
@@ -398,6 +460,16 @@ def disconnect_provider(provider_id: str) -> None:
         ss.weave_url = None
         ss.weave_error = None
         ss.connect_error = None
+
+        # Take the auto-managed W&B MCP server out of circulation when
+        # the user disconnects W&B Inference. We disable rather than
+        # delete so the row stays visible in the Settings card with a
+        # clear "Disabled" caption (and a toggle to re-enable without
+        # waiting for the next Connect).
+        try:
+            mcp_servers.get_registry().disable_wandb_server()
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
 
 
 def forget_provider_key(provider_id: str) -> None:
@@ -430,6 +502,14 @@ def forget_provider_key(provider_id: str) -> None:
         for k in ("_api_key_input", "_remember_input"):
             if k in ss:
                 del ss[k]
+        # Wipe the auto-managed W&B MCP server entry too — the user
+        # asked to forget the W&B credentials, and the bearer token
+        # lives inside ``mcp.json`` (mode 0600, but still on disk) so
+        # leaving it behind would defeat the user's stated intent.
+        try:
+            mcp_servers.get_registry().remove_wandb_server()
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -3,21 +3,33 @@
 Pure module — no Streamlit imports — so it can be unit-tested in
 isolation. The actual chat-completion call still routes through
 :func:`agent.generate_text`, which is the single non-streaming caller
-of ``client.chat.completions.create`` (per the AGENTS.md "single LLM
+of provider chat-completion APIs (per the AGENTS.md "single LLM
 caller" rule). The diff blob fed to the model is built by
 :func:`git_ops.combined_diff_for_paths` so the per-file walk + the
 200 KB cap live in one place.
 
+Each public helper takes an explicit ``model`` argument (the chat's
+currently selected qualified id, ``<provider>:<raw>``) and the
+matching per-provider client. The chat-page sync pipeline is the
+caller — it resolves ``ss.clients[provider_id]`` and passes both in.
+:func:`agent.generate_text` extracts the provider id from the
+qualified model id and dispatches to the right SDK underneath, so
+this module never has to care which provider the user picked.
+
+That contract is what makes the Sync flow's commit messages + PR
+descriptions track the user's selected chat model: a user on
+Anthropic / OpenAI / Google / Mistral / xAI / W&B / OpenRouter all
+get *their* provider's model writing the commit message, rather
+than a forced cross-provider DeepSeek round-trip. Historically this
+module hard-coded ``agent.DEEPSEEK_MODEL``; that gated AI commits to
+W&B accounts that had DeepSeek listed and surprised users who picked
+a different model for their conversation.
+
 Public surface:
 
 - :data:`COMMIT_MSG_SYSTEM` / :data:`PR_DESC_SYSTEM` — prompt templates.
-- :func:`generate_commit_message` — one-shot conventional-commit
-  message for the staged paths.
-- :func:`generate_pr_description` — one-shot ``(title, body)`` tuple,
-  with tolerant JSON parsing so a malformed model output still returns
-  *something* the user can edit.
-- :func:`is_deepseek_available` — trivial membership check the chat
-  page calls before showing the AI affordances.
+- :func:`generate_commit_message(client, working_dir, paths, *, model)`.
+- :func:`generate_pr_description(client, working_dir, paths, branch, base, *, model)`.
 """
 from __future__ import annotations
 
@@ -26,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import git_ops
-from agent import DEEPSEEK_MODEL, generate_text
+from agent import generate_text
 
 
 COMMIT_MSG_SYSTEM = (
@@ -54,38 +66,27 @@ PR_DESC_SYSTEM = (
 )
 
 
-def is_deepseek_available(models: list[str] | None) -> bool:
-    """Return True if DeepSeek V4-Flash is in the connected account's model list.
-
-    Accepts either qualified ids (``"wandb:deepseek-ai/DeepSeek-V4-Flash"``)
-    or bare ids (``"deepseek-ai/DeepSeek-V4-Flash"``) — the chat page may
-    pass ``ss.provider_models["wandb"]`` (raw ids) or the catalog's
-    qualified ids depending on which call site is checking.
-    """
-    if not models:
-        return False
-    # ``DEEPSEEK_MODEL`` is the qualified ``wandb:<raw>`` form.
-    raw_id = DEEPSEEK_MODEL.split(":", 1)[1] if ":" in DEEPSEEK_MODEL else DEEPSEEK_MODEL
-    return DEEPSEEK_MODEL in models or raw_id in models
-
-
 def generate_commit_message(
     client: Any,
     working_dir: Path,
     paths: list[str],
     *,
+    model: str,
     api_key: str = "",
 ) -> str:
-    """Ask DeepSeek for a conventional-commit message describing ``paths``.
+    """Ask ``model`` for a conventional-commit message describing ``paths``.
 
     Returns ``""`` when the diff is empty (nothing to summarize) so the
     caller can fall back to a stub message instead of submitting an
-    empty string. ``client`` is the user's W&B-configured
-    ``openai.OpenAI`` instance (W&B Inference is ``openai_compat``,
-    dispatched through the OpenAI SDK with W&B's ``base_url``);
-    ``DEEPSEEK_MODEL`` is the qualified ``wandb:...`` id that pins
-    routing to that provider. ``api_key`` is accepted for back-compat
-    with older callers and is otherwise unused.
+    empty string.
+
+    ``client`` must be the per-provider client matching the qualified
+    ``model`` id (the chat-page sync pipeline is responsible for
+    resolving ``ss.clients[provider_id]`` and passing it here);
+    :func:`agent.generate_text` extracts the provider id from
+    ``model`` and dispatches to the right SDK underneath. ``api_key``
+    is accepted for back-compat with older callers and is otherwise
+    unused — the client carries its own credentials.
     """
     diff = git_ops.combined_diff_for_paths(working_dir, paths)
     if not diff.strip():
@@ -96,7 +97,7 @@ def generate_commit_message(
     )
     return generate_text(
         client=client,
-        model=DEEPSEEK_MODEL,
+        model=model,
         system=COMMIT_MSG_SYSTEM,
         user=user,
         max_tokens=500,
@@ -111,15 +112,19 @@ def generate_pr_description(
     branch: str,
     base: str,
     *,
+    model: str,
     api_key: str = "",
 ) -> tuple[str, str]:
-    """Ask DeepSeek for a PR title + body. Returns ``(title, body)``.
+    """Ask ``model`` for a PR title + body. Returns ``(title, body)``.
 
     Tolerant JSON parsing: when the model emits invalid JSON we treat
     the whole response as the body and synthesize a title from its
     first non-empty line. That way the user always has *something*
-    pre-filled in the GitHub compare URL even on a model misfire —
+    pre-filled in the platform compare URL even on a model misfire —
     they can still edit both fields before submitting the PR.
+
+    See :func:`generate_commit_message` for the ``client`` / ``model``
+    routing contract.
     """
     diff = git_ops.combined_diff_for_paths(working_dir, paths)
     if not diff.strip():
@@ -131,7 +136,7 @@ def generate_pr_description(
     )
     raw = generate_text(
         client=client,
-        model=DEEPSEEK_MODEL,
+        model=model,
         system=PR_DESC_SYSTEM,
         user=user,
         max_tokens=1500,

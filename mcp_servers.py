@@ -1,7 +1,7 @@
 """MCP (Model Context Protocol) runtime + on-disk config for the agent.
 
-This module owns every interaction with external MCP servers. It exposes two
-things to the rest of the app:
+This module owns every interaction with external MCP servers. It exposes
+three things to the rest of the app:
 
 1. :class:`MCPRegistry` — a process-wide singleton (see :func:`get_registry`)
    that loads/saves ``~/.wb_coding_agent/mcp.json``, opens persistent client
@@ -13,6 +13,18 @@ things to the rest of the app:
    ``tools=[...]`` payload the chat-completion API wants. Every MCP tool is
    namespaced as ``mcp__<server_id>__<tool_name>`` so the agent loop can
    route tool calls back here without ambiguity.
+3. The auto-managed W&B Official MCP server lifecycle —
+   :meth:`MCPRegistry.upsert_wandb_server` /
+   :meth:`MCPRegistry.disable_wandb_server` /
+   :meth:`MCPRegistry.remove_wandb_server`. Wired from
+   :mod:`actions` on Connect / Disconnect / Forget for the W&B Inference
+   provider so a single API key gets the user both chat completions and
+   W&B's hosted MCP tools (Weave traces, support bot, run/report
+   helpers — see https://docs.wandb.ai/platform/mcp-server) without any
+   second copy-paste step. The reserved id is
+   :data:`WANDB_MCP_SERVER_ID` and is namespaced by
+   :data:`MANAGED_SERVER_ID_PREFIX` so a hand-added entry can never
+   collide with the managed one.
 
 Why a background asyncio loop?
 ------------------------------
@@ -90,6 +102,36 @@ CONFIG_FILE = CONFIG_DIR / "mcp.json"
 # the dispatch fork.
 TOOL_NAME_PREFIX = "mcp__"
 TOOL_NAME_SEPARATOR = "__"
+
+# ---------------------------------------------------------------------------
+# Auto-managed W&B Official MCP server
+# ---------------------------------------------------------------------------
+# Whenever the user has connected a W&B Inference API key, the app
+# automatically configures the W&B-hosted MCP server (Weave traces, support
+# bot, run/report tools) using the same key as the bearer token. The
+# upsert / disable / remove helpers on :class:`MCPRegistry` are wired from
+# :mod:`actions` on Connect / Disconnect / Forget so the user gets W&B's
+# tools without copy-pasting headers, and the server is consistently torn
+# down when they sign out. The ``id`` is namespaced with the
+# ``MANAGED_SERVER_ID_PREFIX`` so it cannot collide with a hand-added entry
+# (``make_server_id`` strips leading underscores from user input). The URL
+# and required ``Accept`` header are documented at
+# https://docs.wandb.ai/platform/mcp-server.
+MANAGED_SERVER_ID_PREFIX = "_managed__"
+WANDB_MCP_SERVER_ID = MANAGED_SERVER_ID_PREFIX + "wandb_official"
+WANDB_MCP_SERVER_NAME = "W&B Official"
+WANDB_MCP_URL = "https://mcp.withwandb.com/mcp"
+
+
+def is_managed_server_id(server_id: str) -> bool:
+    """Return ``True`` if ``server_id`` belongs to an app-managed entry.
+
+    Used by the Settings page to render a small "Auto-configured by W&B
+    Inference" caption + lock the Edit / Delete affordances; users still
+    get a manual enable/disable toggle so they can opt out of the tools
+    without disconnecting W&B Inference itself.
+    """
+    return isinstance(server_id, str) and server_id.startswith(MANAGED_SERVER_ID_PREFIX)
 
 # OpenAI's tool-name validation only accepts a-z/A-Z/0-9/_ and limits the
 # length to 64 characters. We sanitize both server ids and tool names to fit
@@ -384,6 +426,80 @@ class MCPRegistry:
             self.statuses.pop(server_id, None)
         self.save()
 
+    # ---- managed (W&B) server lifecycle ----
+
+    def upsert_wandb_server(self, api_key: str) -> None:
+        """Ensure the W&B Official MCP server entry is present and enabled.
+
+        Idempotent: on the first Connect this calls :meth:`add` (creating
+        the entry on disk and reconciling a live session); on subsequent
+        Connects it calls :meth:`update` so a rotated API key flows through
+        to the bearer header and the live session is re-opened with the
+        new credentials. A no-op when ``api_key`` is empty so an
+        accidental call from a half-completed Connect cannot wipe a
+        previously-good entry.
+
+        The user can still disable the entry via the Settings card's
+        per-row toggle; this method always sets ``enabled=True`` because
+        clicking Connect is an explicit "I want W&B's tools" signal —
+        the toggle is for users who want W&B Inference for chat without
+        the MCP tools polluting the agent's tool list.
+        """
+        api_key = (api_key or "").strip()
+        if not api_key:
+            return
+        config = _build_wandb_managed_config(api_key)
+        with self._mutex:
+            exists = any(c.id == WANDB_MCP_SERVER_ID for c in self.configs)
+        if exists:
+            self.update(config)
+        else:
+            self.add(config)
+
+    def disable_wandb_server(self) -> None:
+        """Disable the W&B Official MCP server (idempotent).
+
+        Wired from the W&B Inference disconnect callback so signing out
+        also takes the MCP tools out of circulation; we keep the entry
+        on disk (rather than deleting it) so the user's manual edits, if
+        any, are preserved across the next Connect — and so the row
+        stays visible in the MCP card with a clear "Disabled" status
+        rather than vanishing without explanation.
+        """
+        with self._mutex:
+            existing = next(
+                (c for c in self.configs if c.id == WANDB_MCP_SERVER_ID),
+                None,
+            )
+            if existing is None or not existing.enabled:
+                return
+            new_config = ServerConfig(
+                id=existing.id,
+                name=existing.name,
+                transport=existing.transport,
+                command=existing.command,
+                args=list(existing.args),
+                env=dict(existing.env),
+                url=existing.url,
+                headers=dict(existing.headers),
+                enabled=False,
+            )
+        # ``update`` re-acquires the mutex internally; release it first.
+        self.update(new_config)
+
+    def remove_wandb_server(self) -> None:
+        """Remove the W&B Official MCP server entry entirely (idempotent).
+
+        Wired from the W&B Inference "Forget key" callback so erasing
+        the saved API key also wipes the bearer-token-bearing entry on
+        disk; otherwise the token would persist in ``mcp.json`` despite
+        the user's stated intent to forget it.
+        """
+        with self._mutex:
+            exists = any(c.id == WANDB_MCP_SERVER_ID for c in self.configs)
+        if exists:
+            self.remove(WANDB_MCP_SERVER_ID)
+
     # ---- session lifecycle ----
 
     def reconcile(self) -> None:
@@ -659,6 +775,27 @@ def make_server_id(name: str) -> str:
     if not base:
         base = uuid.uuid4().hex[:8]
     return base
+
+
+def _build_wandb_managed_config(api_key: str) -> ServerConfig:
+    """Construct the canonical ServerConfig for the W&B Official MCP server.
+
+    Headers follow W&B's own configuration recipe at
+    https://docs.wandb.ai/platform/mcp-server: bearer-token auth using the
+    user's W&B API key plus the ``Accept`` header the streamable-HTTP
+    endpoint expects (``application/json, text/event-stream``).
+    """
+    return ServerConfig(
+        id=WANDB_MCP_SERVER_ID,
+        name=WANDB_MCP_SERVER_NAME,
+        transport="http",
+        url=WANDB_MCP_URL,
+        headers={
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Accept": "application/json, text/event-stream",
+        },
+        enabled=True,
+    )
 
 
 _REGISTRY: MCPRegistry | None = None

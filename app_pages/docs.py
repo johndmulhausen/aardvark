@@ -210,30 +210,61 @@ def _render_agent_tab() -> None:
         "Once the chat is idle again it disappears on its own."
     )
 
-    st.markdown("##### The git row")
+    st.markdown("##### The actions row")
     st.markdown(
-        "Just below the chat input, when your folder is a git project, "
-        "you'll see a strip of git controls: a branch picker, a **+** "
-        "button for a new branch, a cloud-arrow button to fetch from "
-        "the remote, and a **Push** button. The Git tab in this guide "
-        "covers each of these in detail."
+        "Just below the chat input, every chat shows a single strip of "
+        "controls for picking a folder and working with git. From left "
+        "to right:"
     )
-
-    st.markdown("##### The Changes button")
     st.markdown(
-        "Right below the git row, when your folder has unsaved "
-        "changes, you'll see a **Changes** button showing how many "
-        "files have changed and how many lines were added or removed. "
-        "Click it to open a window listing every changed file. Each "
-        "file has its own collapsible section with a green-and-red "
-        "view of what was added or removed."
+        "- **Working directory** dropdown — picks the folder the agent "
+        "is allowed to read and edit. Two helper options live at the "
+        "top of the list, both prefixed with a small **›** so they "
+        "stand apart from real folders below: **Browse for a folder...** "
+        "opens a normal OS file picker, and **Start a new project...** "
+        "opens a small window that creates a fresh project. Picking "
+        "either option runs the action and then sets the dropdown to "
+        "the folder you ended up on, so the helper labels never stick "
+        "around as the chosen folder.\n"
+        "- **Branch picker** — switches between branches (a branch is "
+        "an independent line of work in git). Two helper options live "
+        "at the top of the list, both prefixed with the same **›** "
+        "marker as the working-directory helpers: **New branch...** "
+        "opens a small window to create a new branch off the current "
+        "one (any unsaved changes come with you onto the new branch), "
+        "and **Fetch upstream branches** runs `git fetch` so the "
+        "branch list and behind/ahead status reflect the latest remote "
+        "state (without changing any of your files). Picking either "
+        "option runs the action and then snaps the dropdown back to "
+        "your current branch, so the helper labels never stick around "
+        "as the chosen branch. The rest of the list shows your local "
+        "branches followed by remote-only branches; picking a remote-"
+        "only entry checks it out as a new local branch in one click. "
+        "If you have unsaved changes, switching branches tries to "
+        "bring them with you; git only complains when the target "
+        "branch would overwrite a dirty file.\n"
+        "- **Changes** — opens a window listing every changed file. "
+        "Each file has its own collapsible section with a green-and-"
+        "red view of what was added or removed.\n"
+        "- **Sync** — the big primary button on the right. Commits "
+        "anything dirty (with an AI-drafted message), pulls down "
+        "upstream changes if there are any, pushes up your local "
+        "commits, and always fetches the latest list of branches "
+        "from the remote so the branch dropdown above stays current. "
+        "Covered in depth in the **Git** tab."
     )
     st.caption(
-        "The button is hidden when nothing has changed, when your "
-        "folder isn't a git project, or when git isn't installed."
+        "Until you pick a folder, only the **Working directory** "
+        "dropdown shows up — the git controls are hidden because "
+        "there's nothing for them to act on yet. Once you pick a "
+        "folder, the three git controls appear. From that point on "
+        "they stay in place even when they're not usable — they're "
+        "just disabled (not hidden) when your folder isn't a git "
+        "project or git isn't installed, so the row doesn't shift "
+        "around as you change folders."
     )
 
-    st.markdown("##### The Working directory dropdown")
+    st.markdown("##### Picking a folder")
     st.markdown(
         "The dropdown labeled **Working directory** picks the folder "
         "the agent is allowed to read and edit (also called the "
@@ -242,13 +273,17 @@ def _render_agent_tab() -> None:
     st.markdown(
         "- Pick a recent folder from the dropdown.\n"
         "- Paste any path and hit Enter.\n"
-        "- Click the **folder icon** to open a normal file picker.\n"
-        "- Click the **+ folder icon** to start a brand-new project."
+        "- Pick **Browse for a folder...** at the top of the list "
+        "(the **›** prefix marks it as a helper action rather than a "
+        "real folder) to open a normal file picker.\n"
+        "- Pick **Start a new project...** right below it (same **›** "
+        "marker) to create a brand-new project."
     )
     with st.expander("What does \"Start a new project\" do?"):
         st.markdown(
-            "The **+ folder** button opens a small window that helps "
-            "you set up a fresh project. You can:"
+            "Picking **Start a new project...** at the top of the "
+            "Working directory dropdown opens a small window that "
+            "helps you set up a fresh project. You can:"
         )
         st.markdown(
             "- **Make an empty folder** with git already set up.\n"
@@ -264,19 +299,29 @@ def _render_agent_tab() -> None:
             "GitHub) verified on the Settings page first."
         )
 
-    st.markdown("##### The Project context expander")
+    st.markdown("##### The Project context button")
     st.markdown(
         "If your folder has special files like `AGENTS.md`, "
         "`CLAUDE.md`, `CONVENTIONS.md`, or a `.cursor/rules/` folder, "
         "the app finds them and quietly hands them to the AI as "
-        "background context on every message. The expander labeled "
-        "**Project context** shows you exactly what was found."
+        "background context on every message. To the right of the "
+        "Model dropdown is a **Project context** button — click it "
+        "to open a small window that shows you exactly what was found."
     )
     st.markdown(
-        "It also lists any **skills** (a small file with extra "
-        "instructions the AI loads when your message matches it) the "
-        "app discovered, both in your folder and globally on your "
-        "computer."
+        "The window also lists any **skills** (a small file with "
+        "extra instructions the AI loads when your message matches "
+        "it) the app discovered, both in your folder and globally on "
+        "your computer. Close the window with the X, the Esc key, or "
+        "the Close button — your chat input and the rest of the page "
+        "stay exactly where they were, since the window is an overlay "
+        "rather than an inline panel."
+    )
+    st.caption(
+        "When your folder has no detected guidance files or skills, "
+        "the Project context button is disabled and its tooltip "
+        "explains how to add some (drop an `AGENTS.md` or a "
+        "`.cursor/skills/` folder into the working directory)."
     )
 
     st.markdown("##### Mode")
@@ -318,19 +363,13 @@ def _render_agent_tab() -> None:
         "from the dropdown."
     )
 
-    st.markdown("##### The Skills popover")
-    st.markdown(
-        "To the right of the Model dropdown is a button labeled with "
-        "the skill count, like `5 skills`. Click it to see every "
-        "skill available in this folder, each with a one-line "
-        "description and the keywords that turn it on."
-    )
 
     st.subheader("Attaching files to a message")
     st.markdown(
-        "The chat input has a paperclip icon on the right. Click it "
-        "(or drag files onto the chat input) to attach files to your "
-        "next message. Supported types:"
+        "The chat input has a paperclip button on the right, sitting "
+        "right next to the send button. Click the paperclip (or drag "
+        "files onto the chat input) to attach files to your next "
+        "message. Supported types:"
     )
     st.markdown(
         "- **Images** (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) — "
@@ -401,6 +440,30 @@ def _render_agent_tab() -> None:
         "- **Just say a keyword** from the skill's description. The app "
         "watches your message and turns on any skill whose keywords "
         "match. Up to 5 skills can load this way at once."
+    )
+    st.markdown(
+        "**How to tell the AI actually used the skill.** When a skill "
+        "loads, two things appear in your reply: first, a small caption "
+        "above the AI's message that says `Loaded N skill(s)` — that's "
+        "the app confirming it sent the skill's instructions to the AI. "
+        "Second, the AI's reply should start with a single line like "
+        "`Following: /refactor` listing every active skill — that's the "
+        "AI itself confirming it read them. Both lines together give "
+        "you a strong signal the skill was applied. If you ever see the "
+        "first caption but not the second line, the AI may have skimmed "
+        "past the skill (some smaller models do this); try a stronger "
+        "model from the model picker."
+    )
+    st.caption(
+        "One small detail: when you type something like `/refactor make "
+        "this faster`, the AI receives just `make this faster` — the "
+        "slash command itself is treated as a label and stripped before "
+        "your message is sent. You'll still see your full message "
+        "(including the `/refactor` part) in your own chat history; "
+        "only the AI's view of it is cleaned up. Any slash that doesn't "
+        "match a real skill (like a path `/usr/local/bin`) is left "
+        "alone, so you don't have to worry about command-line snippets "
+        "or file paths getting corrupted."
     )
     st.caption(
         "Skills can live in two places: inside your project folder "
@@ -574,58 +637,99 @@ def _render_git_tab() -> None:
         "need."
     )
 
-    st.subheader("The git row at the bottom of the page")
+    st.subheader("The actions row at the bottom of the page")
     st.markdown(
-        "When your folder is a git project, you'll see a strip of "
-        "controls just below the chat input (and just above the "
-        "**Changes** button):"
+        "Every chat shows a single strip of file and git controls just "
+        "below the chat input. Until you pick a folder, only the "
+        "**Working directory** dropdown shows up — the git controls "
+        "appear once a folder is picked. From that point on the git "
+        "cells stay in place even when they're not usable; they're "
+        "just disabled (not hidden) when your folder isn't a git "
+        "project, so the row layout stays stable as you change "
+        "folders:"
     )
 
     st.markdown("##### The branch picker")
     st.markdown(
         "A **branch** is a separate copy of your work where you can "
-        "try things out. The dropdown shows the branches that exist on "
-        "your computer first, then any branches that only exist on the "
-        "remote (a copy of the project hosted somewhere else, like "
-        "GitHub). Pick a branch and the app switches to it."
+        "try things out. Two helper options sit at the top of the "
+        "dropdown, both prefixed with a small **›** so they read as "
+        "helper actions rather than as real branches:"
+    )
+    st.markdown(
+        "- **New branch...** — opens a small window that asks for a "
+        "name, creates a new branch based on whatever you have right "
+        "now (any unsaved changes come along), and switches you to it.\n"
+        "- **Fetch upstream branches** — pulls down the latest list of "
+        "branches and changes from the remote (a copy of the project "
+        "hosted somewhere else, like GitHub), **without** changing any "
+        "of your files. Use it when you want to see what's been added "
+        "on the remote since you last looked. After it runs, the "
+        "dropdown above refreshes so any new remote branches show up "
+        "(and any deleted on the remote disappear)."
+    )
+    st.markdown(
+        "Below those two helpers, the dropdown shows the branches that "
+        "exist on your computer first, then any branches that only "
+        "exist on the remote. Pick a branch and the app switches to it."
     )
     st.caption(
         "Picking a remote-only branch automatically makes a matching "
-        "local branch on your computer first, then switches to it."
+        "local branch on your computer first, then switches to it. "
+        "Switching with unsaved changes brings them along when there's "
+        "no conflict; if a conflict would happen, git refuses with a "
+        "clear message and you stay on the current branch. Picking a "
+        "helper option (**New branch...** or **Fetch upstream "
+        "branches**) runs the action and then snaps the dropdown back "
+        "to your current branch, so the helper labels never stick "
+        "around as the chosen branch."
     )
 
-    st.markdown("##### The \"+\" button")
+    st.markdown("##### The Sync button")
     st.markdown(
-        "Click the **+** to make a new branch based on whatever you "
-        "have right now. A small window asks for the new branch's "
-        "name, then switches you to it. Any unsaved changes come "
-        "along."
-    )
-
-    st.markdown("##### The fetch button")
-    st.markdown(
-        "The cloud-with-an-arrow button pulls down the latest list of "
-        "branches and changes from the remote, **without** changing "
-        "any of your files. Use it when you want to see what's been "
-        "added on GitHub since you last looked."
-    )
-
-    st.markdown("##### The Push button")
-    st.markdown(
-        "The **Push** button is the big one. It saves your work and "
-        "sends it up to the remote. Here's exactly what it does:"
+        "The **Sync** button is the big one. It's a **two-way sync** "
+        "with the remote — it brings down anyone else's changes *and* "
+        "sends up your work, in one click. Here's exactly what it "
+        "does:"
     )
     st.markdown(
-        "1. **Asks an AI model to write a short commit message** "
-        "describing your changes (a **commit** is one saved snapshot "
-        "of your code, with a message that says what changed).\n"
-        "2. **Stages every file you've changed** — this is git's term "
-        "for marking which files belong in the next commit.\n"
-        "3. **Saves them as one commit**, with the AI-written message.\n"
-        "4. **Pulls down anyone else's changes** and replays your new "
-        "commit on top — this is called a **rebase** (replay your "
-        "local commits on top of the latest remote changes).\n"
-        "5. **Sends everything up to the remote.**"
+        "1. **If you have unsaved changes**, it asks an AI model to "
+        "write a short commit message describing them (a **commit** "
+        "is one saved snapshot of your code, with a message that "
+        "says what changed), then stages every changed file and "
+        "saves the commit.\n"
+        "2. **Always fetches** the latest list of branches and "
+        "commits from the remote, and refreshes the branch dropdown "
+        "above so any new remote branches show up (and any branches "
+        "deleted on the remote disappear).\n"
+        "3. **If the remote has new commits you don't have**, pulls "
+        "them down and replays your local commits on top — this is "
+        "called a **rebase** (replay your local commits on top of "
+        "the latest remote changes).\n"
+        "4. **If you have local commits the remote doesn't have**, "
+        "pushes them up.\n"
+        "5. **If neither side has new commits**, it just confirms "
+        "you're already in sync — but the fetch in step 2 still "
+        "ran, so the branch list is up to date."
+    )
+    st.markdown(
+        "The model that writes the commit message is **whichever "
+        "one you've picked for your chat** (in the model picker "
+        "below the chat input). So if your chat is using Claude, "
+        "Claude writes the commit message; if it's using Gemini, "
+        "Gemini does; and so on. The same goes for the pull-request "
+        "title and description on the **Push and open a pull request** "
+        "path below."
+    )
+    st.markdown(
+        "Sync stays enabled whenever you're inside a git project on "
+        "a real branch (not a half-finished merge or rebase), even "
+        "when there's nothing local to commit and nothing on the "
+        "remote to pull — clicking it then is the easiest way to "
+        "ask \"what new branches has anyone pushed since I last "
+        "looked?\" without leaving the app. A pull-only or "
+        "fetch-only sync doesn't need a model at all, so it works "
+        "even if you haven't picked one yet."
     )
     st.caption(
         "You'll see toast notifications as each step finishes."
@@ -633,7 +737,7 @@ def _render_git_tab() -> None:
 
     st.subheader("First push: publishing a branch")
     st.markdown(
-        "When you push a branch that has never been pushed before, "
+        "When you sync a branch that has never been pushed before, "
         "you'll see a small window asking you to pick:"
     )
     st.markdown(
@@ -642,9 +746,9 @@ def _render_git_tab() -> None:
         "- **Push and open a pull request** — uploads the branch, "
         "then opens a page in your web browser with a draft pull "
         "request (a proposal to merge your branch into the main one, "
-        "reviewed on GitHub) already filled in. The AI writes the "
-        "title and description for you. You just review and click "
-        "submit."
+        "reviewed on GitHub) already filled in. The model you've "
+        "picked for your chat writes the title and description for "
+        "you. You just review and click submit."
     )
     st.caption(
         "Pull requests are supported on GitHub, GitLab, and Bitbucket."
@@ -654,7 +758,7 @@ def _render_git_tab() -> None:
     st.markdown(
         "A **merge conflict** is when two people changed the same "
         "lines in a file, and git can't tell which version to keep. "
-        "It shows up most often during the rebase step of a Push."
+        "It shows up most often during the rebase step of a Sync."
     )
     st.markdown(
         "When this happens, you'll see a yellow warning in the sidebar "
@@ -671,10 +775,11 @@ def _render_git_tab() -> None:
 
     st.subheader("The Changes window")
     st.markdown(
-        "The **Changes** button just below the git row opens a modal "
-        "listing every file that has changed in your folder since the "
-        "last commit. Each file has its own collapsible section with "
-        "a green-and-red diff. Small badges flag files that are:"
+        "The **Changes** button at the right of the actions row opens "
+        "a modal listing every file that has changed in your folder "
+        "since the last commit. Each file has its own collapsible "
+        "section with a green-and-red diff. Small badges flag files "
+        "that are:"
     )
     st.markdown(
         "- **Untracked** — brand-new files git hasn't seen yet.\n"
@@ -682,6 +787,29 @@ def _render_git_tab() -> None:
         "- **Renamed** — files you moved.\n"
         "- **Staged only** — already marked for the next commit.\n"
         "- **Unstaged only** — changed but not yet marked."
+    )
+
+    st.markdown("##### Throwing changes away")
+    st.markdown(
+        "If the agent (or you) made a change you don't want to keep, "
+        "the Changes window has two ways to throw it away — both work "
+        "before you commit, and neither asks the agent to do anything:"
+    )
+    st.markdown(
+        "- **Discard** (next to each file) — undoes just that one "
+        "file's changes. The file goes back to whatever was last "
+        "committed. Brand-new files (untracked) get deleted from your "
+        "folder.\n"
+        "- **Discard all** (top-right of the window) — does the same "
+        "for every file in the list, in one click."
+    )
+    st.markdown(
+        "Clicking either button opens a small popover that asks you "
+        "to confirm — there's no in-app undo, so the popover is your "
+        "last chance to back out. Once you confirm, the changes are "
+        "gone for good. (If you want to keep the changes but stop "
+        "showing them in the diff, commit them or stash them with "
+        "regular git instead.)"
     )
 
     st.subheader("How commits get your name on them")
@@ -694,10 +822,11 @@ def _render_git_tab() -> None:
 
     st.subheader("Cloning and creating GitHub projects")
     st.markdown(
-        "The **Start a new project** button next to the Working "
-        "directory dropdown can clone one of your GitHub repos or "
-        "create a brand-new one for you. Both options need a GitHub "
-        "personal access token verified on the Settings page first."
+        "Picking **Start a new project...** at the top of the "
+        "Working directory dropdown can clone one of your GitHub "
+        "repos or create a brand-new one for you. Both options need "
+        "a GitHub personal access token verified on the Settings "
+        "page first."
     )
     st.caption(
         "Your token is sent only when needed — it never gets saved "
@@ -844,9 +973,14 @@ def _render_settings_tab() -> None:
         "is saved on this computer in a file only you can read. Untick "
         "it if you'd rather paste the key fresh every session.\n"
         "- **Connect / Disconnect / Forget saved API key** — Connect "
-        "logs you in and downloads the list of available models. "
-        "Disconnect just signs you out for this session. **Forget "
-        "saved API key** erases the saved key from your computer."
+        "logs you in and downloads the list of available models. It "
+        "also auto-adds the **W&B Official** entry to your MCP "
+        "servers list (using the same key as the bearer token), so "
+        "the agent can query your runs, Weave traces, and ask the "
+        "W&B SupportBot. Disconnect signs you out for this session "
+        "and disables that MCP entry. **Forget saved API key** "
+        "erases the saved key from your computer and removes the "
+        "MCP entry too."
     )
     st.caption(
         "The next time you open the app, it tries to connect on its "
@@ -887,6 +1021,25 @@ def _render_settings_tab() -> None:
     st.markdown(
         "The MCP servers card lists every server you've added and "
         "lets you turn each on or off."
+    )
+
+    st.markdown("##### The W&B Official server (added for you)")
+    st.markdown(
+        "When you connect **W&B Inference**, the app automatically "
+        "adds an entry called **W&B Official** to your MCP servers "
+        "list. It uses the same API key as the bearer token, so you "
+        "don't need to copy-paste anything else. It's marked with a "
+        "small **auto-configured** badge."
+    )
+    st.markdown(
+        "This server gives the agent tools for working with your "
+        "W&B account directly — looking up runs, querying Weave "
+        "traces, creating reports, asking the W&B SupportBot for "
+        "documentation help. If you'd rather not have those tools "
+        "available, untick its **Enabled** box; the W&B Inference "
+        "connection itself stays live. **Disconnect** on the W&B "
+        "Inference card disables this entry; **Forget key** removes "
+        "it entirely."
     )
 
     st.markdown("##### Adding a server")

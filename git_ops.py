@@ -465,6 +465,107 @@ def unstage_all(working_dir: Path) -> None:
     _run(["reset", "HEAD", "--", "."], cwd=working_dir, check=False, timeout=15)
 
 
+def discard_changes(working_dir: Path, entry: StatusEntry) -> None:
+    """Discard local changes for one file, returning it to its HEAD state.
+
+    Destructive: there is no in-product undo, and the change is wiped
+    from both the index and the worktree atomically. Callers (the chat
+    page's Changes modal) gate this behind an inline-popover confirm.
+
+    Two paths depending on the kind of change:
+
+    - **Untracked** files (those that were never committed and aren't
+      staged either) don't exist at HEAD, so we delete them via
+      ``git clean -fd -- <path>``. ``git clean`` is preferred over
+      ``Path.unlink()`` here because it goes through git's own
+      pathspec resolution and refuses to touch ignored paths by default
+      (``--ignored`` is required to reach those), keeping the operation
+      strictly within the "things git is currently complaining about"
+      surface that the caller is showing the user.
+    - **Tracked** changes (modified, deleted, staged-add, or rename)
+      are reset via
+      ``git restore --source=HEAD --staged --worktree -- <paths>`` so
+      both the index and the worktree return to whatever HEAD says.
+      Files HEAD does have come back; files HEAD does not have are
+      removed from both index and worktree (per ``git restore`` docs:
+      "if a file does not exist in the source tree, the file is
+      removed from the work tree"). Renames pass *both* paths
+      (``orig_path`` and ``path``) so the original file reappears at
+      its original location in one shot and the new path is removed
+      from index + worktree simultaneously — without that pairing,
+      the new path would survive as untracked and the user would have
+      to discard it again.
+    """
+    if entry.is_untracked:
+        _run(
+            ["clean", "-fd", "--", entry.path],
+            cwd=working_dir,
+            timeout=30,
+        )
+        return
+
+    paths = [entry.path]
+    if entry.is_renamed and entry.orig_path and entry.orig_path != entry.path:
+        paths.append(entry.orig_path)
+
+    _run(
+        ["restore", "--source=HEAD", "--staged", "--worktree", "--", *paths],
+        cwd=working_dir,
+        timeout=30,
+    )
+
+
+def discard_all_changes(working_dir: Path, entries: list[StatusEntry]) -> None:
+    """Discard all changes covered by ``entries`` in two batched calls.
+
+    Routes the per-entry logic of :func:`discard_changes` through a
+    single ``git restore`` call for the tracked set and a single
+    ``git clean`` call for the untracked set, so reverting a large
+    working tree takes O(2) git invocations instead of O(N) — fast
+    enough that the chat page's Changes modal can run it in the on-
+    click path without a spinner.
+
+    The caller (chat page's "Discard all" popover) is expected to
+    have already collected the live ``StatusEntry`` list from a
+    fresh ``git_ops.scan`` and gated the call behind a confirm; this
+    helper does no double-checking on its own.
+    """
+    if not entries:
+        return
+
+    tracked_paths: set[str] = set()
+    untracked_paths: list[str] = []
+
+    for entry in entries:
+        if entry.is_untracked:
+            untracked_paths.append(entry.path)
+            continue
+        tracked_paths.add(entry.path)
+        if entry.is_renamed and entry.orig_path and entry.orig_path != entry.path:
+            tracked_paths.add(entry.orig_path)
+
+    if tracked_paths:
+        _run(
+            [
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                *sorted(tracked_paths),
+            ],
+            cwd=working_dir,
+            timeout=120,
+        )
+
+    if untracked_paths:
+        _run(
+            ["clean", "-fd", "--", *untracked_paths],
+            cwd=working_dir,
+            timeout=120,
+        )
+
+
 def commit(working_dir: Path, message: str) -> None:
     """Create a commit with the given message.
 
@@ -481,12 +582,23 @@ def commit(working_dir: Path, message: str) -> None:
 
 
 def fetch(working_dir: Path, remote: str = "origin") -> None:
-    """Run ``git fetch <remote>``; raises :class:`GitError` on failure.
+    """Run ``git fetch --prune <remote>``; raises :class:`GitError` on failure.
+
+    The ``--prune`` flag deletes any remote-tracking refs under
+    ``refs/remotes/<remote>/`` whose corresponding branch no longer
+    exists on the remote — without it, a branch that was deleted on
+    origin keeps showing up in the chat-page branch dropdown
+    indefinitely (the local cache of remote refs is sticky). Pruning
+    is exactly the "drop branches that don't exist locally and no
+    longer exist remotely" semantics the dropdown wants on every
+    fetch click. Local branches the user actually checked out are
+    untouched — ``--prune`` only operates on the remote-tracking
+    namespace.
 
     Tolerates "no remote" by raising — the UI catches and surfaces the
     error in the dialog status area.
     """
-    _run(["fetch", remote], cwd=working_dir, timeout=120)
+    _run(["fetch", "--prune", remote], cwd=working_dir, timeout=120)
 
 
 def has_upstream(working_dir: Path, branch: str | None = None) -> bool:
@@ -501,6 +613,22 @@ def is_behind_upstream(working_dir: Path) -> bool:
     """Return True if HEAD is behind its upstream (i.e., a pull is needed)."""
     proc = _run(
         ["rev-list", "--count", "HEAD..@{u}"],
+        cwd=working_dir,
+        check=False,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        return False
+    try:
+        return int(proc.stdout.strip()) > 0
+    except ValueError:
+        return False
+
+
+def is_ahead_of_upstream(working_dir: Path) -> bool:
+    """Return True if HEAD has commits not yet on its upstream (i.e., a push is needed)."""
+    proc = _run(
+        ["rev-list", "--count", "@{u}..HEAD"],
         cwd=working_dir,
         check=False,
         timeout=10,

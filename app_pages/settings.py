@@ -489,6 +489,30 @@ def _render_provider_card(provider: providers.Provider) -> None:
                     f"{ss.weave_error}"
                 )
 
+        # ---- Empty-listing helper (connected but /v1/models returned 0) ----
+        # When the provider's listing endpoint succeeded but came back
+        # with zero models, the user sees ``:green-badge[Connected · 0
+        # models]`` in the header and would otherwise have no idea why.
+        # Most often this means the API key was created but no models
+        # have been provisioned for it yet (xAI in particular requires
+        # explicit per-model enablement in the team console; OpenAI's
+        # tiered access can have a similar effect on org-restricted
+        # accounts). Surface a small info caption pointing at the
+        # provider's console so the user can fix it.
+        if is_connected and n_models == 0:
+            console_link = (
+                f"[{provider.key_url}]({provider.key_url})"
+                if provider.key_url else provider.label
+            )
+            st.info(
+                f"{provider.label} accepted the API key but listed **0 "
+                f"available models**. This usually means no models are "
+                f"enabled for this key yet — open {console_link} to "
+                f"enable models on your account, then click **Refresh** "
+                f"in the model picker to pull the new list.",
+                icon=":material/info:",
+            )
+
         # ---- Error banner (only on failure; full-width because the
         # message can be long) ----
         if not is_connected and error:
@@ -857,7 +881,10 @@ def _render_mcp_card() -> None:
                 "Connect external Model Context Protocol servers to expose "
                 "their tools to the agent. Stdio servers run as a local "
                 "subprocess; HTTP servers are remote. Configs persist to "
-                "`~/.wb_coding_agent/mcp.json` (mode 0600)."
+                "`~/.wb_coding_agent/mcp.json` (mode 0600). When **W&B "
+                "Inference** is connected, the official W&B MCP server "
+                "(Weave traces, runs, support bot) is auto-configured "
+                "below using the same API key."
             )
         with header_cols[1]:
             st.button(
@@ -873,6 +900,7 @@ def _render_mcp_card() -> None:
 
         for cfg in configs:
             status = registry.statuses.get(cfg.id)
+            is_managed = mcp_servers.is_managed_server_id(cfg.id)
             row = st.container(border=True)
             with row:
                 top = st.columns([6, 1, 1], vertical_alignment="center")
@@ -882,7 +910,13 @@ def _render_mcp_card() -> None:
                         if cfg.transport == "stdio"
                         else ":violet-badge[http]"
                     )
-                    st.markdown(f"**{cfg.name}** {transport_badge}")
+                    badges = [transport_badge]
+                    if is_managed:
+                        # Surface the auto-managed status so users
+                        # understand why the Edit button is missing
+                        # and where the bearer token came from.
+                        badges.append(":gray-badge[auto-configured]")
+                    st.markdown(f"**{cfg.name}** {' '.join(badges)}")
                     if status is not None and status.connected:
                         n = len(status.tools)
                         st.caption(
@@ -895,6 +929,14 @@ def _render_mcp_card() -> None:
                         st.caption("Disabled")
                     else:
                         st.caption("Not connected")
+                    if is_managed:
+                        st.caption(
+                            "Configured automatically when you connect "
+                            "**W&B Inference**. Disconnect or **Forget "
+                            "key** there to remove it; toggle the box "
+                            "to opt out of these tools without "
+                            "disconnecting Inference."
+                        )
                 with top[1]:
                     st.checkbox(
                         "Enabled",
@@ -906,15 +948,33 @@ def _render_mcp_card() -> None:
                         help="Enable or disable this server.",
                     )
                 with top[2]:
-                    st.button(
-                        "",
-                        icon=":material/edit:",
-                        key=f"mcp_edit_{cfg.id}",
-                        help="Edit this server.",
-                        on_click=_open_edit_mcp_dialog,
-                        args=(cfg.id,),
-                        width="stretch",
-                    )
+                    if is_managed:
+                        # Managed entries skip the Edit affordance —
+                        # the next Connect would overwrite any manual
+                        # changes anyway. We render a disabled
+                        # placeholder so the column layout stays
+                        # aligned with the user-added rows.
+                        st.button(
+                            "",
+                            icon=":material/lock:",
+                            key=f"mcp_locked_{cfg.id}",
+                            help=(
+                                "URL and headers are auto-configured "
+                                "from your W&B Inference connection."
+                            ),
+                            disabled=True,
+                            width="stretch",
+                        )
+                    else:
+                        st.button(
+                            "",
+                            icon=":material/edit:",
+                            key=f"mcp_edit_{cfg.id}",
+                            help="Edit this server.",
+                            on_click=_open_edit_mcp_dialog,
+                            args=(cfg.id,),
+                            width="stretch",
+                        )
 
 
 def _render_session_summary() -> None:

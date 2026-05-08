@@ -85,6 +85,27 @@ SKILL_ROOT_SUBPATHS: tuple[Path, ...] = (
 # from being parsed as commands.
 _SLASH_RE = re.compile(r"(?:^|\s)/([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
 
+# Strip-pattern variant of ``_SLASH_RE`` used by :func:`strip_slash_commands`.
+# Two intentional differences from the detection pattern:
+#
+# 1. The "preceded by whitespace OR start-of-string" anchor is expressed
+#    as a zero-width lookbehind ``(?:(?<=\s)|^)`` instead of the
+#    consuming ``(?:^|\s)`` of the detection pattern. The lookbehind
+#    leaves the leading whitespace in the message after the strip, so
+#    ``"foo /skill bar"`` becomes ``"foo bar"`` (one space between
+#    surrounding words) rather than ``"foobar"``.
+# 2. ``[ \t]*`` trails the slug so any spaces / tabs immediately after
+#    the slash command are consumed by the same match — without this,
+#    a leading-anchored ``"/skill make this better"`` would strip down
+#    to ``" make this better"`` and require a separate pass to normalize
+#    the leftover space. Newlines after a slash command are deliberately
+#    *not* consumed (that's why this is ``[ \t]*`` and not ``\s*``) so
+#    multi-line prompts keep their line breaks intact.
+_SLASH_STRIP_RE = re.compile(
+    r"(?:(?<=\s)|^)/([a-z0-9][a-z0-9_-]{0,63})\b[ \t]*",
+    re.IGNORECASE,
+)
+
 # Slug normalization for skill names. Same logic as the slash regex's
 # allowed character class, applied to the frontmatter ``name`` value.
 _SLUG_NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -481,6 +502,67 @@ def parse_slash_commands(message: str, ctx: ProjectContext) -> tuple[list[Skill]
     return matched, unknown
 
 
+def strip_slash_commands(message: str, ctx: ProjectContext) -> str:
+    """Remove ``/<slug>`` tokens that activated a known skill in ``ctx``.
+
+    Used by the agent loop after :func:`select_skills_for_turn` so the
+    model sees the user's actual request without the meta-tokens. The
+    chat history rendered to the user still shows the verbatim message
+    (the chat page renders from ``Chat.ui_turns``, which is independent
+    from ``Chat.messages`` — the wire-level conversation that this
+    function mutates).
+
+    Stripping only **known** slugs is deliberate: the slash regex
+    ``_SLASH_RE`` will happily match ``/usr`` inside ``/usr/local/bin``
+    (``/usr`` is at start-of-string and ``\\b`` lands on the slash that
+    follows), so blindly stripping every regex match would corrupt
+    legitimate file paths and command-line snippets. Unknown slash
+    candidates are left untouched in the wire message; the user already
+    sees a ``Unknown slash command /<slug>`` caption from
+    :func:`parse_slash_commands` for those.
+
+    Implementation notes:
+
+    - We use a sibling regex (:data:`_SLASH_STRIP_RE`) instead of the
+      detection regex (:data:`_SLASH_RE`). The differences are local:
+      the strip pattern uses a *lookbehind* for "preceded by whitespace"
+      (so the leading whitespace stays in the message and provides the
+      natural gap between surrounding words after the strip), and it
+      consumes any trailing horizontal whitespace (``[ \\t]*``) so we
+      don't leave double spaces around the strip site. Newlines after a
+      slash command are deliberately *not* consumed so multi-line
+      prompts keep their structure.
+    - The single ``re.sub`` pass plus a final ``.strip()`` is enough to
+      handle the common cases (slash at start, slash mid-message, code
+      blocks indented after a slash) without a global horizontal-
+      whitespace collapse — that collapse would corrupt code-block
+      indentation in any line of the prompt, not just at the strip site.
+
+    Returns the stripped message. Returns ``message`` unchanged when no
+    known slug matched, and also returns ``message`` unchanged when the
+    strip would leave an empty result — the user explicitly typed
+    *something*, and an empty user content would either error on the
+    wire or produce a low-quality reply, so we'd rather send the
+    verbatim slash than a hollow turn.
+    """
+    if not message or not ctx.slug_index:
+        return message
+
+    def _replace(m: re.Match[str]) -> str:
+        slug = m.group(1).lower()
+        if slug not in ctx.slug_index:
+            return m.group(0)
+        return ""
+
+    stripped = _SLASH_STRIP_RE.sub(_replace, message)
+    if stripped == message:
+        return message
+    stripped = stripped.strip()
+    if not stripped:
+        return message
+    return stripped
+
+
 def match_skills(message: str, ctx: ProjectContext) -> list[tuple[Skill, str]]:
     """Find skills whose trigger phrases appear in ``message``.
 
@@ -567,15 +649,56 @@ def build_system_addendum(ctx: ProjectContext, selection: SkillSelection) -> str
 
     Layout (sections are omitted when empty):
 
-    1. ``## Project guidance`` — full content of every AGENTS.md / CLAUDE.md
-       / CONVENTIONS.md found at the working-dir root.
-    2. ``## Project rules`` — full content of every ``.cursor/rules/*.mdc``.
-    3. ``## Active skills for this turn`` — full content of every selected
-       skill, each block prefaced with the trigger reason so the model
-       knows the user explicitly asked (``slash``) versus an automated
-       keyword match.
+    1. ``## Active skills for this turn — READ BEFORE RESPONDING`` —
+       full content of every selected skill, each block prefaced with
+       the trigger reason so the model knows the user explicitly asked
+       (``slash``) versus an automated keyword match. Placed at the
+       top of the addendum (rather than after AGENTS.md / .cursor/rules
+       as the historical layout had it) so the skill bodies land
+       immediately after the base system prompt instead of being pushed
+       into "lost in the middle" territory by the typically-much-larger
+       project guidance. The "READ BEFORE RESPONDING" suffix on the
+       heading is the loud-but-still-``##`` way of flagging precedence
+       without breaking the parallel hierarchy with the sections below
+       (``###`` for the individual skill / file entries beneath each
+       section). The preamble also instructs the model to begin its
+       reply with a ``Following: /<slug>[, /<slug>]...`` line — that
+       line is what gives the user in-chat confirmation that the model
+       actually consulted the skill, not just that we injected it.
+    2. ``## Project guidance`` — full content of every AGENTS.md /
+       CLAUDE.md / CONVENTIONS.md found at the working-dir root.
+    3. ``## Project rules`` — full content of every ``.cursor/rules/*.mdc``.
     """
     parts: list[str] = []
+
+    if selection.selected:
+        slugs_csv = ", ".join(f"/{p.skill.slug}" for p in selection.selected)
+        parts.append("\n\n## Active skills for this turn — READ BEFORE RESPONDING")
+        parts.append(
+            "The user's last message activated the skill(s) below — either "
+            "explicitly via a slash command or via a keyword match against the "
+            "skill's triggers. Treat each one as the authoritative procedure "
+            "for this specific turn; follow its instructions as written and "
+            "let it override your default workflow when they conflict. If a "
+            "skill says to read or edit specific files, do that before "
+            "responding.\n\n"
+            "Begin your reply with a single line of the exact form:\n\n"
+            f"    Following: {slugs_csv}\n\n"
+            "listing every active skill in the order shown above. This line is "
+            "verification for the user that you consulted the skill(s); it is "
+            "required even when the rest of your reply should be concise, and "
+            "it is not subject to any \"do not narrate\" rule above."
+        )
+        for picked in selection.selected:
+            skill = picked.skill
+            try:
+                content = skill.content_loader()
+            except Exception as e:
+                content = f"[failed to load skill: {e}]"
+            parts.append(
+                f"\n### /{skill.slug} ({skill.scope}, trigger: {picked.trigger_reason})\n"
+                f"Path: `{skill.path}`\n\n{content}"
+            )
 
     if ctx.agents_md:
         parts.append("\n\n## Project guidance")
@@ -600,25 +723,6 @@ def build_system_addendum(ctx: ProjectContext, selection: SkillSelection) -> str
             except ValueError:
                 rel = rule.path
             parts.append(f"\n### {rel}\n\n{rule.content}")
-
-    if selection.selected:
-        parts.append("\n\n## Active skills for this turn")
-        parts.append(
-            "The user's message matched these skills. Each one is a procedural "
-            "guide; consult them while answering and follow their instructions. "
-            "If a skill says to read or edit specific files, do that before "
-            "responding."
-        )
-        for picked in selection.selected:
-            skill = picked.skill
-            try:
-                content = skill.content_loader()
-            except Exception as e:
-                content = f"[failed to load skill: {e}]"
-            parts.append(
-                f"\n### /{skill.slug} ({skill.scope}, trigger: {picked.trigger_reason})\n"
-                f"Path: `{skill.path}`\n\n{content}"
-            )
 
     if not parts:
         return ""

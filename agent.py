@@ -88,19 +88,26 @@ def _op(*args: Any, **kwargs: Any) -> Any:
 from tools import ToolContext, dispatch, tools_for_mode
 
 
-# DeepSeek model used by the git push flow for commit messages, PR
-# titles/bodies, and merge-conflict resolution. Hard-coded to V4-Flash
-# because its 1M context comfortably fits multi-file diffs and the
-# multi-file conflict-resolution turn. Stored as a fully-qualified id
-# (``wandb:<raw>``) since the multi-provider migration — the helper
-# :func:`commit_ai.is_deepseek_available` checks this against the
-# user's connected W&B catalog before invoking; if not, the downstream
-# UI surfaces a clear "model unavailable" error and disables generation.
-# The git push / commit-message / conflict-resolution flows REQUIRE
-# W&B Inference to be configured (and this model present on the user's
-# account); the W&B-pinned qualified id routes the call through the
-# user's W&B-configured ``openai.OpenAI`` client (with W&B's
-# ``base_url``) just like any other ``openai_compat`` provider.
+# DeepSeek model used by the multi-step **merge-conflict resolution
+# turn** (the sidebar's "Resolve with DeepSeek" button) and by the
+# AI-generated chat **title** helper in :mod:`chats`. Hard-coded to
+# V4-Flash because its 1M context comfortably fits the multi-file
+# conflict-resolution turn's full repo state; the title generation
+# inherits the same id for consistency. Stored as a fully-qualified
+# id (``wandb:<raw>``) since the multi-provider migration; the
+# qualified prefix routes the call through the user's
+# W&B-configured ``openai.OpenAI`` client (with W&B's ``base_url``)
+# just like any other ``openai_compat`` provider, so DeepSeek
+# remains a W&B-only feature for these two flows.
+#
+# The chat-page **Sync** flow (commit messages + PR
+# title/body) intentionally does NOT use this constant — it routes
+# through whatever model the user picked for their chat (see
+# :mod:`commit_ai` and ``app_pages/chat.py._resolve_commit_ai_model``).
+# Hard-coding DeepSeek there used to be the contract; it was
+# removed because users on non-W&B providers (Anthropic / OpenAI /
+# Google / Mistral / xAI / OpenRouter) shouldn't have to keep a W&B
+# account connected just to draft a commit message.
 DEEPSEEK_MODEL = "wandb:deepseek-ai/DeepSeek-V4-Flash"
 
 
@@ -598,13 +605,38 @@ def run_agent_turn(
 
     proj_ctx = project_context.scan(working_dir)
     last_user = ""
-    for msg in reversed(messages):
+    last_user_idx: int | None = None
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
         if msg.get("role") == "user":
             content = msg.get("content")
             if isinstance(content, str):
                 last_user = content
+                last_user_idx = i
+            # Either branch (string content found, or list/multimodal
+            # content we can't text-mine today) marks the most recent
+            # user message — break either way so we don't accidentally
+            # surface an *older* string user message past a multimodal
+            # one and run skill detection against the wrong turn.
             break
     selection = project_context.select_skills_for_turn(last_user, proj_ctx)
+
+    # Strip the slash commands that activated a known skill out of the
+    # wire-level user message so the model sees the user's actual
+    # request without the meta-tokens. The chat history rendered to
+    # the user still shows the verbatim message (the chat page renders
+    # from ``Chat.ui_turns``, which is independent from this list).
+    # Multimodal user messages (``content`` is a list of parts) are
+    # currently skipped — ``last_user_idx`` only gets set for string
+    # content, mirroring the same gap on the detection side. Strict
+    # no-op when there's nothing to strip OR when stripping would
+    # leave an empty message (the helper enforces both).
+    if last_user_idx is not None and last_user:
+        cleaned = project_context.strip_slash_commands(last_user, proj_ctx)
+        if cleaned != last_user:
+            stripped_msg = dict(messages[last_user_idx])
+            stripped_msg["content"] = cleaned
+            messages[last_user_idx] = stripped_msg
 
     yield {
         "type": "skills_loaded",

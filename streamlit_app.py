@@ -182,6 +182,13 @@ def _init_state() -> None:
     # cache holds the wall-clock equivalent).
     ss.setdefault("model_picker_open", False)
     ss.setdefault("_model_picker_search", "")
+    # Sortable column state for the picker's table-style row list.
+    # ``None`` means "default order" (recommended-first, then
+    # alphabetical), otherwise a dict ``{"column": "context" |
+    # "input" | "output", "direction": "asc" | "desc"}`` produced by
+    # clicking a column header in the picker. The same sort applies
+    # across every tab body within an open picker session.
+    ss.setdefault("_model_picker_sort", None)
     ss.setdefault("model_catalog_refreshing", False)
     ss.setdefault("model_catalog_last_refreshed_at", None)
     # Phase 5: lightbox modal state for inline image / audio / video
@@ -242,23 +249,25 @@ def _init_state() -> None:
 
     # Git integration state. ``git_state_nonce`` is bumped after every
     # mutating git op (checkout, commit, push, conflict resolution) so the
-    # cached repo scan refreshes on the next rerun. The bottom-of-chat
-    # git row owns the new-branch / publish-branch modals (gated by
+    # cached repo scan refreshes on the next rerun. The chat-page actions
+    # row owns the new-branch / publish-branch modals (gated by
     # ``new_branch_dialog_open`` / ``first_push_dialog_open``) and queues
-    # the push pipeline through ``pending_push_request`` so the actual
-    # network + LLM work runs inside ``app_pages/chat.py.render()`` (where
-    # ``st.toast`` / ``st.rerun`` work normally) rather than inside an
-    # on-click callback. ``merge_conflict`` is set to
-    # ``{"files": [...], "operation": "rebase"|"merge"}`` after a conflict
-    # during the push flow's ``pull --rebase`` and drives the sidebar
-    # warning + "Resolve with DeepSeek" button. ``pending_conflict_resolution``
-    # is the cross-page handoff: the sidebar (in this module) sets it; the
-    # chat page (in ``app_pages/chat.py``) drains it and runs an agent turn
-    # with ``override_model=DEEPSEEK_MODEL``.
+    # the bidirectional sync pipeline through ``pending_sync_request`` so
+    # the actual network + LLM work runs inside
+    # ``app_pages/chat.py.render()`` (where ``st.toast`` / ``st.rerun``
+    # work normally) rather than inside an on-click callback.
+    # ``merge_conflict`` is set to ``{"files": [...], "operation":
+    # "rebase"|"merge"}`` after a conflict during the sync flow's ``pull
+    # --rebase`` and drives the sidebar warning + "Resolve with DeepSeek"
+    # button. ``pending_conflict_resolution`` is the cross-page handoff:
+    # the sidebar (in this module) sets it; the chat page (in
+    # ``app_pages/chat.py``) drains it and runs an agent turn with
+    # ``override_model=DEEPSEEK_MODEL``.
     ss.setdefault("git_state_nonce", 0)
     ss.setdefault("new_branch_dialog_open", False)
     ss.setdefault("first_push_dialog_open", False)
-    ss.setdefault("pending_push_request", None)
+    ss.setdefault("pending_sync_request", None)
+    ss.setdefault("project_context_dialog_open", False)
     ss.setdefault("merge_conflict", None)
     ss.setdefault("pending_conflict_resolution", None)
 
@@ -1011,20 +1020,67 @@ def main() -> None:
     _init_state()
     _maybe_auto_connect()
 
-    # Tighten the default ~6rem top padding Streamlit reserves above the
-    # main block container so the page title sits directly below the top
-    # navigation bar instead of being separated by a wide empty band.
-    # Applied globally (via ``main()``, not from any single page) so the
-    # rule is in effect on Chat / Diff / Usage / Settings — each page's
-    # title was visually orphaned from the nav at the default padding.
-    # Targets the documented ``[data-testid="stMainBlockContainer"]``
-    # selector so a Streamlit upgrade that changes internal class names
-    # doesn't silently regress the rule. ``app_pages/chat.py`` adds its
-    # own chat-page-specific flex/height rules on top of this; those use
-    # ``!important`` and don't conflict with this padding-only override.
+    # Tighten the default top padding Streamlit reserves above the main
+    # block container *and* close the empty band above the
+    # ``stSidebarHeader`` (the row that holds the ``«`` collapse button
+    # at the top of the sidebar) so each page's title sits directly
+    # below the top navigation bar **and** the "W&B Coding Agent"
+    # sidebar header sits directly below the collapse button instead of
+    # being separated by a wide empty band. Applied globally (via
+    # ``main()``, not from any single page) so the rule is in effect on
+    # Chat / Diff / Usage / Settings.
+    #
+    # The sidebar half ONLY needs to override ``stSidebarHeader``. The
+    # gap above "W&B Coding Agent" is *not* coming from
+    # ``stSidebarUserContent``'s padding — Streamlit's CSS-in-JS sets
+    # ``stSidebarUserContent``'s ``padding-top`` to ``theme.spacing.twoXL``
+    # only when a top page-nav is present and ``0`` otherwise, and we
+    # don't render a top nav inside the sidebar so it's already at 0.
+    # The visible gap comes from ``stSidebarHeader`` itself, whose
+    # CSS-in-JS body is roughly ``{height: theme.sizes.headerHeight,
+    # marginBottom: theme.spacing.lg, ...}``. Together that's a fixed
+    # ~3.75rem header row plus ~1rem bottom margin = the empty band
+    # below the collapse button. Setting ``min-height:0`` /
+    # ``padding-bottom:0`` does nothing because the header has neither
+    # a min-height nor any bottom padding — only fixed ``height`` and
+    # ``margin-bottom``.
+    #
+    # We override two properties:
+    #
+    # - ``height: 2rem`` — small but non-zero. ``height: auto`` won't
+    #   work because Streamlit gives the collapse-button wrapper
+    #   (``stSidebarCollapseButton``) ``display:inline; lineHeight:0``,
+    #   which means it has zero intrinsic height inside its flex
+    #   parent; a header with ``height:auto`` collapses to 0 and the
+    #   button vanishes. 2rem is enough to render the xl Material icon
+    #   (~1.5rem) plus a bit of vertical breathing room so the button
+    #   stays clickable.
+    # - ``margin-bottom: 0`` — kills the ~1rem ``theme.spacing.lg`` gap
+    #   the styled component places below the header so the
+    #   "W&B Coding Agent" title sits flush below the button row.
+    #
+    # ``!important`` is required because Streamlit's emotion-style
+    # CSS-in-JS attaches a generated class with matching attribute-vs-
+    # class specificity (both 0,1,0); without ``!important`` the
+    # cascade order is too brittle across hot-reloads. The matching
+    # selectors are documented data-testids verified by grepping the
+    # bundled ``streamlit/static/static/js/index.*.js`` for
+    # ``stSidebar*`` tokens, so a future Streamlit upgrade that
+    # changes internal class names won't silently regress the rule.
+    #
+    # The main-content half is intentionally a single 1.5rem selector
+    # (not 0) because the page-title H1 already brings its own ~0.5rem
+    # above-margin, so zeroing out *all* breathing room there would
+    # push the H1 baseline too close to the top nav. The user
+    # explicitly asked to fully close the gap on the sidebar axis.
+    #
+    # ``app_pages/chat.py`` adds its own chat-page-specific flex/height
+    # rules on top of this; those use ``!important`` on different
+    # selectors and don't conflict with this override.
     st.html(
         "<style>"
         '[data-testid="stMainBlockContainer"]{padding-top:1.5rem;}'
+        '[data-testid="stSidebarHeader"]{height:2rem!important;margin-bottom:0!important;}'
         "</style>"
     )
 

@@ -740,6 +740,29 @@ export default function (component) {
     textarea.addEventListener("blur", state.onBlur);
   }
 
+  function relocateFileButton() {
+    // Streamlit's chat input renders the file-upload button inside the
+    // textarea sub-block (parent A) and the submit button inside its
+    // own sibling sub-block (parent B). They share an outer flex
+    // container but never the same direct parent, which means
+    // ``order:`` CSS can't put them adjacent — order only reorders
+    // siblings within the same parent. To get the two buttons truly
+    // side-by-side we move the file-upload button into the submit
+    // button's parent (a tiny ``display: flex; gap: 5px`` container)
+    // as the previous sibling of submit, so the parent's existing
+    // gap takes care of spacing and our CSS only has to match the
+    // submit button's resting visual.
+    //
+    // Idempotent and self-healing: runs on every script run, no-ops
+    // when the button is already in the right place, and re-moves if
+    // a Streamlit re-render restored the original layout.
+    const sb = doc.querySelector('[data-testid="stChatInputSubmitButton"]');
+    const fb = doc.querySelector('[data-testid="stChatInputFileUploadButton"]');
+    if (!sb || !fb) return;
+    if (fb.parentElement === sb.parentElement && fb.nextElementSibling === sb) return;
+    sb.parentElement.insertBefore(fb, sb);
+  }
+
   function tryAttachLoop(remaining) {
     const ta = findChatTextarea();
     if (ta) {
@@ -752,6 +775,11 @@ export default function (component) {
       // attach), so re-renders within the same chat don't disturb
       // the user's in-progress typing.
       applyDraftIfNeeded();
+      // Move the paperclip next to the submit button (no-op when
+      // already adjacent). Has to run after the textarea is found
+      // because the file-upload button sits inside the textarea's
+      // sub-block of the chat input until we move it.
+      relocateFileButton();
       return;
     }
     if (remaining > 0) setTimeout(() => tryAttachLoop(remaining - 1), 150);
@@ -767,7 +795,14 @@ export default function (component) {
   // changed since last time (e.g. user clicked a different chat in the
   // sidebar — the textarea is the same DOM node, but ``data.chatId``
   // / ``data.draft`` are now for a different chat).
-  if (state.textarea) applyDraftIfNeeded();
+  if (state.textarea) {
+    applyDraftIfNeeded();
+    // Re-assert the paperclip's position next to the submit button on
+    // every render. ``relocateFileButton`` no-ops when already in
+    // place, so this is cheap; the cost buys us self-healing if a
+    // Streamlit-driven re-render restored the default layout.
+    relocateFileButton();
+  }
 
   injectStyles();
 

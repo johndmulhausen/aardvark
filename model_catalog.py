@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -452,6 +453,200 @@ def _http_get_json(url: str, *, timeout: float = 15.0) -> Any:
     return json.loads(body.decode("utf-8"))
 
 
+def _friendly_error(exc: Exception) -> str:
+    """Extract the human-readable message from a provider SDK exception.
+
+    Provider SDKs (openai, anthropic, google-genai, mistralai) all
+    surface HTTP errors as exceptions whose ``str()`` defaults to a
+    noisy combo of ``"Error code: <status> - <raw response body
+    dict>"``. We unwrap to the actual user-facing message when we can
+    recognize the shape, prepending the HTTP status as a small framing
+    hint (403 = permissions, 401 = key, 429 = rate limit, etc.).
+
+    Recognized response-body shapes:
+
+    - **OpenAI** / Anthropic style: ``{"error": {"message": "...",
+      "type": "...", "code": "..."}}``. We pull ``body["error"]
+      ["message"]``.
+    - **xAI** style (the case that motivated this helper): ``{"code":
+      "<short slug summary>", "error": "<long actionable message
+      with URLs>"}``. Both fields are present and useful — the
+      ``code`` value summarizes the failure type ("The caller does
+      not have permission..."), the ``error`` value has the actionable
+      detail ("Your newly created team doesn't have any credits or
+      licenses yet. You can purchase those on https://..."). We
+      surface both joined as ``"<code>. <error>"`` so the user gets
+      one readable sentence rather than two separate fields.
+    - Other shapes seen in the wild: top-level ``"message"`` or
+      ``"detail"`` keys.
+
+    The body lookup walks the exception's ``body`` attribute first
+    (the openai SDK's parsed-JSON field). When that's missing — the
+    SDK's parser sometimes punts to ``None`` and stuffs the dict
+    repr into the message string instead — we fall back to parsing
+    ``e.message`` / ``str(e)`` for the ``"Error code: N - {dict}"``
+    pattern, ``ast.literal_eval``\\-ing the dict portion and walking
+    it the same way. This rescues the message in the case where the
+    SDK's structured ``body`` field was never populated.
+
+    Falls back to ``str(exc)`` when no shape is recognized so a
+    one-off API change degrades gracefully (still showing whatever
+    the SDK chose to print) rather than to no message at all.
+    """
+    body = _resolve_body(exc)
+
+    user_msg = _extract_user_message_from_body(body) if isinstance(body, dict) else None
+
+    # Some SDKs already expose a parsed message field on the exception
+    # itself; use it when our body-walk didn't yield anything AND it
+    # doesn't look like the noisy "Error code: N - {dict}" default.
+    if user_msg is None:
+        msg = getattr(exc, "message", None)
+        if isinstance(msg, str) and msg.strip() and not _looks_like_dict_repr_message(msg):
+            user_msg = msg.strip()
+
+    if user_msg is None:
+        # Last resort: fall back to ``str(exc)``, but strip the
+        # leading ``"Error code: N - "`` framing if it's there so we
+        # don't double-show the status (we add the friendly ``HTTP N:``
+        # prefix below).
+        raw = str(exc)
+        stripped = _strip_error_code_prefix(raw)
+        user_msg = stripped if stripped else raw
+
+    status_code = getattr(exc, "status_code", None)
+    if not isinstance(status_code, int) or not status_code:
+        # Try to recover the status code from the message string.
+        status_code = _extract_status_code_from_message(str(exc))
+
+    if isinstance(status_code, int) and status_code:
+        return f"HTTP {status_code}: {user_msg}"
+    return user_msg
+
+
+# Pattern matching the OpenAI SDK's stringified APIStatusError:
+# ``"Error code: <int> - <body-repr>"``. The body repr is whatever
+# Python's ``repr()`` produces for the parsed JSON (typically a dict
+# with single-quote strings, but can also be a list, str, or None).
+_ERROR_CODE_PREFIX_RE = re.compile(r"^Error code:\s*(\d+)\s*-\s*(.+)$", re.DOTALL)
+
+
+def _resolve_body(exc: Exception) -> Any:
+    """Return the parsed body dict for ``exc``, falling back to message parsing.
+
+    Tries the SDK-exposed ``exc.body`` attribute first (openai /
+    anthropic / mistralai all populate this when the response was
+    valid JSON). When that's None or not a dict, parses the
+    exception's message string for the ``"Error code: N - {dict}"``
+    pattern that the openai SDK falls back to when its structured
+    ``body`` field hasn't been wired through. Returns ``None`` when
+    no parseable body can be recovered.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        return body
+
+    # Body wasn't a dict — try the message-string fallback.
+    msg = getattr(exc, "message", None) or str(exc)
+    if not isinstance(msg, str):
+        return None
+    match = _ERROR_CODE_PREFIX_RE.match(msg.strip())
+    if match is None:
+        return None
+    body_repr = match.group(2).strip()
+    try:
+        import ast
+
+        parsed = ast.literal_eval(body_repr)
+    except (ValueError, SyntaxError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_user_message_from_body(body: dict[str, Any]) -> str | None:
+    """Walk a parsed response body dict for the user-facing message.
+
+    See :func:`_friendly_error` for the recognized shapes. The xAI
+    ``{"code": "<summary>", "error": "<detail>"}`` shape is special-
+    cased to combine both fields — ``code`` is the failure summary,
+    ``error`` is the actionable detail; together they read as one
+    coherent sentence.
+    """
+    err = body.get("error")
+    code = body.get("code")
+
+    # xAI shape: both ``code`` and ``error`` are strings — combine.
+    if isinstance(err, str) and err.strip() and isinstance(code, str) and code.strip():
+        code_clean = code.strip().rstrip(".")
+        err_clean = err.strip()
+        return f"{code_clean}. {err_clean}"
+
+    # xAI shape with only the ``error`` key as a string.
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+
+    # xAI shape with only the ``code`` key as a string.
+    if isinstance(code, str) and code.strip():
+        return code.strip()
+
+    # OpenAI / Anthropic shape: nested ``error.message``.
+    if isinstance(err, dict):
+        msg = err.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+
+    # Other shapes seen in the wild.
+    msg = body.get("message")
+    if isinstance(msg, str) and msg.strip():
+        return msg.strip()
+    detail = body.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    return None
+
+
+def _looks_like_dict_repr_message(msg: str) -> bool:
+    """Return True if ``msg`` is the openai SDK's noisy default format.
+
+    The SDK's ``APIStatusError`` defaults to ``"Error code: <N> -
+    <body-repr>"`` when no parsed body is available. Surfacing that
+    string verbatim is exactly the bug ``_friendly_error`` exists to
+    avoid; this predicate lets the caller skip the ``e.message``
+    fallback when the SDK only has the noisy default to offer.
+    """
+    return _ERROR_CODE_PREFIX_RE.match(msg.strip()) is not None
+
+
+def _strip_error_code_prefix(raw: str) -> str | None:
+    """Strip the openai SDK's ``"Error code: N - "`` prefix from ``raw``.
+
+    Returns the body-repr substring (still ugly, but at least without
+    the duplicated status-code framing the caller adds back via the
+    ``HTTP N: ...`` prefix). Returns ``None`` when the prefix isn't
+    present.
+    """
+    match = _ERROR_CODE_PREFIX_RE.match(raw.strip())
+    if match is None:
+        return None
+    return match.group(2).strip()
+
+
+def _extract_status_code_from_message(msg: str) -> int | None:
+    """Pull the HTTP status code out of an ``"Error code: N - ..."`` string.
+
+    Used as a fallback for SDK exceptions that didn't populate
+    :attr:`status_code` directly but did include the code in their
+    message string.
+    """
+    match = _ERROR_CODE_PREFIX_RE.match(msg.strip())
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
 def _fetch_openrouter_catalog() -> dict[str, dict[str, Any]]:
     """Read OpenRouter's full model catalog, cache to disk, return id-keyed dict.
 
@@ -468,7 +663,9 @@ def _fetch_openrouter_catalog() -> dict[str, dict[str, Any]]:
         body = _http_get_json(OPENROUTER_CATALOG_URL)
     except Exception as e:  # noqa: BLE001
         with _state_lock:
-            _state.errors["openrouter"] = f"OpenRouter fetch failed: {e}"
+            _state.errors["openrouter"] = (
+                f"OpenRouter catalog fetch failed: {_friendly_error(e)}"
+            )
         # Fall through to stale cache if present.
         stale = _read_json_any_age(OPENROUTER_CACHE_FILE)
         if isinstance(stale, dict) and isinstance(stale.get("by_id"), dict):
@@ -1009,8 +1206,14 @@ def refresh(provider_id: str, client: Any) -> list[ModelInfo]:
     try:
         raw_ids, live_meta = _list_provider_models_with_meta(provider_id, client)
     except Exception as e:  # noqa: BLE001
+        # Store just the friendly underlying message — the connect
+        # flow in ``actions.connect_provider`` adds the
+        # ``"Could not connect to <label>: ..."`` framing on top.
+        # Doubling the provider label here would render as e.g.
+        # "Could not connect to xAI (Grok): xAI (Grok) list-models
+        # failed: ..." which reads worse than the deduped form.
         with _state_lock:
-            _state.errors[provider_id] = f"{provider.label} list-models failed: {e}"
+            _state.errors[provider_id] = _friendly_error(e)
             return [
                 mi for mi in _state.info_by_qualified_id.values()
                 if mi.provider_id == provider_id
@@ -1076,7 +1279,7 @@ def refresh_all(clients: dict[str, Any]) -> dict[str, list[ModelInfo]]:
             results[pid] = refresh(pid, client)
         except Exception as e:  # noqa: BLE001 — surfaced via _state.errors
             with _state_lock:
-                _state.errors[pid] = f"{provider.label} refresh raised: {e}"
+                _state.errors[pid] = _friendly_error(e)
             results[pid] = []
     return results
 
@@ -1100,7 +1303,9 @@ def refresh_all_async(
             refresh_all(clients)
         except Exception as e:  # noqa: BLE001
             with _state_lock:
-                _state.errors["__refresh_all__"] = f"refresh_all failed: {e}"
+                _state.errors["__refresh_all__"] = (
+                    f"Catalog refresh failed: {_friendly_error(e)}"
+                )
         if on_done is not None:
             try:
                 on_done()

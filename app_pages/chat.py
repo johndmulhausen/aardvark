@@ -46,7 +46,6 @@ import git_ops
 import mcp_servers
 import project_context
 import usage as usage_log
-from agent import DEEPSEEK_MODEL
 from chat_input import mount_slash_autocomplete
 from git_ops import GitError
 import model_catalog
@@ -77,21 +76,105 @@ MCP_TOOL_ICON = ":material/extension:"
 # — the ``"stretch"`` variant only matches parent height and does not turn on
 # scrolling, per the [`st.container` docs](https://docs.streamlit.io/develop/api-reference/layout/st.container).
 # 330px is calibrated against a typical desktop viewport (≈900px tall) so
-# the chat input + git row + Changes button + workdir picker + model
-# selector below the conversation area stay in view without the user
-# having to scroll the whole page — i.e. the controls "stay pinned at
-# the bottom" of the visible viewport for the common case. On taller
-# viewports there will be empty space below the controls; on shorter
-# viewports the page itself gains a scrollbar. We accept that trade-off
-# because trying to make the height truly responsive via CSS
-# ``calc(100vh - …)`` requires fighting with Streamlit-internal class
-# names on the height-bearing inner element, which is unstable across
-# upgrades — empirically tested and reverted, see git history. Tweak
-# this integer if you change the natural height of anything outside the
-# conversation area on the chat page (title above; chat input +
-# slash-autocomplete slot + git row + Changes button + workdir row +
-# project context expander + model row + model card caption below).
+# the chat input + actions row + model selector below the conversation
+# area stay in view without the user having to scroll the whole page —
+# i.e. the controls "stay pinned at the bottom" of the visible viewport
+# for the common case. On taller viewports there will be empty space
+# below the controls; on shorter viewports the page itself gains a
+# scrollbar. We accept that trade-off because trying to make the height
+# truly responsive via CSS ``calc(100vh - …)`` requires fighting with
+# Streamlit-internal class names on the height-bearing inner element,
+# which is unstable across upgrades — empirically tested and reverted,
+# see git history. Tweak this integer if you change the natural height
+# of anything outside the conversation area on the chat page (title
+# above; chat input + slash-autocomplete slot + single actions row
+# [workdir | branch | Changes | Sync] + model row + model card
+# caption below — Browse, Start a new project, New branch, and
+# Fetch upstream branches all live as sentinel options at the top of
+# the relevant dropdowns rather than as separate cells, so the row
+# is compact). The project context is a modal triggered from the
+# model row, not an inline expander, so toggling it never reshuffles
+# this layout.
 _CHAT_HISTORY_HEIGHT_PX = 330
+
+
+# Allow-list of file extensions the chat input accepts as attachments.
+# Covers images (vision-capable models), PDFs (Anthropic / Google
+# native, others get text-extracted via pypdf), and a curated set of
+# plain-text + code formats. We deliberately do **not** pass this
+# list as ``file_type=`` to ``st.chat_input``: doing so would surface
+# the full list as a tooltip on Streamlit's attach button (cluttering
+# the chat UI). Instead we let the OS picker accept anything and
+# validate manually after submit, so the user discovers the
+# constraint via a clear error message that names the file they
+# tried and the supported extensions.
+_SUPPORTED_FILE_EXTENSIONS: tuple[str, ...] = (
+    "png", "jpg", "jpeg", "webp", "gif",
+    "pdf",
+    "txt", "md", "json", "csv", "yaml", "yml", "toml",
+    "py", "ts", "tsx", "js", "jsx", "html", "css",
+    "sh", "rs", "go", "java", "cpp", "c", "h",
+)
+
+
+# CSS for Streamlit's chat-input attach button. Two things going on
+# (the third — *repositioning* the button to live next to the submit
+# arrow — is done in JS, not CSS, by ``chat_input.relocateFileButton``;
+# see the docstring there for why ``order:`` doesn't work on its own).
+#
+# 1. **Match the submit button's resting visual exactly** so the two
+#    buttons read as a single matched pair. Streamlit's submit button
+#    measures ``20px × 20px`` with ``3.75px`` padding and a ``5px``
+#    border-radius (verified by ``getComputedStyle`` against a live
+#    chat input), and uses ``rgba(172, 177, 195, 0.15)`` as its
+#    resting / disabled-state fill (a translucent theme-derived
+#    color that reads correctly in both light and dark mode without
+#    depending on a specific Streamlit CSS-variable name — those
+#    rotate occasionally between minor versions). The paperclip
+#    inherits exactly those values so the two buttons sit as
+#    visually-identical pills inside the chat input's right cluster.
+#    The submit button still bumps to ``--st-primary`` once the
+#    textarea has text (Streamlit's own behavior); the paperclip
+#    intentionally stays neutral, which mirrors the "secondary
+#    action" UX pattern (Send is the primary action; Attach is a
+#    helper).
+# 2. **Swap glyph** from the default ``+`` SVG to ``attach_file``
+#    from Material Symbols Rounded (the same icon font Streamlit
+#    loads for its ``:material/...:`` shortcodes), at ``10px`` to
+#    match the submit arrow's intrinsic icon size (the submit
+#    button uses ``font-size: 10px`` for its inline arrow SVG).
+#
+# The SVG hide + ``::before`` glyph substitution keeps the existing
+# button behavior (click handler + drag-and-drop target) intact —
+# only the visual changes.
+_CHAT_INPUT_ATTACH_BUTTON_CSS = (
+    "<style>"
+    # 1. Match submit button's exact dimensions + resting fill.
+    '[data-testid="stChatInputFileUploadButton"]{'
+    "width:20px!important;height:20px!important;"
+    "padding:3.75px!important;"
+    "border-radius:5px!important;"
+    "background-color:rgba(172,177,195,0.15)!important;"
+    "border:none!important;"
+    "}"
+    '[data-testid="stChatInputFileUploadButton"]:hover{'
+    "background-color:rgba(172,177,195,0.30)!important;"
+    "}"
+    # 2. Replace the inline SVG ``+`` with the Material paperclip,
+    # sized to match the submit button's arrow glyph.
+    '[data-testid="stChatInputFileUploadButton"] svg{display:none!important;}'
+    '[data-testid="stChatInputFileUploadButton"]::before{'
+    'content:"attach_file";'
+    'font-family:"Material Symbols Rounded";'
+    "font-size:14px;font-weight:400;font-style:normal;"
+    "line-height:1;letter-spacing:normal;text-transform:none;"
+    "display:inline-block;white-space:nowrap;direction:ltr;"
+    "color:inherit;"
+    "-webkit-font-feature-settings:'liga';"
+    "-webkit-font-smoothing:antialiased;"
+    "}"
+    "</style>"
+)
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -926,6 +1009,30 @@ def _shorten_path(path: str) -> str:
     return path
 
 
+# Sentinel option labels at the top of the working-directory dropdown.
+# Selecting one routes through ``_on_working_dir_select`` to either
+# launch the native folder picker or open the new-project modal,
+# instead of treating the sentinel string as a literal path. We keep
+# them as plain text (with leading punctuation that's unlikely to
+# collide with a real path) because Streamlit selectbox option labels
+# render as raw strings — Material icon tokens don't work inside
+# selectbox options. The branch picker uses the same pattern with
+# ``_NEW_BRANCH_SENTINEL``.
+#
+# All sentinels share a leading ``›`` (U+203A SINGLE RIGHT-POINTING
+# ANGLE QUOTATION MARK) glyph as a subtle unifying visual marker that
+# delineates them from real path / branch entries below. The glyph is
+# decorative — comparison sites use the constants directly so the
+# sentinel-vs-real-value membership check stays exact, and the
+# "meaningful name" inside the constant (e.g. ``Browse for a folder``)
+# is what we surface in help text / docs / dialog copy.
+_WD_BROWSE_SENTINEL = "›  Browse for a folder..."
+_WD_NEW_PROJECT_SENTINEL = "›  Start a new project..."
+_WD_SENTINELS: frozenset[str] = frozenset(
+    [_WD_BROWSE_SENTINEL, _WD_NEW_PROJECT_SENTINEL]
+)
+
+
 def _on_working_dir_select() -> None:
     """Working-directory selectbox callback: persist + sync to active chat.
 
@@ -935,13 +1042,45 @@ def _on_working_dir_select() -> None:
     ``__main__``; importing it from a sub-page re-executes ``main()``
     and re-renders the sidebar, blowing up with duplicate-widget-key
     errors).
+
+    Two sentinel options live at the top of the dropdown:
+      - ``_WD_BROWSE_SENTINEL`` — picking it opens the native folder
+        picker. Selecting a folder updates the working directory; a
+        Cancel reverts the dropdown to the previous value.
+      - ``_WD_NEW_PROJECT_SENTINEL`` — picking it opens the
+        ``_new_project_dialog`` modal (gated by
+        ``ss.new_project_dialog_open``). The dialog itself updates
+        ``ss.working_dir`` on success.
+
+    Both sentinels revert the selectbox value to the previous working
+    directory before triggering their action, so the sentinel string
+    never sticks around as the visible value (matches the branch
+    picker's ``_NEW_BRANCH_SENTINEL`` pattern).
     """
-    chosen = st.session_state.get("wd_select")
+    ss = st.session_state
+    chosen = ss.get("wd_select")
     if not chosen:
         return
     import actions
 
-    st.session_state.working_dir = chosen
+    if chosen in _WD_SENTINELS:
+        # Revert the dropdown so the sentinel label doesn't stick
+        # around. The action either updates ``ss.working_dir`` (which
+        # the next render will re-seed into ``ss.wd_select``) or
+        # leaves it alone if the user cancels.
+        previous = ss.get("working_dir") or ""
+        ss["wd_select"] = previous
+        if chosen == _WD_BROWSE_SENTINEL:
+            picked = actions.pick_directory(initial=previous)
+            if picked:
+                ss.working_dir = picked
+                actions.record_recent_dir(picked)
+                _persist_active_chat_setting("working_dir", picked)
+        elif chosen == _WD_NEW_PROJECT_SENTINEL:
+            ss.new_project_dialog_open = True
+        return
+
+    ss.working_dir = chosen
     actions.record_recent_dir(chosen)
     _persist_active_chat_setting("working_dir", chosen)
 
@@ -1033,74 +1172,137 @@ def _on_draft_change() -> None:
         pass
 
 
-def _render_project_context_indicator(working_dir: str) -> None:
-    summary = _scan_project_summary(working_dir or "")
+def _project_context_summary_pieces(summary: dict[str, Any]) -> list[str]:
+    """Build the ``["N guidance files", "M skills"]`` chips for the button label."""
     eager: list[dict[str, Any]] = list(summary.get("agents_md", [])) + list(
         summary.get("cursor_rules", [])
     )
     all_skills: list[dict[str, Any]] = summary.get("all_skills", [])
-    if not eager and not all_skills:
-        return
-
     pieces: list[str] = []
     if eager:
         pieces.append(f"{len(eager)} guidance file{'s' if len(eager) != 1 else ''}")
     if all_skills:
         pieces.append(f"{len(all_skills)} skill{'s' if len(all_skills) != 1 else ''}")
-    label = "Project context \u00b7 " + ", ".join(pieces)
-
-    with st.expander(label, icon=":material/menu_book:", expanded=False):
-        if eager:
-            st.markdown("**Eagerly loaded** (always sent to the model)")
-            for entry in eager:
-                marker = " :gray-badge[truncated]" if entry.get("truncated") else ""
-                st.markdown(f"- `{entry['path']}`{marker}")
-        if all_skills:
-            if eager:
-                st.divider()
-            st.markdown("**Conditionally loaded skills**")
-            st.caption(
-                "Auto-loaded when your message matches the keywords, or "
-                "force-loaded with `/<slug>` (type `/` in the chat input "
-                "for inline autocomplete)."
-            )
-            for skill in all_skills:
-                scope = skill.get("scope", "workspace")
-                badge = (
-                    ":blue-badge[workspace]" if scope == "workspace" else ":gray-badge[user]"
-                )
-                slug = skill.get("slug", "")
-                desc = skill.get("description", "")
-                st.markdown(f"- `/{slug}` {badge} \u2014 {desc}")
-                triggers = skill.get("triggers") or []
-                if triggers:
-                    preview = ", ".join(f"`{t}`" for t in triggers[:8])
-                    if len(triggers) > 8:
-                        preview += f", ... +{len(triggers) - 8} more"
-                    st.caption(f"Triggers: {preview}")
-        conflicts = summary.get("slug_conflicts") or []
-        if conflicts:
-            st.warning(
-                "User skills shadowed by workspace skills with the same slug: "
-                + ", ".join(f"`/{c}`" for c in conflicts),
-                icon=":material/warning:",
-            )
+    return pieces
 
 
-def _render_skills_popover(working_dir: str) -> None:
+def _render_project_context_button(working_dir: str) -> None:
+    """Render the Project context button on the model row.
+
+    Clicking the button opens the :func:`_project_context_dialog` modal
+    so the user can peek at what's loaded without the layout-shifting
+    inline expander we used to render at the tail of the workdir row.
+    The button stays in place even when the working directory has no
+    detected guidance / skills (rendered as disabled with a clear
+    tooltip) so the model row keeps a stable layout regardless of the
+    current workdir.
+    """
     summary = _scan_project_summary(working_dir or "")
+    pieces = _project_context_summary_pieces(summary)
+    has_context = bool(pieces)
+    # Label is **only** the counts (e.g. ``5 guidance · 12 skills``) —
+    # no leading "Project context" word. The ``:material/menu_book:``
+    # icon already conveys what the button is for, and dropping the
+    # word lets the label fit comfortably in the narrower column.
+    # Disabled state still surfaces a clear placeholder so the empty
+    # button isn't a mystery — see the help-text branch below.
+    if pieces:
+        label = "  \u00b7  ".join(pieces)
+        help_text = (
+            "Show eagerly-loaded guidance files and conditionally-"
+            "loaded skills the agent can pull in for this turn."
+        )
+    else:
+        label = "No project context"
+        help_text = (
+            "No project context detected. Add an `AGENTS.md` or "
+            "`.cursor/skills/` directory to your working directory "
+            "to give the agent always-on guidance and named skill "
+            "commands."
+        )
+    st.button(
+        label,
+        icon=":material/menu_book:",
+        key="chat_project_context_btn",
+        on_click=_open_project_context_dialog,
+        disabled=not has_context,
+        width="stretch",
+        help=help_text,
+    )
+
+
+def _open_project_context_dialog() -> None:
+    """Project-context-button callback: flip the dialog open."""
+    st.session_state.project_context_dialog_open = True
+
+
+def _close_project_context_dialog() -> None:
+    """Drop the dialog flag so subsequent reruns don't re-mount the modal."""
+    st.session_state.project_context_dialog_open = False
+
+
+@st.dialog("Project context", width="large", on_dismiss=_close_project_context_dialog)
+def _project_context_dialog() -> None:
+    """Modal showing eagerly-loaded guidance + conditionally-loaded skills.
+
+    Body shape mirrors what the now-deleted inline expander showed:
+    a list of always-on guidance files (AGENTS.md, .cursor/rules), a
+    list of skill commands the agent will auto-load when the user's
+    message matches, and a slug-conflict warning when workspace skills
+    shadow user-scope skills.
+
+    Mounted via the modal pattern so toggling the dialog never reflows
+    the chat input or the actions row — the user can peek at the
+    context, dismiss, and keep typing.
+
+    ``on_dismiss=_close_project_context_dialog`` is mandatory so X /
+    Esc / click-outside dismissal clears
+    ``ss.project_context_dialog_open``; otherwise the modal re-opens
+    on the very next rerun (e.g. when the user presses Enter to send
+    a chat message). See :func:`_diff_dialog` for the full rationale.
+    """
+    ss = st.session_state
+    working_dir = ss.working_dir or ""
+    summary = _scan_project_summary(working_dir)
+    eager: list[dict[str, Any]] = list(summary.get("agents_md", [])) + list(
+        summary.get("cursor_rules", [])
+    )
     all_skills: list[dict[str, Any]] = summary.get("all_skills", [])
-    if not all_skills:
-        return
-    with st.popover(
-        f":material/auto_fix_high: {len(all_skills)} skills",
-        help="Skills auto-load when your message matches their keywords. "
-        "Type `/` in the chat input for inline autocomplete, or pick from "
-        "the full list here.",
-    ):
+
+    if not eager and not all_skills:
+        st.info(
+            "No project context detected for this working directory.",
+            icon=":material/info:",
+        )
         st.caption(
-            "Type `/` in the chat input for inline autocomplete, or pick a "
-            "command below to see its description."
+            "Add an `AGENTS.md` (always-on guidance for the agent) or a "
+            "`.cursor/skills/` directory (named slash-commands the agent "
+            "can auto-load) to your working directory and reopen this "
+            "dialog."
+        )
+        if st.button(
+            "Close",
+            icon=":material/close:",
+            key="project_ctx_close_empty",
+            width="stretch",
+        ):
+            _close_project_context_dialog()
+            st.rerun()
+        return
+
+    if eager:
+        st.markdown("**Eagerly loaded** (always sent to the model)")
+        for entry in eager:
+            marker = " :gray-badge[truncated]" if entry.get("truncated") else ""
+            st.markdown(f"- `{entry['path']}`{marker}")
+    if all_skills:
+        if eager:
+            st.divider()
+        st.markdown("**Conditionally loaded skills**")
+        st.caption(
+            "Auto-loaded when your message matches the keywords, or "
+            "force-loaded with `/<slug>` (type `/` in the chat input "
+            "for inline autocomplete)."
         )
         for skill in all_skills:
             scope = skill.get("scope", "workspace")
@@ -1109,83 +1311,499 @@ def _render_skills_popover(working_dir: str) -> None:
             )
             slug = skill.get("slug", "")
             desc = skill.get("description", "")
-            st.markdown(f"`/{slug}` {badge} \u2014 {desc}")
+            st.markdown(f"- `/{slug}` {badge} \u2014 {desc}")
+            triggers = skill.get("triggers") or []
+            if triggers:
+                preview = ", ".join(f"`{t}`" for t in triggers[:8])
+                if len(triggers) > 8:
+                    preview += f", ... +{len(triggers) - 8} more"
+                st.caption(f"Triggers: {preview}")
+    conflicts = summary.get("slug_conflicts") or []
+    if conflicts:
+        st.warning(
+            "User skills shadowed by workspace skills with the same slug: "
+            + ", ".join(f"`/{c}`" for c in conflicts),
+            icon=":material/warning:",
+        )
+
+    st.divider()
+    if st.button(
+        "Close",
+        icon=":material/close:",
+        key="project_ctx_close_btn",
+        width="stretch",
+    ):
+        _close_project_context_dialog()
+        st.rerun()
 
 
-def _render_workdir_controls() -> None:
+def _render_chat_actions_row() -> None:
+    """Single combined row of git + file actions below the chat input.
+
+    Two layout shapes depending on whether a working directory has
+    been picked:
+
+    **No workdir selected yet** — the row collapses to just the
+    workdir picker (rendered full-width). The git controls (branch
+    picker, Changes, Sync) are hidden entirely because none of them
+    are actionable until the user points the agent at a folder.
+    Hiding (rather than disabling) keeps the brand-new-user state
+    quiet — a row of 3 grayed-out cells next to the picker would
+    just be noise. As soon as the user picks a folder via the
+    dropdown's recents / **Browse for a folder** / **Start a new
+    project** options, the next render falls into the full 4-cell
+    layout below.
+
+    **Workdir selected** — full 4-cell layout, left-to-right:
+      1. Working directory selectbox — also hosts two sentinel
+         options at the top of its list (**Browse for a folder** and
+         **Start a new project**) that fold the v1 browse + new-
+         project icon buttons into the dropdown itself.
+      2. Branch selectbox — also hosts two sentinel options at the
+         top of its list (**New branch** and **Fetch upstream
+         branches**) that fold the v1 new-branch + fetch icon
+         buttons into the dropdown itself, matching the workdir-
+         dropdown convention. No separate icon buttons.
+      3. Changes button (opens the live working-tree diff modal).
+      4. Sync primary button (bidirectional commit/pull/push pipeline)
+         — sits at the right end of the row as the primary action so
+         the user's eye reads "what's pending? then sync it" in left-
+         to-right order.
+
+    In the 4-cell layout, the branch picker and Changes button are
+    disabled rather than hidden when the workdir is set but isn't a
+    git repo / git is missing / there's nothing to view, so the
+    column layout stays stable as the user adds files or switches
+    between git-and-non-git folders. On a detached HEAD the branch
+    picker is replaced with a ``(detached HEAD)`` placeholder inside
+    the same column — which means fetch is also unavailable from the
+    UI in that state (since it now lives inside the dropdown that's
+    disabled). That's an intentional, narrow trade-off: the user's
+    workflow naturally requires checking out a branch before doing
+    anything else (Sync is also disabled in detached HEAD), and once
+    a branch is checked out the dropdown's Fetch sentinel becomes
+    reachable again. The hide-vs-disable rule is therefore
+    asymmetric: when there is no workdir at all, the git cells are
+    hidden (no possible action); once there is a workdir, the git
+    cells stay in place (disabled when the specific git op isn't
+    applicable, with a tooltip explaining why).
+
+    The new-project dialog is also mounted from this function (it's
+    triggered when the user picks the ``_WD_NEW_PROJECT_SENTINEL``
+    sentinel from the workdir dropdown). The new-branch dialog is
+    mounted from ``render()`` alongside the other dialogs.
+    """
     ss = st.session_state
 
-    wd_options: list[str] = []
-    if ss.working_dir:
+    # Workdir dropdown options: sentinels first, then the current
+    # workdir (if any), then recents. The sentinels are intercepted
+    # in ``_on_working_dir_select`` and never persisted as the
+    # working directory.
+    wd_options: list[str] = [_WD_BROWSE_SENTINEL, _WD_NEW_PROJECT_SENTINEL]
+    if ss.working_dir and ss.working_dir not in wd_options:
         wd_options.append(ss.working_dir)
     for d in ss.recent_dirs:
         if d not in wd_options:
             wd_options.append(d)
 
-    # The branch switcher relocated to the per-chat sidebar row (so each
-    # chat can pin its own branch without sharing a single dropdown);
-    # this row stays the simpler 3-column layout: workdir + browse +
-    # new-project.
-    wd_cols = st.columns([10, 1, 1], vertical_alignment="bottom")
+    initial_index = (
+        wd_options.index(ss.working_dir)
+        if ss.working_dir and ss.working_dir in wd_options
+        else 0
+    )
 
-    with wd_cols[0]:
+    chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
+    working_dir_str = (chat.working_dir if chat else "") or ss.working_dir or ""
+
+    # No workdir picked yet — short-circuit to a single full-width
+    # workdir picker so the user's eye lands on the one action they
+    # can usefully take. The git cells stay hidden entirely (rather
+    # than rendered as a row of disabled grayed-out controls) — a
+    # brand-new-user state is busy enough already without showing
+    # 4 cells the user can't interact with. The new-project dialog
+    # still mounts here because the workdir picker's sentinel
+    # options can open it.
+    if not working_dir_str:
         st.selectbox(
             "Working directory",
             options=wd_options,
-            index=wd_options.index(ss.working_dir) if ss.working_dir in wd_options else 0,
+            index=initial_index,
             key="wd_select",
             on_change=_on_working_dir_select,
-            format_func=_shorten_path,
+            format_func=lambda v: v if v in _WD_SENTINELS else _shorten_path(v),
             accept_new_options=True,
             placeholder="Choose or paste a directory",
             help=(
                 "Recent working directories. Pick from the list, paste a "
-                "custom path, click the folder icon to browse, or the plus "
-                "icon to start a new project."
+                "custom path, or pick **Browse for a folder...** / "
+                "**Start a new project...** at the top of the dropdown "
+                "(both prefixed with **›** to set them apart from real "
+                "directories) to open the OS picker / the new-project "
+                "modal."
+            ),
+        )
+        if ss.get("new_project_dialog_open"):
+            _new_project_dialog()
+        return
+
+    # Resolve git state once for the whole row so the branch picker,
+    # Sync button, and Changes button all see the same snapshot.
+    git_installed = git_ops.is_git_installed()
+    state: dict[str, Any] = {}
+    if git_installed:
+        state = _diff_git_state(working_dir_str)
+    in_repo = bool(state.get("in_repo"))
+    branch = state.get("current_branch") if in_repo else None
+    detached = in_repo and not branch
+    in_progress = bool(state.get("in_merge_or_rebase"))
+    entries: list[git_ops.StatusEntry] = list(state.get("status") or [])
+    dirty = bool(entries)
+
+    # Resolve the chat's qualified model id once for the Sync button
+    # tooltip + the eventual ``_run_sync_pipeline`` drain. The Sync
+    # flow's commit-message + PR-description steps go through
+    # :func:`commit_ai.generate_commit_message` /
+    # :func:`commit_ai.generate_pr_description`, which take the chat's
+    # currently selected model rather than a hard-coded DeepSeek id.
+    # ``_resolve_commit_ai_model`` returns the matching client +
+    # model + a user-friendly error message when either is missing
+    # (blank model, provider not connected, etc.).
+    chat_model_str = chat.model if chat else ""
+    _commit_client, _commit_model, commit_model_error = _resolve_commit_ai_model(
+        chat_model_str
+    )
+
+    # Branch selectbox options. We build them up-front so the Sync /
+    # Changes columns can still render even when the picker is empty.
+    # The two sentinels sit at the **top** of the list (mirroring the
+    # workdir dropdown's Browse / Start a new project sentinels):
+    # ``_NEW_BRANCH_SENTINEL`` first (creating a branch is the more
+    # common follow-up to looking at the list), then
+    # ``_FETCH_BRANCHES_SENTINEL`` (a refresh action that doesn't
+    # change the working tree). Both share the same leading ``›``
+    # glyph as the workdir sentinels so all four pinned action items
+    # read as a visually distinct group when the dropdown is open.
+    # Both fold the v1 standalone icon buttons into the same dropdown
+    # the user is already looking at — no separate icons needed.
+    local_branches = list(state.get("branches") or []) if in_repo else []
+    remote_branches = list(state.get("remote_branches") or []) if in_repo else []
+    remote_only = [
+        rb for rb in remote_branches
+        if rb.split("/", 1)[-1] not in local_branches
+    ]
+    branch_options: list[str] = []
+    if in_repo and not detached:
+        branch_options.append(_NEW_BRANCH_SENTINEL)
+        branch_options.append(_FETCH_BRANCHES_SENTINEL)
+    if branch and branch not in local_branches:
+        branch_options.append(branch)
+    branch_options.extend(local_branches)
+    branch_options.extend(remote_only)
+
+    # Stable 4-cell layout. Wider weight on the workdir + branch
+    # selectboxes (which carry text) and on the Sync + Changes buttons
+    # (which carry text labels). The branch column absorbs the width
+    # the v1 layout reserved for a standalone fetch icon — that
+    # affordance now lives as a sentinel option at the top of the
+    # branch dropdown alongside ``_NEW_BRANCH_SENTINEL``.
+    cols = st.columns([5, 5, 3, 3], vertical_alignment="bottom")
+
+    # Cell 1: working directory. The sentinel options
+    # ``_WD_BROWSE_SENTINEL`` and ``_WD_NEW_PROJECT_SENTINEL`` live at
+    # the top of the list; ``_on_working_dir_select`` intercepts them
+    # and routes to the OS picker / the new-project modal
+    # respectively. The current workdir / recents follow.
+    with cols[0]:
+        st.selectbox(
+            "Working directory",
+            options=wd_options,
+            index=initial_index,
+            key="wd_select",
+            on_change=_on_working_dir_select,
+            format_func=lambda v: v if v in _WD_SENTINELS else _shorten_path(v),
+            accept_new_options=True,
+            placeholder="Choose or paste a directory",
+            help=(
+                "Recent working directories. Pick from the list, paste a "
+                "custom path, or pick **Browse for a folder...** / "
+                "**Start a new project...** at the top of the dropdown "
+                "(both prefixed with **›** to set them apart from real "
+                "directories) to open the OS picker / the new-project "
+                "modal."
             ),
         )
 
-    browse_col = wd_cols[1]
-    new_proj_col = wd_cols[2]
+    # Cell 2: branch selectbox (or detached-HEAD caption / disabled
+    # placeholder when the workdir isn't a usable git repo).
+    with cols[1]:
+        if not git_installed:
+            st.selectbox(
+                "Branch",
+                options=["(git not installed)"],
+                index=0,
+                disabled=True,
+                key="chat_actions_branch_disabled_no_git",
+                label_visibility="collapsed",
+                help="Install git to enable branch operations.",
+            )
+        elif not in_repo:
+            st.selectbox(
+                "Branch",
+                options=["(not a git repo)"],
+                index=0,
+                disabled=True,
+                key="chat_actions_branch_disabled_no_repo",
+                label_visibility="collapsed",
+                help=(
+                    "The working directory is not a git repository. Run "
+                    "`git init`, or pick a different directory, to enable "
+                    "branch operations."
+                ),
+            )
+        elif detached:
+            st.selectbox(
+                "Branch",
+                options=["(detached HEAD)"],
+                index=0,
+                disabled=True,
+                key=f"chat_actions_branch_detached_{chat.id if chat else 'no_chat'}",
+                label_visibility="collapsed",
+                help=(
+                    "Detached HEAD. Switch to a branch via the command line "
+                    "to enable branch operations and sync."
+                ),
+            )
+        else:
+            select_key = f"chat_bottom_branch_select_{chat.id}"
+            sentinel_key = f"_chat_bottom_branch_active_{chat.id}"
+            ss[sentinel_key] = branch
+            # Defensive: never seed the visible value with one of the
+            # sentinel entries — fall through to the first real
+            # branch if we somehow can't find ``branch`` in the
+            # option list (shouldn't happen, but keeps the dropdown
+            # showing a real branch name even if our model drifts).
+            if branch in branch_options:
+                ss[select_key] = branch
+            else:
+                real_options = [
+                    b for b in branch_options if b not in _BRANCH_SENTINELS
+                ]
+                ss[select_key] = real_options[0] if real_options else branch_options[0]
+            st.selectbox(
+                "Branch",
+                options=branch_options,
+                key=select_key,
+                on_change=_on_chat_git_branch_change,
+                args=(chat.id,),
+                label_visibility="collapsed",
+                format_func=lambda b: (
+                    b if b in _BRANCH_SENTINELS
+                    # Selectbox option labels render as raw strings —
+                    # Material tokens don't work here, so use a plain
+                    # text marker for remote-only refs.
+                    else (f"{b}  (remote)" if b in remote_only else b)
+                ),
+                help=(
+                    "Switch this chat's working-directory branch, create "
+                    "a new branch, or fetch upstream branches from origin. "
+                    "**New branch...** and **Fetch upstream branches** "
+                    "(both prefixed with **›** at the top of the dropdown "
+                    "to set them apart from real branch names) trigger "
+                    "the create / fetch flows; everything below is a real "
+                    "branch you can check out. Pick a `(remote)` entry "
+                    "to check out a remote-only branch as a new local "
+                    "tracking branch. Uncommitted changes come along on "
+                    "the switch when there's no conflict; git surfaces a "
+                    "clear error when the target branch would overwrite "
+                    "a dirty file."
+                ),
+            )
 
-    with browse_col:
-        if st.button(
-            "",
-            icon=":material/folder_open:",
-            key="wd_pick_btn",
-            help="Browse for a working directory",
-            width="stretch",
-        ):
-            import actions
-            chosen = actions.pick_directory(initial=ss.working_dir)
-            if chosen:
-                ss.working_dir = chosen
-                actions.record_recent_dir(chosen)
-                st.rerun()
-    with new_proj_col:
+    # Cell 3: Changes (live working-tree diff modal).
+    with cols[2]:
+        changes_disabled = not (in_repo and dirty)
+        if not in_repo:
+            # Empty placeholder label keeps the cell width — the
+            # ``:material/difference:`` icon still conveys what the
+            # button is for, and the disabled state + tooltip explain
+            # the why.
+            changes_label = " "
+            changes_help = (
+                "Pick a git working directory to view the working-tree diff."
+            )
+        elif not dirty:
+            changes_label = " "
+            changes_help = "Working tree is clean. Nothing to view."
+        else:
+            working_dir_resolved = Path(working_dir_str).expanduser().resolve()
+            counts = git_ops.summary_diff_counts(
+                working_dir_resolved,
+                [e.path for e in entries if not e.is_untracked],
+            )
+            total_adds = 0
+            total_dels = 0
+            for entry in entries:
+                adds, dels = counts.get(entry.path, (0, 0))
+                if entry.is_untracked and adds == 0:
+                    adds = git_ops.untracked_line_count(
+                        working_dir_resolved, entry.path
+                    )
+                total_adds += adds
+                total_dels += dels
+            n = len(entries)
+            # Compact label without the leading "Changes" word — the
+            # ``:material/difference:`` icon already indicates this is
+            # the changes button, and dropping the word lets the
+            # +adds/−dels chip + file count fit on a single line in the
+            # narrow column.
+            changes_label = (
+                f"+{total_adds} \u2212{total_dels}  "
+                f"\u00b7  {n} file{'s' if n != 1 else ''}"
+            )
+            changes_help = "View the live working-tree diff in an overlay."
         st.button(
-            "",
-            icon=":material/create_new_folder:",
-            key="wd_new_proj_btn",
-            help="Start a new project (create a folder, git init, optionally wire an upstream).",
-            on_click=_open_new_project_dialog,
+            changes_label,
+            icon=":material/difference:",
+            key="chat_diff_open_btn",
             width="stretch",
+            on_click=_open_diff_dialog,
+            help=changes_help,
+            disabled=changes_disabled,
         )
 
-    _render_project_context_indicator(ss.working_dir)
+    # Cell 4: Sync (bidirectional commit / pull / push). Sits at the
+    # right end of the row as the primary action — eye lands on it
+    # last, after the user has had a chance to glance at the Changes
+    # button to confirm what's about to be synced.
+    with cols[3]:
+        sync_disabled, sync_help = _sync_button_state(
+            in_repo=in_repo,
+            detached=detached,
+            in_progress=in_progress,
+            operation=state.get("operation"),
+            dirty=dirty,
+            commit_model_error=commit_model_error,
+            commit_model=_commit_model,
+            working_dir_str=working_dir_str,
+            branch=branch,
+        )
+        st.button(
+            "Sync",
+            icon=":material/sync:",
+            type="primary",
+            key=(
+                f"chat_bottom_sync_{chat.id}"
+                if chat else "chat_bottom_sync_no_chat"
+            ),
+            on_click=_on_chat_git_sync_clicked,
+            disabled=sync_disabled,
+            width="stretch",
+            help=sync_help,
+        )
 
     if ss.get("new_project_dialog_open"):
         _new_project_dialog()
 
 
+def _sync_button_state(
+    *,
+    in_repo: bool,
+    detached: bool,
+    in_progress: bool,
+    operation: str | None,
+    dirty: bool,
+    commit_model_error: str | None,
+    commit_model: str | None,
+    working_dir_str: str,
+    branch: str | None,
+) -> tuple[bool, str]:
+    """Decide whether the Sync button is enabled and what its tooltip says.
+
+    The state machine is the read-only mirror of
+    :func:`_run_sync_pipeline`'s preconditions: anything that would
+    cause the pipeline to early-return with a toast becomes a disabled
+    + helpful-tooltip state on the button.
+
+    ``commit_model_error`` / ``commit_model`` come from
+    :func:`_resolve_commit_ai_model`. When the working tree is dirty
+    we need a usable model for the commit-message draft; when it's
+    clean we don't (Sync just fetches + pulls + pushes).
+
+    Returns ``(disabled, help_text)``.
+    """
+    if not in_repo:
+        return True, "Pick a git working directory to enable sync."
+    if detached or branch is None:
+        return True, "Detached HEAD. Check out a branch to enable sync."
+    if in_progress:
+        return (
+            True,
+            f"In-progress `{operation or 'merge'}` — resolve before syncing.",
+        )
+    if dirty and commit_model_error is not None:
+        return True, commit_model_error
+
+    has_upstream = False
+    behind = False
+    ahead = False
+    if working_dir_str:
+        working_dir = Path(working_dir_str).expanduser().resolve()
+        try:
+            has_upstream = git_ops.has_upstream(working_dir, branch)
+            if has_upstream:
+                behind = git_ops.is_behind_upstream(working_dir)
+                ahead = git_ops.is_ahead_of_upstream(working_dir)
+        except Exception:  # noqa: BLE001 — best-effort UI predicate
+            pass
+
+    if dirty:
+        # ``commit_model`` is the qualified ``<provider>:<raw>`` id;
+        # show only the raw bit in the tooltip so it reads naturally.
+        model_label_short = (
+            unqualified(commit_model) if commit_model else "the chat's model"
+        )
+        return (
+            False,
+            f"Sync: commit local changes (`{model_label_short}`-drafted "
+            "message), fetch, pull --rebase if behind, and push if ahead.",
+        )
+    if not has_upstream:
+        return (
+            False,
+            "Branch has no upstream yet. Sync opens the Publish branch "
+            "dialog so you can push and optionally open a pull request.",
+        )
+    if behind and ahead:
+        return (
+            False,
+            "Sync: pull --rebase upstream changes, then push your local "
+            "commits.",
+        )
+    if behind:
+        return False, "Sync: pull --rebase upstream changes from origin."
+    if ahead:
+        return False, "Sync: push local commits to origin."
+    # Even with nothing to commit / pull / push, Sync still runs
+    # `git fetch --prune` and bumps the git-state nonce so any new
+    # remote branches show up in the branch dropdown (and any
+    # branches deleted on origin disappear). That's a useful action
+    # in its own right, so the button stays enabled here.
+    return (
+        False,
+        f"Sync: fetch from origin to refresh the branch list "
+        f"(already up to date with `origin/{branch}`).",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Start-a-new-project dialog
 # ---------------------------------------------------------------------------
-# This dialog lives next to ``_render_workdir_controls`` because it's an
-# affordance of the working-directory picker, not a standalone page-level
-# concern. All filesystem / GitHub / git work is delegated to ``account.py``
-# (see "Project bootstrap helpers" there); this module only owns the form
-# fields, validation, and orchestration.
+# This dialog is an affordance of the working-directory picker in
+# ``_render_chat_actions_row`` (the new-project icon button) — opened
+# via the ``ss.new_project_dialog_open`` flag and mounted from inside
+# the actions-row helper. All filesystem / GitHub / git work is
+# delegated to ``account.py`` (see "Project bootstrap helpers" there);
+# this module only owns the form fields, validation, and orchestration.
 
 _UPSTREAM_NONE = "None"
 _UPSTREAM_REMOTE = "Link existing remote"
@@ -1540,7 +2158,17 @@ def _close_model_picker() -> None:
 
 
 def _select_model(qualified_id: str) -> None:
-    """Pick callback: write ``qualified_id`` to ``ss.model`` + active chat."""
+    """Apply the picked model to canonical state + close the modal.
+
+    Called from ``_render_model_row`` script-body context (NOT as an
+    ``on_click`` callback): an ``@st.dialog`` only actually closes when
+    ``st.rerun()`` is invoked from the dialog body, and ``st.rerun()``
+    inside ``on_click`` callbacks is a no-op (per AGENTS.md). The caller
+    is responsible for calling ``st.rerun()`` immediately after this
+    helper returns; we keep the rerun out of here because tests and
+    future non-dialog callers might want the state mutation without the
+    forced rerun.
+    """
     st.session_state.model = qualified_id
     _persist_active_chat_setting("model", qualified_id)
     _close_model_picker()
@@ -1614,6 +2242,124 @@ _TAB_TAG_FOR: dict[str, str] = {
 }
 
 
+# Column weights shared between the picker table header and each
+# model row so the cells align. ``[Model | Context | $/M in |
+# $/M out | Select]``. Skewed heavily toward Model because the
+# description is the column users actually search by eye; the
+# numeric columns only need room for short formatted values
+# (``128k``, ``$0.50``). Keep these in sync with
+# ``_render_picker_table_header`` and ``_render_model_row``.
+_PICKER_TABLE_WEIGHTS = [8, 1, 1, 1, 1.2]
+
+
+# Sortable columns: header label + the ``ModelInfo`` attribute the
+# sort reads. Add a column by appending here AND widening
+# ``_PICKER_TABLE_WEIGHTS`` by one slot.
+_PICKER_SORT_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("context", "Context", "context"),
+    ("input", "$/M in", "input_price_per_1m"),
+    ("output", "$/M out", "output_price_per_1m"),
+)
+
+
+def _cycle_picker_sort(column: str) -> None:
+    """Cycle the picker's sort state for ``column``: inactive → asc → desc → cleared.
+
+    Wired to each column-header button's ``on_click``. Mutating
+    ``ss._model_picker_sort`` from a callback triggers Streamlit's
+    automatic rerun, which re-renders the modal body with the new
+    order applied via :func:`_apply_picker_sort`.
+    """
+    ss = st.session_state
+    current = ss.get("_model_picker_sort")
+    if not current or current.get("column") != column:
+        ss._model_picker_sort = {"column": column, "direction": "asc"}
+    elif current.get("direction") == "asc":
+        ss._model_picker_sort = {"column": column, "direction": "desc"}
+    else:
+        ss._model_picker_sort = None
+
+
+def _render_picker_table_header(*, key_prefix: str) -> None:
+    """Render the sortable column-header row above each tab body.
+
+    ``key_prefix`` scopes the per-column button keys to the active
+    tab (mirrors :func:`_render_model_row`'s Select-button scoping)
+    so a model that surfaces in multiple tabs doesn't collide on
+    ``StreamlitDuplicateElementKey``. Cell 0 is a plain "Model"
+    caption — alphabetical-by-label isn't a useful axis when the
+    default order is the curated recommended list. Cells 1-3 are
+    ``type="tertiary"`` buttons whose label carries a Material
+    arrow when that column is the active sort.
+    """
+    ss = st.session_state
+    sort = ss.get("_model_picker_sort") or {}
+    active_column = sort.get("column")
+    active_direction = sort.get("direction")
+
+    cols = st.columns(_PICKER_TABLE_WEIGHTS, vertical_alignment="center")
+    with cols[0]:
+        st.caption("Model")
+    for idx, (col_key, col_label, _attr) in enumerate(_PICKER_SORT_COLUMNS, start=1):
+        with cols[idx]:
+            if col_key == active_column:
+                icon = (
+                    ":material/arrow_upward:"
+                    if active_direction == "asc"
+                    else ":material/arrow_downward:"
+                )
+                btn_label = f"{icon} {col_label}"
+            else:
+                btn_label = col_label
+            st.button(
+                btn_label,
+                key=f"_picker_sort_{key_prefix}_{col_key}",
+                type="tertiary",
+                on_click=_cycle_picker_sort,
+                args=(col_key,),
+                help=f"Sort by {col_label}.",
+            )
+
+
+def _apply_picker_sort(qualified_ids: list[str]) -> list[str]:
+    """Apply ``ss._model_picker_sort`` to ``qualified_ids``.
+
+    Returns the input unchanged when no column is active. Otherwise
+    reads the configured ``ModelInfo`` attribute and sorts ascending
+    or descending. The strict completeness gate guarantees chat
+    models always carry context + both axis prices, but we still
+    push ``None`` to the end defensively so a future media-mode
+    surface in the picker doesn't crash on a missing field.
+    """
+    ss = st.session_state
+    sort = ss.get("_model_picker_sort")
+    if not sort:
+        return qualified_ids
+    column = sort.get("column")
+    direction = sort.get("direction", "asc")
+    attr = next(
+        (a for k, _label, a in _PICKER_SORT_COLUMNS if k == column),
+        None,
+    )
+    if attr is None:
+        return qualified_ids
+    descending = (direction == "desc")
+
+    def _key(qid: str) -> tuple[int, float | int]:
+        info = model_catalog.get_info(qid)
+        if info is None:
+            return (1, 0)
+        value = getattr(info, attr, None)
+        if value is None:
+            return (1, 0)
+        # Negate for descending sort while keeping the missing-value
+        # sentinel ``(1, ...)`` after present values regardless of
+        # direction.
+        return (0, -value if descending else value)
+
+    return sorted(qualified_ids, key=_key)
+
+
 def _render_model_row(qualified_id: str, *, key_prefix: str) -> None:
     """Render one model row inside the picker modal.
 
@@ -1623,10 +2369,15 @@ def _render_model_row(qualified_id: str, *, key_prefix: str) -> None:
     needs the tab as a scope qualifier or Streamlit raises a
     ``StreamlitDuplicateElementKey`` error.
 
-    A bordered container with three columns:
-    [provider badge + label + description | context + pricing chips | Select button].
-    The Select button is ``type="primary"`` for the currently-selected
-    model so users can see at a glance what they're already using.
+    A bordered container shaped as a 5-cell table row matching the
+    column headers rendered by :func:`_render_picker_table_header`:
+    ``[Model | Context | $/M in | $/M out | Select]``. The Select
+    button is ``type="primary"`` for the currently-selected model so
+    users can see at a glance what they're already using. Cached-input
+    pricing (when set) renders as a small caption directly under the
+    Input price — cache-hit pricing is an OpenAI / Anthropic
+    convention that applies to *input* tokens, so it belongs under
+    the Input column rather than earning its own column.
     """
     info = model_catalog.get_info(qualified_id)
     if info is None:
@@ -1640,29 +2391,44 @@ def _render_model_row(qualified_id: str, *, key_prefix: str) -> None:
     is_current = (st.session_state.model == qualified_id)
 
     with st.container(border=True):
-        cols = st.columns([5, 2, 1], vertical_alignment="center")
+        cols = st.columns(_PICKER_TABLE_WEIGHTS, vertical_alignment="center")
         with cols[0]:
             st.markdown(
                 f"{_provider_badge(info.provider_id)} **{info.label}**"
             )
             st.caption(info.description)
         with cols[1]:
-            chips: list[str] = [f":gray-badge[{_format_context(info.context)} context]"]
-            chips.append(f":gray-badge[{_format_price(info.input_price_per_1m)}/M in]")
-            chips.append(f":gray-badge[{_format_price(info.output_price_per_1m)}/M out]")
-            if info.cache_hit_price_per_1m is not None:
-                chips.append(f":gray-badge[{_format_price(info.cache_hit_price_per_1m)}/M cached]")
-            st.markdown(" ".join(chips))
+            st.markdown(_format_context(info.context))
         with cols[2]:
-            st.button(
+            st.markdown(f"{_format_price(info.input_price_per_1m)}/M")
+            if info.cache_hit_price_per_1m is not None:
+                st.caption(
+                    f"{_format_price(info.cache_hit_price_per_1m)}/M cached"
+                )
+        with cols[3]:
+            st.markdown(f"{_format_price(info.output_price_per_1m)}/M")
+        with cols[4]:
+            # NOTE: deliberately uses the "if button: ... st.rerun()"
+            # pattern (mirrors ``_mcp_server_dialog`` in settings.py)
+            # rather than ``on_click=_select_model``. ``@st.dialog``
+            # modals only actually close when ``st.rerun()`` runs in
+            # the dialog body — an auto-rerun triggered by an
+            # ``on_click`` callback updates state but does NOT close
+            # the modal in the user's browser, so picking a model
+            # would silently apply the change while leaving the modal
+            # stuck open. AGENTS.md's "do not call ``st.rerun`` inside
+            # an ``on_click`` callback" rule (the rerun no-ops with a
+            # warning) is what forces this body-pattern instead.
+            picked = st.button(
                 "Selected" if is_current else "Select",
                 key=f"_pick_{key_prefix}_{qualified_id}",
                 type="primary" if is_current else "secondary",
                 disabled=is_current,
-                on_click=_select_model,
-                args=(qualified_id,),
                 width="stretch",
             )
+            if picked:
+                _select_model(qualified_id)
+                st.rerun()
 
 
 def _connected_qualified_ids() -> list[str]:
@@ -1771,8 +2537,13 @@ def _model_picker_dialog() -> None:
     1. Header row: title + Refresh button + last-refreshed caption.
     2. Search box.
     3. Tabs over capability buckets.
-    4. Per-tab list of model rows.
+    4. Per-tab sortable column-header row + list of model rows.
     5. Footer caption surfacing the count of hidden models.
+
+    Per-source connect / refresh errors are intentionally NOT
+    surfaced here — they live on the Settings provider card so the
+    user sees the failure where they can fix the credentials and
+    the picker stays on-task as a model-selection surface.
 
     The modal is gated by ``ss.model_picker_open`` and dismissed via
     ``on_dismiss=_close_model_picker`` (per AGENTS.md @st.dialog rule).
@@ -1820,12 +2591,11 @@ def _model_picker_dialog() -> None:
                 key="_picker_refresh_btn",
             )
 
-    # Per-source error chips (OpenRouter / per-provider).
-    errs = model_catalog.errors()
-    if errs:
-        with st.container(border=False):
-            for source, msg in sorted(errs.items()):
-                st.caption(f":red[:material/error: {source}: {msg}]")
+    # NOTE: per-source connect / refresh errors are intentionally NOT
+    # rendered here. They live on the Settings provider card via
+    # ``_render_provider_card``'s ``st.error(error)`` so the user sees
+    # the failure where they can fix the credentials, and the picker
+    # stays on-task as a model-selection surface.
 
     # Search box.
     st.text_input(
@@ -1891,7 +2661,8 @@ def _model_picker_dialog() -> None:
                     continue
                 # Slugify the tab label into a stable key prefix.
                 key_prefix = tab_label.replace(" ", "_").replace("&", "and").lower()
-                for qid in tab_ids:
+                _render_picker_table_header(key_prefix=key_prefix)
+                for qid in _apply_picker_sort(tab_ids):
                     _render_model_row(qid, key_prefix=key_prefix)
 
     # Footer: hidden-models caption.
@@ -1912,12 +2683,19 @@ def _model_picker_dialog() -> None:
 
 
 def _render_model_controls() -> None:
-    """Render the Mode dropdown + the current-model button + skills popover.
+    """Render the Mode dropdown + the current-model button + Project context button.
 
-    Replaces the old Model selectbox with a button that opens the
-    @st.dialog model picker. The button label shows the current
-    model's provider badge + label so users see at a glance what
-    they're using; clicking opens the modal.
+    The model selectbox was replaced with a button that opens the
+    ``@st.dialog`` model picker — its label shows the current
+    model's provider + label so users see at a glance what they're
+    using; clicking opens the modal.
+
+    Column weights ``[1, 5, 2]`` make Mode the smallest cell (it
+    only ever shows ``Agent`` / ``Ask only``), give the Model
+    button the lion's share (it carries the longest text — provider
+    + model name), and reserve a moderate slot for the Project
+    context button (now a compact ``N guidance · M skills`` label
+    with no "Project context" word).
     """
     ss = st.session_state
 
@@ -1926,7 +2704,7 @@ def _render_model_controls() -> None:
     # non-widget and survives navigation.
     ss["_chat_mode_input"] = ss.mode if ss.mode in ("agent", "ask") else "agent"
 
-    cols = st.columns([1, 2, 1], vertical_alignment="bottom")
+    cols = st.columns([1, 5, 2], vertical_alignment="bottom")
     with cols[0]:
         st.selectbox(
             "Mode",
@@ -1976,7 +2754,7 @@ def _render_model_controls() -> None:
                 help=help_text,
             )
     with cols[2]:
-        _render_skills_popover(ss.working_dir)
+        _render_project_context_button(ss.working_dir)
 
     # Inline model-card caption — surfaces the chips below the button so
     # the user has at-a-glance pricing info without opening the modal.
@@ -2203,9 +2981,9 @@ def _render_xai_live_search_toggle(chat: chats.Chat) -> None:
 # ---------------------------------------------------------------------------
 # The chat page is the single rendering site for the live working-tree
 # unified diff. Surface area:
-#   - ``_render_chat_diff_button``: a "Changes" button rendered just
-#     below the bottom-of-chat git row (i.e. a couple of rows below the
-#     chat input); hidden when there are no changes / not a git repo.
+#   - The Changes button at the right of ``_render_chat_actions_row``;
+#     disabled (rather than hidden) when the working tree is clean /
+#     workdir isn't a git repo, so the row layout stays stable.
 #   - ``_diff_dialog`` (mounted from ``render()``): a modal overlay
 #     showing the TOC + per-file diff sections, gated by
 #     ``ss.diff_dialog_open``.
@@ -2270,23 +3048,110 @@ def _diff_for_entry(working_dir: Path, entry: git_ops.StatusEntry) -> str:
         return f"(git diff failed: {e.stderr})"
 
 
+def _safe_path_key(path: str) -> str:
+    """Sanitize a path string for use as a Streamlit widget key suffix.
+
+    Paths can contain slashes, dots, and other characters that Streamlit
+    accepts in keys but that we don't want littering the rendered key
+    string (it shows up in the DOM as the row's ``data-testid`` slug).
+    Replace any non-alphanumeric run with a single underscore so the
+    resulting key is stable and unique across the per-file ``Discard``
+    popover trigger + the inner Confirm button.
+    """
+    return re.sub(r"[^A-Za-z0-9_]+", "_", path).strip("_") or "root"
+
+
+def _on_discard_one_file(
+    working_dir_str: str, entry: git_ops.StatusEntry
+) -> None:
+    """Per-file Discard confirm callback — runs ``git_ops.discard_changes``.
+
+    Streamlit ``on_click`` callback context: must NOT call ``st.rerun()``
+    (Streamlit reruns automatically after callbacks per AGENTS.md). We
+    bump the chat-page git nonce so the cached scan re-reads the
+    working tree on the next render, and toast the result. ``st.toast``
+    is allowed inside callbacks (only ``st.rerun`` / ``st.switch_page``
+    are forbidden).
+    """
+    if not working_dir_str:
+        return
+    working_dir = Path(working_dir_str).expanduser().resolve()
+    try:
+        git_ops.discard_changes(working_dir, entry)
+    except GitError as e:
+        _toast_git_error("git restore failed", e)
+        return
+    _bump_chat_git_nonce()
+    label = entry.orig_path if (entry.is_renamed and entry.orig_path) else entry.path
+    st.toast(
+        f"Discarded changes to `{label}`",
+        icon=":material/undo:",
+    )
+
+
+def _on_discard_all_files(
+    working_dir_str: str, entries: list[git_ops.StatusEntry]
+) -> None:
+    """Top-of-modal "Discard all" confirm callback — bulk discard.
+
+    Routes through :func:`git_ops.discard_all_changes` which collapses
+    the per-entry work into one ``git restore`` + one ``git clean``
+    call so reverting a large working tree stays fast even on the
+    on-click path. Same callback-context rules as
+    :func:`_on_discard_one_file` (no ``st.rerun()``; ``st.toast`` OK).
+    """
+    if not working_dir_str or not entries:
+        return
+    working_dir = Path(working_dir_str).expanduser().resolve()
+    try:
+        git_ops.discard_all_changes(working_dir, entries)
+    except GitError as e:
+        _toast_git_error("git restore failed", e)
+        return
+    _bump_chat_git_nonce()
+    n = len(entries)
+    st.toast(
+        f"Discarded changes to {n} file{'s' if n != 1 else ''}",
+        icon=":material/undo:",
+    )
+
+
 def _render_diff_file_section(
     entry: git_ops.StatusEntry,
     counts: dict[str, tuple[int, int]],
     working_dir: Path,
+    working_dir_str: str,
 ) -> None:
-    """Render one file as a collapsed-by-default ``st.expander``.
+    """Render one file as a collapsed-by-default ``st.expander`` + Discard.
 
-    The expander label carries everything the user needs to triage a
-    file without expanding it: path (or ``orig → new`` for renames), a
-    ``:green[+adds] :red[−dels]`` chip, and a state badge for
-    untracked / deleted / renamed / staged-only / unstaged-only files.
-    Expanding the expander shows the unified ``git diff`` body. We
-    deliberately render every file collapsed (``expanded=False``)
+    Layout: a 2-column row whose left cell holds the expander (path +
+    +adds/−dels chip + state badge in the label, unified diff in the
+    body when expanded) and whose right cell holds a ``st.popover``
+    trigger labeled **Discard** that opens a small confirmation pane
+    inline. The popover is the inline-confirm pattern: a warning + a
+    primary-styled **Confirm** button whose ``on_click`` runs
+    ``git_ops.discard_changes`` against this single entry. We use a
+    popover (rather than a second ``@st.dialog`` for the confirmation,
+    or a 2-step button-label-changes-on-click pattern) because:
+
+    1. Streamlit doesn't support nested ``@st.dialog``s — the Changes
+       modal is itself a dialog, so a nested confirm dialog isn't an
+       option.
+    2. ``st.popover`` is exactly the right shape — a small overlay
+       anchored to the trigger button, dismissible via click-outside
+       — so the user gets a "are you sure?" step without losing
+       sight of the file they're about to discard, and without
+       reflowing the rest of the modal.
+    3. The 2-step button approach (first click changes label to
+       "Confirm?") doesn't read as confirmation in screenshots / docs
+       and is easy to mis-click.
+
+    We deliberately render every file collapsed (``expanded=False``)
     because long working-tree diffs were dominating the modal — the
     user explicitly asked for "collapsed by default" so the dialog
     reads as a list of files first, with the line-by-line walk
-    available on demand.
+    available on demand. The discard button stays visible regardless
+    of expander state because it's outside the expander.
     """
     adds, dels = counts.get(entry.path, (0, 0))
     if entry.is_untracked and adds == 0:
@@ -2305,12 +3170,48 @@ def _render_diff_file_section(
         label_parts.append(state_label)
     label = "  \u00b7  ".join(label_parts)
 
-    with st.expander(label, expanded=False):
-        diff = _diff_for_entry(working_dir, entry)
-        if diff.strip():
-            st.code(diff, language="diff")
-        else:
-            st.caption("(no textual diff — likely a binary file)")
+    # 8/2 column split: the expander (with its diff body) gets the
+    # bulk of the width so unified-diff lines stay readable when the
+    # user expands a file; the Discard popover trigger sits on the
+    # right end of the row at a comfortable touch target. The popover
+    # body (which includes the warning + Confirm button) renders as a
+    # floating overlay anchored to the trigger button — it doesn't
+    # occupy column space.
+    cols = st.columns([8, 2], vertical_alignment="top")
+    with cols[0]:
+        with st.expander(label, expanded=False):
+            diff = _diff_for_entry(working_dir, entry)
+            if diff.strip():
+                st.code(diff, language="diff")
+            else:
+                st.caption("(no textual diff — likely a binary file)")
+    with cols[1]:
+        path_key = _safe_path_key(entry.path)
+        with st.popover(
+            "Discard",
+            icon=":material/undo:",
+            help="Discard changes to this file (cannot be undone)",
+            width="stretch",
+        ):
+            display_path = (
+                f"`{entry.orig_path}` → `{entry.path}`"
+                if (entry.is_renamed and entry.orig_path)
+                else f"`{entry.path}`"
+            )
+            st.markdown(f"Discard changes to {display_path}?")
+            st.warning(
+                "This permanently removes the changes from your working tree.",
+                icon=":material/warning:",
+            )
+            st.button(
+                "Confirm",
+                icon=":material/undo:",
+                type="primary",
+                width="stretch",
+                key=f"diff_dlg_discard_confirm_{path_key}",
+                on_click=_on_discard_one_file,
+                args=(working_dir_str, entry),
+            )
 
 
 def _open_diff_dialog() -> None:
@@ -2396,12 +3297,7 @@ def _diff_dialog() -> None:
     in_progress = bool(state.get("in_merge_or_rebase"))
 
     chat_label = chat.title if chat and chat.title else "active chat"
-    if entries:
-        st.caption(
-            f"Chat: **{chat_label}** \u00b7 branch `{branch}` \u00b7 "
-            f"{len(entries)} file{'s' if len(entries) != 1 else ''} changed"
-        )
-    else:
+    if not entries:
         st.caption(f"Chat: **{chat_label}** \u00b7 branch `{branch}`")
         st.success(
             "Working tree clean. Nothing to push.",
@@ -2412,19 +3308,57 @@ def _diff_dialog() -> None:
             st.rerun()
         return
 
+    # Header row: caption on the left, "Discard all" popover on the
+    # right. Column ratio [6, 2] keeps the caption comfortable on
+    # typical chat titles while leaving the right column wide enough
+    # for the labeled "Discard all" trigger button at width="stretch".
+    # Using `vertical_alignment="center"` so the caption baseline lines
+    # up with the button regardless of the caption's natural height.
+    file_count = f"{len(entries)} file{'s' if len(entries) != 1 else ''} changed"
+    header_cols = st.columns([6, 2], vertical_alignment="center")
+    with header_cols[0]:
+        st.caption(
+            f"Chat: **{chat_label}** \u00b7 branch `{branch}` \u00b7 {file_count}"
+        )
+    with header_cols[1]:
+        with st.popover(
+            "Discard all",
+            icon=":material/undo:",
+            help="Discard every change in this list (cannot be undone)",
+            width="stretch",
+        ):
+            st.markdown(f"Discard all **{file_count}**?")
+            st.warning(
+                "This permanently removes every change from your working "
+                "tree. There is no in-product undo.",
+                icon=":material/warning:",
+            )
+            st.button(
+                "Confirm",
+                icon=":material/undo:",
+                type="primary",
+                width="stretch",
+                key="diff_dlg_discard_all_confirm",
+                on_click=_on_discard_all_files,
+                args=(working_dir_str, entries),
+            )
+
     working_dir_resolved = working_dir.resolve()
     counts = git_ops.summary_diff_counts(
         working_dir_resolved, [e.path for e in entries if not e.is_untracked]
     )
 
     # Each file renders as its own collapsed-by-default `st.expander`
-    # via `_render_diff_file_section`, so the dialog body reads as a
-    # compact list of file headers up front; the user expands the
-    # ones they actually want to inspect. Expanders sit flush against
-    # each other — no `st.divider()` between them — so the list stays
-    # tight even with many files.
+    # plus an inline ``Discard`` popover via `_render_diff_file_section`,
+    # so the dialog body reads as a compact list of file headers up
+    # front; the user expands the ones they actually want to inspect
+    # (or clicks Discard to revert without expanding). Expanders sit
+    # flush against each other — no `st.divider()` between them — so
+    # the list stays tight even with many files.
     for entry in entries:
-        _render_diff_file_section(entry, counts, working_dir_resolved)
+        _render_diff_file_section(
+            entry, counts, working_dir_resolved, working_dir_str
+        )
 
     if in_progress:
         st.divider()
@@ -2447,14 +3381,14 @@ def _diff_dialog() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bottom-of-chat git row: branch picker + new branch + fetch + Push
+# Bottom-of-chat git row: branch picker (with new-branch + fetch
+# sentinels) + Changes + Sync
 # ---------------------------------------------------------------------------
-# Rendered directly below the chat input, with the "Changes" button
-# directly below it. Owns the per-chat branch switching, new-branch
-# creation, fetch, and the one-click "generate commit message + commit
-# + push" pipeline. Modals (`New branch`, `Publish branch`) are
-# mounted from ``render()`` alongside ``_diff_dialog`` so they overlay
-# the page rather than reflowing it.
+# Rendered directly below the chat input. Owns the per-chat branch
+# switching, new-branch creation, fetch, and the one-click "generate
+# commit message + commit + push" pipeline. Modals (`New branch`,
+# `Publish branch`) are mounted from ``render()`` alongside
+# ``_diff_dialog`` so they overlay the page rather than reflowing it.
 #
 # This is the **single entry point** for git push in the app — the
 # sidebar's old per-chat git block was removed and the push dialog
@@ -2462,14 +3396,26 @@ def _diff_dialog() -> None:
 # lives in the sidebar (so it remains visible from any page), but
 # branch ops + push live exclusively here.
 
-# Sentinel name used in the branch dropdown for "I want to create a new
-# branch". Selecting it opens the new-branch dialog and reverts the
-# selectbox to the live current branch so the sentinel never sticks.
-# Plain text rather than a `:material/...:` token because Streamlit's
-# selectbox option labels render as raw strings — Material icon tokens
-# only render inside `icon=` props on buttons / sidebar items / similar,
+# Sentinel names used in the branch dropdown to fold "create a new
+# branch" and "fetch upstream branches" into the same control the user
+# is already looking at — no separate icon buttons. Selecting either
+# sentinel runs its action and reverts the selectbox to the live
+# current branch so the sentinel string never sticks. Plain text
+# rather than a `:material/...:` token because Streamlit's selectbox
+# option labels render as raw strings — Material icon tokens only
+# render inside `icon=` props on buttons / sidebar items / similar,
 # not inside selectbox options.
-_NEW_BRANCH_SENTINEL = "+ New branch..."
+#
+# Both sentinels share the same leading ``›`` glyph as the workdir
+# sentinels above (see ``_WD_BROWSE_SENTINEL``) so all four pinned
+# action items in the bottom-of-chat actions row read as a visually
+# distinct group when the dropdown is open.
+_NEW_BRANCH_SENTINEL = "›  New branch..."
+_FETCH_BRANCHES_SENTINEL = "›  Fetch upstream branches"
+_BRANCH_SENTINELS: tuple[str, ...] = (
+    _NEW_BRANCH_SENTINEL,
+    _FETCH_BRANCHES_SENTINEL,
+)
 
 # Strict branch-name validator. Mirrors a useful subset of git's
 # refname rules: no whitespace, no double-dot, no leading/trailing
@@ -2515,15 +3461,86 @@ def _toast_git_error(prefix: str, exc: Exception) -> None:
     st.toast(f"{prefix}: {msg}", icon=":material/error:")
 
 
+def _resolve_commit_ai_model(chat_model: str) -> tuple[Any | None, str | None, str | None]:
+    """Resolve the chat's qualified model id for the Sync pipeline.
+
+    Sync's commit-message + PR-description steps run :mod:`commit_ai`,
+    which routes through :func:`agent.generate_text` and dispatches by
+    qualified model id. To call them we need three things in sync:
+
+    1. The qualified model id (``<provider>:<raw>``) — comes straight
+       from ``chat.model``.
+    2. The matching per-provider client object —
+       ``ss.clients[provider_id]`` after a successful Connect.
+    3. A user-friendly error string when either is missing, so the
+       Sync button's tooltip and the pipeline's toast can explain
+       *why* AI commits aren't ready (rather than blowing up later
+       with a generic SDK exception).
+
+    Returns ``(client, qualified_model, error)``:
+
+    - On success, ``(client, qualified_model, None)``.
+    - On any failure (blank model, malformed id, unknown provider,
+      provider not connected), ``(None, None, error_msg)``.
+
+    The error strings are user-facing — they reference the provider's
+    display label (from :data:`providers.PROVIDERS`) so a user who
+    picked an Anthropic model sees "Connect Anthropic..." rather
+    than the cryptic "anthropic" id.
+    """
+    if not chat_model:
+        return None, None, (
+            "Pick a model in the dropdown below the chat input to "
+            "enable AI-drafted commit messages."
+        )
+    provider_id = model_provider(chat_model)
+    if not provider_id:
+        # Bare ids (no ``provider:`` prefix) are legacy / migration
+        # state. Surface a clear message rather than guessing a
+        # provider — the user can pick from the model picker to fix.
+        return None, None, (
+            f"Model `{chat_model}` is not in qualified `<provider>:<model>` "
+            "form. Open the model picker below the chat input to pick one."
+        )
+    provider = providers.get_provider(provider_id)
+    if provider is None:
+        return None, None, (
+            f"Unknown provider id `{provider_id}`. Open the model picker "
+            "to pick a model from a connected provider."
+        )
+    client = st.session_state.clients.get(provider_id)
+    if client is None:
+        return None, None, (
+            f"Connect {provider.label} on the Settings page so Sync "
+            "can use this chat's model to draft the commit message."
+        )
+    return client, chat_model, None
+
+
 def _on_chat_git_branch_change(chat_id: str) -> None:
     """Branch-selectbox callback inside the bottom-of-chat git row.
 
-    Refuses on a dirty working tree (toast + revert), falls through to
-    ``git_ops.checkout`` for both local and remote-tracking names
-    (git resolves ``origin/feature`` -> a new local tracking branch
-    automatically), bumps the global git nonce, and toasts on success.
-    Selecting the sentinel "New branch..." entry opens the new-branch
-    dialog instead of running a checkout.
+    Three branches:
+
+    1. ``_NEW_BRANCH_SENTINEL`` — revert the selectbox to the live
+       branch (so the sentinel string doesn't stick) and open the new-
+       branch modal.
+    2. ``_FETCH_BRANCHES_SENTINEL`` — revert the selectbox, run
+       ``git fetch origin`` in the active chat's workdir, bump the
+       git nonce so the next render's branch dropdown reflects newly
+       fetched remote branches (and any deleted on origin disappear),
+       and toast on success / error.
+    3. A real branch name — fall through to ``git_ops.checkout`` for
+       both local and remote-tracking names (git resolves
+       ``origin/feature`` -> a new local tracking branch
+       automatically), bump the nonce, and toast on success. Don't
+       refuse on a dirty working tree: ``git checkout <branch>``
+       natively carries uncommitted changes when there's no conflict
+       with the target branch, which matches what most users mean by
+       "switch branches and bring my work along". When there *is* a
+       real conflict (the target branch would overwrite a dirty file),
+       git fails with a clear stderr that the GitError handler below
+       surfaces verbatim.
     """
     ss = st.session_state
     select_key = f"chat_bottom_branch_select_{chat_id}"
@@ -2534,10 +3551,20 @@ def _on_chat_git_branch_change(chat_id: str) -> None:
         return
 
     if chosen == _NEW_BRANCH_SENTINEL:
-        # Revert the selectbox so the sentinel doesn't stick around as
-        # the displayed value while the dialog is open.
         ss[select_key] = ss.get(sentinel_key) or ss.get(select_key)
         ss.new_branch_dialog_open = True
+        return
+
+    if chosen == _FETCH_BRANCHES_SENTINEL:
+        ss[select_key] = ss.get(sentinel_key) or ss.get(select_key)
+        working_dir = Path(chat.working_dir).expanduser().resolve()
+        try:
+            git_ops.fetch(working_dir)
+        except GitError as e:
+            _toast_git_error("git fetch failed", e)
+            return
+        _bump_chat_git_nonce()
+        st.toast("Fetched from origin", icon=":material/cloud_download:")
         return
 
     if chosen == ss.get(sentinel_key):
@@ -2545,14 +3572,6 @@ def _on_chat_git_branch_change(chat_id: str) -> None:
 
     working_dir = Path(chat.working_dir).expanduser().resolve()
     try:
-        if git_ops.working_tree_dirty(working_dir):
-            st.toast(
-                "Cannot switch branches with uncommitted changes. "
-                "Commit or stash first.",
-                icon=":material/warning:",
-            )
-            ss[select_key] = ss.get(sentinel_key)
-            return
         git_ops.checkout(working_dir, chosen)
     except GitError as e:
         _toast_git_error("git checkout failed", e)
@@ -2563,41 +3582,32 @@ def _on_chat_git_branch_change(chat_id: str) -> None:
     st.toast(f"Switched to `{chosen}`", icon=":material/check_circle:")
 
 
-def _on_chat_git_fetch_clicked() -> None:
-    """Fetch button callback: ``git fetch origin`` in the active chat's workdir."""
-    ss = st.session_state
-    chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
-    if chat is None or not chat.working_dir:
-        return
-    working_dir = Path(chat.working_dir).expanduser().resolve()
-    try:
-        git_ops.fetch(working_dir)
-    except GitError as e:
-        _toast_git_error("git fetch failed", e)
-        return
-    _bump_chat_git_nonce()
-    st.toast("Fetched from origin", icon=":material/cloud_download:")
-
-
 def _on_chat_git_new_branch_clicked() -> None:
-    """`+ New branch` button callback: open the modal."""
+    """**New branch** sentinel callback: open the modal."""
     st.session_state.new_branch_dialog_open = True
 
 
-def _on_chat_git_push_clicked() -> None:
-    """Push button callback: branch on upstream + open the right next step.
+def _on_chat_git_sync_clicked() -> None:
+    """Sync button callback: enqueue a bidirectional sync, or open first-push.
 
-    - With an upstream: enqueue a one-click push (no PR) for the current
-      script run to consume after the rerun. We can't run the pipeline
-      directly inside this on-click callback because callbacks fire
-      *before* the script runs; doing the pipeline here would block the
-      callback for the duration of a network round-trip + an LLM call,
-      and any exception would render through Streamlit's ugly
-      uncaught-exception traceback. Routing through the
-      ``pending_push_request`` queue keeps the pipeline inside
+    Sync is bidirectional: if the working tree is dirty, draft a
+    commit message via the chat's currently selected model, stage,
+    commit; always fetch; pull ``--rebase`` if behind upstream
+    (with the existing merge-conflict
+    handoff); push if ahead. When the branch has no upstream yet, open
+    the **Publish branch** modal first so the user can opt into a PR.
+
+    - With an upstream: enqueue a one-click sync (no PR) for the
+      current script run to consume after the rerun. We can't run the
+      pipeline directly inside this on-click callback because callbacks
+      fire *before* the script runs; doing the pipeline here would
+      block the callback for the duration of a network round-trip + an
+      LLM call, and any exception would render through Streamlit's
+      ugly uncaught-exception traceback. Routing through the
+      ``pending_sync_request`` queue keeps the pipeline inside
       ``render()`` where ``st.toast`` / ``st.rerun`` work normally.
-    - Without an upstream (first push of this branch): open the
-      "Publish branch" modal so the user can opt into a PR.
+    - Without an upstream + dirty or already-committed work locally:
+      open the "Publish branch" modal so the user can opt into a PR.
     """
     ss = st.session_state
     chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
@@ -2607,45 +3617,62 @@ def _on_chat_git_push_clicked() -> None:
     branch = git_ops.current_branch(working_dir)
     if not branch:
         st.toast(
-            "Cannot push from a detached HEAD. Check out a branch first.",
+            "Cannot sync from a detached HEAD. Check out a branch first.",
             icon=":material/error:",
         )
         return
     if git_ops.has_upstream(working_dir, branch):
-        ss.pending_push_request = {"create_pr": False}
+        ss.pending_sync_request = {"create_pr": False}
     else:
         ss.first_push_dialog_open = True
 
 
-def _run_push_pipeline(
+def _run_sync_pipeline(
     working_dir: Path,
     branch: str,
     *,
     create_pr: bool,
 ) -> None:
-    """One-click stage -> commit -> fetch -> rebase -> push (-> optional PR URL).
+    """One-click bidirectional sync: commit (if dirty) -> fetch -> pull --rebase (if behind) -> push (if ahead).
 
-    Ports the body of the (former) ``streamlit_app._push_dialog`` action
-    handler. Status surfaces via :func:`st.toast` calls so the user
-    sees progress without us having to host a status pane in any
-    dialog. On a ``pull --rebase`` conflict we set ``ss.merge_conflict``
-    and the sidebar's existing merge-conflict warning takes over —
-    same handoff the old dialog used.
+    The sync state machine:
+
+    1. Refuse if a merge/rebase is in progress (the sidebar's existing
+       conflict-resolution flow has to finish first).
+    2. If the working tree is dirty: resolve the chat's selected model
+       + matching per-provider client via
+       :func:`_resolve_commit_ai_model`, ask **that** model for a
+       commit message, stage all dirty paths, and commit. The chat's
+       selected model (Anthropic / OpenAI / Google / W&B / etc.) is
+       used here — not a hard-coded provider — so users who picked a
+       non-W&B model don't have to also keep DeepSeek connected.
+       Model resolution is only required when there's something to
+       commit; pull-only / push-only syncs work without it.
+    3. Always ``git fetch origin`` (best-effort; failure is non-fatal).
+    4. If the branch has an upstream and is behind: ``git pull --rebase``.
+       On a real merge conflict we set ``ss.merge_conflict`` and hand
+       off to the sidebar's existing "Resolve with DeepSeek" affordance
+       (the conflict-resolution turn still pins to DeepSeek because
+       it's a multi-step agent loop with its own model contract).
+    5. If the branch has an upstream and is ahead: ``git push``. (When
+       the working tree was dirty in step 2, the new commit is what
+       makes us ahead, so this is the same code path the old "Push"
+       button took.)
+    6. When ``create_pr=True`` (set by the Publish branch dialog on a
+       branch with no upstream), generate PR title + body via the
+       chat's selected model and open the platform compare URL.
 
     All dirty paths (tracked + untracked) are staged unconditionally;
-    file-by-file selection is deliberately not exposed in v2 of this
-    flow — see the plan's "Out of scope" section.
+    file-by-file selection is deliberately not exposed.
     """
     ss = st.session_state
 
-    # Check W&B-side availability (DeepSeek V4-Flash is W&B-only). Look
-    # in both the legacy ``ss.models`` list (W&B raw ids) and the new
-    # multi-provider ``ss.provider_models["wandb"]`` slot.
-    wandb_models = ss.provider_models.get("wandb") or ss.get("models") or []
-    if not commit_ai.is_deepseek_available(wandb_models):
+    in_progress, op = git_ops.is_in_merge_or_rebase(working_dir)
+    if in_progress:
         st.toast(
-            f"Push needs `{DEEPSEEK_MODEL}` for the commit message.",
-            icon=":material/error:",
+            f"In-progress `{op or 'merge'}` — resolve before syncing "
+            "(see the warning in the sidebar).",
+            icon=":material/warning:",
         )
         return
 
@@ -2655,72 +3682,154 @@ def _run_push_pipeline(
         _toast_git_error("git status failed", e)
         return
     paths = [e.path for e in entries]
-    if not paths:
-        st.toast("Working tree is clean. Nothing to push.", icon=":material/info:")
-        return
+    dirty = bool(paths)
 
-    in_progress, op = git_ops.is_in_merge_or_rebase(working_dir)
-    if in_progress:
-        st.toast(
-            f"In-progress `{op or 'merge'}` — resolve before pushing "
-            "(see the warning in the sidebar).",
-            icon=":material/warning:",
-        )
-        return
+    # Resolve the chat's selected model + matching per-provider client
+    # for AI-drafted commit messages and PR descriptions. Sync only
+    # *requires* this when the working tree is dirty (the pull-only /
+    # push-only paths work without an LLM round-trip); we still
+    # resolve it up front so the create-PR step downstream — which
+    # may run on a clean tree — can also reach for it.
+    chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
+    chat_model_str = chat.model if chat else ""
+    commit_client, commit_model, commit_model_error = _resolve_commit_ai_model(
+        chat_model_str
+    )
 
-    st.toast("Generating commit message...", icon=":material/auto_awesome:")
-    wandb_key = ss.provider_keys.get("wandb", "")
-    try:
-        commit_msg = commit_ai.generate_commit_message(
-            ss.get("client"), working_dir, paths, api_key=wandb_key
-        )
-    except Exception as e:
-        st.toast(f"DeepSeek failed: {e}", icon=":material/error:")
-        return
-    commit_msg = (commit_msg or "").strip()
-    if not commit_msg:
-        st.toast(
-            "DeepSeek did not return a commit message.",
-            icon=":material/error:",
-        )
-        return
+    commit_msg = ""
+    if dirty:
+        if commit_model_error is not None:
+            st.toast(commit_model_error, icon=":material/error:")
+            return
+
+        # Pre-flight: build the diff blob ourselves so we can detect the
+        # "dirty paths but no textual diff" case (submodules with only
+        # internal changes, binary file changes, mode-only changes,
+        # etc.) BEFORE calling the model. ``commit_ai.generate_commit_message``
+        # short-circuits to ``""`` when the diff is empty and we'd
+        # surface a misleading "model did not return" toast otherwise —
+        # the model wasn't even called. Building it here costs nothing
+        # extra because ``commit_ai.generate_commit_message`` would do
+        # the same call internally; the diff is small relative to the
+        # subsequent LLM round-trip.
+        diff_blob = git_ops.combined_diff_for_paths(working_dir, paths)
+        if not diff_blob.strip():
+            # Most common cause is a submodule with only working-tree
+            # changes (parent shows ` M <submodule>` but `git diff
+            # HEAD` produces nothing because the submodule's commit
+            # hash hasn't changed). Other causes: binary-only diffs,
+            # mode-only changes, untracked files git can't read as
+            # text. The `git commit` CLI rejects this state too — we
+            # surface a clear toast rather than blame the model.
+            sample_paths = ", ".join(f"`{p}`" for p in paths[:3])
+            more = f" and {len(paths) - 3} more" if len(paths) > 3 else ""
+            st.toast(
+                "Nothing to commit from the working tree's textual "
+                "diff (paths: " + sample_paths + more + "). This "
+                "usually means a submodule with only internal "
+                "changes, a binary-only change, or a mode-only "
+                "change — none of which produce a textual diff for "
+                "the model to summarize. Commit those directly with "
+                "git or resolve the submodule first.",
+                icon=":material/info:",
+            )
+            return
+
+        st.toast("Generating commit message...", icon=":material/auto_awesome:")
+        try:
+            commit_msg = commit_ai.generate_commit_message(
+                commit_client,
+                working_dir,
+                paths,
+                model=commit_model,
+            )
+        except Exception as e:
+            st.toast(
+                f"Commit message generation failed: {e}",
+                icon=":material/error:",
+            )
+            return
+        commit_msg = (commit_msg or "").strip()
+        if not commit_msg:
+            # This branch is now narrowly "the model returned an
+            # empty response despite a non-empty diff" — a real
+            # model failure rather than a misleading
+            # nothing-to-summarize misclassification (the empty-diff
+            # case is caught by the pre-flight above).
+            st.toast(
+                "The model returned an empty commit message. Try "
+                "again, or pick a different model in the chat input.",
+                icon=":material/error:",
+            )
+            return
 
     pr_title = ""
     pr_body = ""
     if create_pr:
-        st.toast(
-            "Generating pull request title and body...",
-            icon=":material/auto_awesome:",
-        )
-        try:
-            target = git_ops.default_branch(working_dir)
-            pr_title, pr_body = commit_ai.generate_pr_description(
-                ss.get("client"), working_dir, paths, branch, target,
-                api_key=wandb_key,
+        # PR title/body uses the *current* dirty diff if there is one,
+        # otherwise the diff of HEAD vs the default branch (covers the
+        # "I committed earlier and now want to publish" case). Reuses
+        # the same ``commit_client`` / ``commit_model`` we resolved
+        # above; if model resolution failed we surface the same toast
+        # rather than silently falling back to a blank PR body.
+        if commit_model_error is not None:
+            st.toast(commit_model_error, icon=":material/warning:")
+        else:
+            st.toast(
+                "Generating pull request title and body...",
+                icon=":material/auto_awesome:",
             )
-        except Exception as e:
-            st.toast(f"DeepSeek PR generation failed: {e}", icon=":material/warning:")
+            try:
+                target = git_ops.default_branch(working_dir)
+                pr_title, pr_body = commit_ai.generate_pr_description(
+                    commit_client,
+                    working_dir,
+                    paths,
+                    branch,
+                    target,
+                    model=commit_model,
+                )
+            except Exception as e:
+                st.toast(
+                    f"Pull request description generation failed: {e}",
+                    icon=":material/warning:",
+                )
 
-    try:
-        git_ops.unstage_all(working_dir)
-        git_ops.stage(working_dir, paths)
-        git_ops.commit(working_dir, commit_msg)
-        _bump_chat_git_nonce()
-    except GitError as e:
-        _toast_git_error("commit failed", e)
-        return
-
-    if git_ops.has_upstream(working_dir, branch):
+    if dirty:
         try:
-            git_ops.fetch(working_dir)
-        except GitError:
-            # fetch failures aren't fatal; push will surface the same
-            # condition with a clearer error if it matters.
-            pass
+            git_ops.unstage_all(working_dir)
+            git_ops.stage(working_dir, paths)
+            git_ops.commit(working_dir, commit_msg)
+            _bump_chat_git_nonce()
+        except GitError as e:
+            _toast_git_error("commit failed", e)
+            return
+
+    # Always fetch so behind/ahead checks below see fresh refs. We
+    # also bump the git-state nonce on success so the branch
+    # dropdown above the Sync button picks up any newly-fetched
+    # remote branches (and any branches `--prune` just dropped) on
+    # the same rerun — pulling the per-rerun "fetch" affordance into
+    # Sync means users who hit Sync expecting the branch list to
+    # stay current actually get that.
+    fetched = False
+    try:
+        git_ops.fetch(working_dir)
+        fetched = True
+        _bump_chat_git_nonce()
+    except GitError:
+        # Fetch failures aren't fatal here; push/pull will surface
+        # the same condition with a clearer error if it matters.
+        pass
+
+    has_upstream = git_ops.has_upstream(working_dir, branch)
+    pulled = False
+    if has_upstream:
         try:
             if git_ops.is_behind_upstream(working_dir):
                 pull = git_ops.pull_rebase(working_dir)
                 _bump_chat_git_nonce()
+                pulled = pull.ok
                 if not pull.ok and pull.conflict:
                     ss.merge_conflict = {
                         "files": pull.files,
@@ -2736,22 +3845,67 @@ def _run_push_pipeline(
             _toast_git_error("git pull --rebase failed", e)
             return
 
-    push_result = git_ops.push(working_dir, branch=branch)
-    _bump_chat_git_nonce()
-    if not push_result.ok:
-        st.toast(
-            f"Push failed: {push_result.stderr.strip() or 'unknown error'}",
-            icon=":material/error:",
-        )
+    # Decide whether to push. With an upstream, only push when ahead;
+    # without an upstream (first publish), push unconditionally so we
+    # can set the upstream on origin in the same call.
+    pushed = False
+    push_result = None
+    if has_upstream:
+        if git_ops.is_ahead_of_upstream(working_dir):
+            push_result = git_ops.push(working_dir, branch=branch)
+            _bump_chat_git_nonce()
+            if not push_result.ok:
+                st.toast(
+                    f"Push failed: {push_result.stderr.strip() or 'unknown error'}",
+                    icon=":material/error:",
+                )
+                return
+            pushed = True
+    else:
+        # No upstream + create_pr=True means the user opened the
+        # Publish branch dialog explicitly and confirmed; always push
+        # in that case. Otherwise (sync clicked on a no-upstream
+        # branch with a clean tree), the on-click handler already
+        # routes to the publish dialog rather than enqueueing a sync,
+        # so this branch is reached after a confirmed publish or after
+        # we just committed in step 2 above.
+        push_result = git_ops.push(working_dir, branch=branch)
+        _bump_chat_git_nonce()
+        if not push_result.ok:
+            st.toast(
+                f"Push failed: {push_result.stderr.strip() or 'unknown error'}",
+                icon=":material/error:",
+            )
+            return
+        pushed = True
+
+    if not (dirty or pulled or pushed):
+        if fetched:
+            st.toast(
+                f"Fetched from origin — already in sync with `origin/{branch}`.",
+                icon=":material/check_circle:",
+            )
+        else:
+            st.toast(
+                f"Already in sync with `origin/{branch}`. Nothing to do.",
+                icon=":material/check_circle:",
+            )
         return
 
-    short_msg = commit_msg.splitlines()[0][:80]
+    parts: list[str] = []
+    if dirty:
+        short_msg = commit_msg.splitlines()[0][:60] if commit_msg else "committed"
+        parts.append(f"committed: {short_msg}")
+    if pulled:
+        parts.append("pulled upstream")
+    if pushed:
+        parts.append(f"pushed `{branch}`")
     st.toast(
-        f"Pushed `{branch}`: {short_msg}",
+        "Sync done — " + " · ".join(parts),
         icon=":material/check_circle:",
     )
 
-    if create_pr:
+    if create_pr and push_result is not None:
         target = git_ops.default_branch(working_dir)
         url = git_ops.remote_compare_url(
             working_dir,
@@ -2874,9 +4028,10 @@ def _first_push_dialog() -> None:
 
     Two-option radio: just push the branch, or push and open a
     pre-filled pull-request draft. Selecting the PR option triggers
-    an extra DeepSeek call to draft a title + body, then opens the
-    GitHub compare URL with both pre-filled — the user can review
-    and edit before submitting on the platform side.
+    an extra round-trip to the chat's currently selected model to
+    draft a title + body, then opens the GitHub compare URL with
+    both pre-filled — the user can review and edit before submitting
+    on the platform side.
 
     ``on_dismiss=_close_first_push_dialog`` is mandatory so X / Esc /
     click-outside dismissal clears ``ss.first_push_dialog_open``;
@@ -2931,163 +4086,24 @@ def _first_push_dialog() -> None:
         return
 
     create_pr = choice == "Push and open a pull request"
-    ss.pending_push_request = {"create_pr": create_pr}
+    ss.pending_sync_request = {"create_pr": create_pr}
     _close_first_push_dialog()
     st.rerun()
 
 
-def _render_chat_git_row() -> None:
-    """The compact git row directly below the chat input: branch / new / fetch / push.
+def _drain_pending_sync_request() -> None:
+    """Run any queued sync pipeline. Called once per ``render()``.
 
-    Hidden entirely when the active chat has no workdir, when the
-    workdir is not a git repo, or when git isn't installed — the
-    Changes button rendered just below this row degrades the same
-    way, so there's nothing useful for this row to do in those cases
-    and the bottom controls collapse cleanly to just the workdir +
-    model selectors.
-
-    On a detached HEAD we render a single caption explaining why the
-    full controls are missing instead of an empty row.
-    """
-    ss = st.session_state
-    chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
-    working_dir_str = (chat.working_dir if chat else "") or ss.working_dir or ""
-    if not working_dir_str:
-        return
-    if not git_ops.is_git_installed():
-        return
-
-    state = _diff_git_state(working_dir_str)
-    if not state.get("in_repo"):
-        return
-
-    branch = state.get("current_branch")
-    if not branch:
-        st.caption(
-            ":material/warning: Detached HEAD. Switch to a branch via the "
-            "command line to enable branch operations and push."
-        )
-        return
-
-    # Build the dropdown options. Local branches first, then any
-    # remote-only ones (suffixed `(remote)` so users see at a glance
-    # which entries are remote-tracking — selectbox option labels
-    # render as raw strings, so Material icon tokens are not an
-    # option), then the sentinel "+ New branch..." entry.
-    local_branches = list(state.get("branches") or [])
-    remote_branches = list(state.get("remote_branches") or [])
-    remote_only = [
-        rb for rb in remote_branches
-        if rb.split("/", 1)[-1] not in local_branches
-    ]
-    options: list[str] = []
-    if branch not in local_branches:
-        options.append(branch)
-    options.extend(local_branches)
-    options.extend(remote_only)
-    options.append(_NEW_BRANCH_SENTINEL)
-
-    select_key = f"chat_bottom_branch_select_{chat.id}"
-    sentinel_key = f"_chat_bottom_branch_active_{chat.id}"
-    ss[sentinel_key] = branch
-    ss[select_key] = branch if branch in options else options[0]
-
-    in_progress = bool(state.get("in_merge_or_rebase"))
-    dirty = bool(state.get("status"))
-    deepseek_ok = commit_ai.is_deepseek_available(
-        ss.provider_models.get("wandb") or ss.get("models") or []
-    )
-
-    cols = st.columns([4, 1, 1, 4], vertical_alignment="bottom")
-
-    with cols[0]:
-        st.selectbox(
-            "Branch",
-            options=options,
-            key=select_key,
-            on_change=_on_chat_git_branch_change,
-            args=(chat.id,),
-            label_visibility="collapsed",
-            format_func=lambda b: (
-                b if b == _NEW_BRANCH_SENTINEL
-                # Selectbox option labels render as raw strings — Material
-                # tokens don't work here, so use a plain text marker for
-                # remote-only refs.
-                else (f"{b}  (remote)" if b in remote_only else b)
-            ),
-            help=(
-                "Switch this chat's working-directory branch. Pick a "
-                "`(remote)` entry to check out a remote-only branch as a "
-                "new local tracking branch. Switching is refused with a "
-                "toast if you have uncommitted changes."
-            ),
-        )
-
-    with cols[1]:
-        st.button(
-            "",
-            icon=":material/add:",
-            key=f"chat_bottom_new_branch_{chat.id}",
-            help="Create a new branch off the current HEAD.",
-            on_click=_on_chat_git_new_branch_clicked,
-            width="stretch",
-        )
-
-    with cols[2]:
-        st.button(
-            "",
-            icon=":material/cloud_download:",
-            key=f"chat_bottom_fetch_{chat.id}",
-            help="Fetch upstream branches from origin.",
-            on_click=_on_chat_git_fetch_clicked,
-            width="stretch",
-        )
-
-    with cols[3]:
-        push_disabled = (not dirty) or in_progress or (not deepseek_ok)
-        if not dirty:
-            push_help = "Working tree is clean. Nothing to push."
-        elif in_progress:
-            push_help = (
-                f"In-progress `{state.get('operation') or 'merge'}` — "
-                "resolve before pushing."
-            )
-        elif not deepseek_ok:
-            push_help = (
-                f"Push needs `{DEEPSEEK_MODEL}` to draft the commit "
-                "message; that model isn't available on this account."
-            )
-        else:
-            push_help = (
-                "Generate a commit message with DeepSeek and push to "
-                "origin. First push of a branch asks whether to also "
-                "open a pull request."
-            )
-        st.button(
-            "Push",
-            icon=":material/upload:",
-            type="primary",
-            key=f"chat_bottom_push_{chat.id}",
-            on_click=_on_chat_git_push_clicked,
-            disabled=push_disabled,
-            width="stretch",
-            help=push_help,
-        )
-
-
-def _drain_pending_push_request() -> None:
-    """Run any queued push pipeline. Called once per ``render()``.
-
-    Push callbacks (the bottom-row Push button + the Publish-branch
+    Sync callbacks (the actions-row Sync button + the Publish-branch
     modal Confirm button) drop their intent into
-    ``ss.pending_push_request`` instead of running the pipeline
+    ``ss.pending_sync_request`` instead of running the pipeline
     inline; this drain step turns that into a single in-render call
     so :func:`st.toast` / :func:`st.rerun` work normally and any
-    DeepSeek / git failure surfaces through the toast layer rather
-    than a Streamlit uncaught-exception trace.
+    LLM / git failure surfaces through the toast layer rather than a
+    Streamlit uncaught-exception trace.
     """
     ss = st.session_state
-    req = ss.pop("pending_push_request", None)
+    req = ss.pop("pending_sync_request", None)
     if not req:
         return
     chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
@@ -3097,61 +4113,11 @@ def _drain_pending_push_request() -> None:
     branch = git_ops.current_branch(working_dir)
     if not branch:
         st.toast(
-            "Cannot push from a detached HEAD.",
+            "Cannot sync from a detached HEAD.",
             icon=":material/error:",
         )
         return
-    _run_push_pipeline(working_dir, branch, create_pr=bool(req.get("create_pr")))
-
-
-def _render_chat_diff_button() -> None:
-    """Render the "Changes" button just below the bottom-of-chat git row.
-
-    Hidden entirely when the chat's working directory is empty / not a
-    git repo / has no changes / git is missing — so the bottom controls
-    stay compact when there's nothing to look at.
-    """
-    ss = st.session_state
-    chat = ss.chats.get(ss.active_chat_id) if ss.active_chat_id else None
-    working_dir_str = (chat.working_dir if chat else "") or ss.working_dir or ""
-    if not working_dir_str:
-        return
-    if not git_ops.is_git_installed():
-        return
-
-    state = _diff_git_state(working_dir_str)
-    if not state.get("in_repo"):
-        return
-    entries: list[git_ops.StatusEntry] = list(state.get("status") or [])
-    if not entries:
-        return
-
-    working_dir_resolved = Path(working_dir_str).expanduser().resolve()
-    counts = git_ops.summary_diff_counts(
-        working_dir_resolved, [e.path for e in entries if not e.is_untracked]
-    )
-    total_adds = 0
-    total_dels = 0
-    for entry in entries:
-        adds, dels = counts.get(entry.path, (0, 0))
-        if entry.is_untracked and adds == 0:
-            adds = git_ops.untracked_line_count(working_dir_resolved, entry.path)
-        total_adds += adds
-        total_dels += dels
-
-    n = len(entries)
-    label = (
-        f"Changes  +{total_adds} \u2212{total_dels}  "
-        f"\u00b7  {n} file{'s' if n != 1 else ''}"
-    )
-    st.button(
-        label,
-        icon=":material/difference:",
-        key="chat_diff_open_btn",
-        width="stretch",
-        on_click=_open_diff_dialog,
-        help="View the live working-tree diff in an overlay.",
-    )
+    _run_sync_pipeline(working_dir, branch, create_pr=bool(req.get("create_pr")))
 
 
 # ---------------------------------------------------------------------------
@@ -3504,13 +4470,13 @@ def render() -> None:
 
     wd_ok = Path(ss.working_dir).expanduser().is_dir() if ss.working_dir else False
 
-    # Drain any push pipeline that a callback queued before this rerun.
+    # Drain any sync pipeline that a callback queued before this rerun.
     # Has to run after the active-chat sync above (so it sees the
     # right working_dir) but before the bottom controls render so the
-    # toast for "pushed!" / "rebase conflict" appears on the same
-    # rerun rather than the next one, and so the git row below picks
-    # up the post-push branch / dirty state on the same render.
-    _drain_pending_push_request()
+    # toast for "synced!" / "rebase conflict" appears on the same
+    # rerun rather than the next one, and so the actions row below
+    # picks up the post-sync branch / dirty state on the same render.
+    _drain_pending_sync_request()
 
     # Chat input is wrapped in its own ``st.container()`` so Streamlit
     # renders it inline (rather than docking it to the viewport bottom
@@ -3529,23 +4495,23 @@ def render() -> None:
     )
     with st.container():
         _render_chat_stop_button(chat)
+        # Inject the paperclip + outlined-button styling for Streamlit's
+        # built-in attach button. Done inside the chat-input container
+        # so the rule sits next to the element it targets.
+        st.html(_CHAT_INPUT_ATTACH_BUTTON_CSS)
         # Phase 6: ``accept_file="multiple"`` turns the chat input
         # into a ``ChatInputValue`` dict-like with ``text`` and
-        # ``files: list[UploadedFile]`` keys. The accepted file
-        # extensions cover images (vision-capable models),
-        # PDFs (Anthropic / Google native, others get text-extracted
-        # via pypdf), and a curated set of plain-text + code formats.
+        # ``files: list[UploadedFile]`` keys. We intentionally do **not**
+        # pass ``file_type=...`` here: Streamlit surfaces that list as
+        # a tooltip on the attach button which clutters the chat UI.
+        # The OS picker accepts anything; we validate against
+        # ``_SUPPORTED_FILE_EXTENSIONS`` after submit and surface a
+        # clear ``st.error`` listing the supported types when the user
+        # picks something we don't handle.
         chat_submission = st.chat_input(
             chat_input_placeholder,
             disabled=(not wd_ok) or chat_running,
             accept_file="multiple",
-            file_type=[
-                "png", "jpg", "jpeg", "webp", "gif",
-                "pdf",
-                "txt", "md", "json", "csv", "yaml", "yml", "toml",
-                "py", "ts", "tsx", "js", "jsx", "html", "css",
-                "sh", "rs", "go", "java", "cpp", "c", "h",
-            ],
         )
         # Normalize: ``ChatInputValue`` is a dict-like for new-style
         # submissions; ``str`` for the legacy single-text path. We
@@ -3586,21 +4552,13 @@ def render() -> None:
         on_draft_change=_on_draft_change,
     )
 
-    # Compact git row sits directly below the chat input: branch
-    # picker + new-branch + fetch + Push. Hidden entirely when the
-    # workdir isn't a git repo / git is missing — same degradation the
-    # Changes button has, so the bottom controls stay tight when
-    # there's nothing useful to show.
-    _render_chat_git_row()
-
-    # "Changes" button sits directly below the git row. Hidden when
-    # the working tree is clean / not a git repo so it doesn't take up
-    # space when there's nothing to view. Clicking the button opens
-    # ``_diff_dialog`` (a modal overlay) so opening the diff never
-    # reflows the chat input or any other control.
-    _render_chat_diff_button()
-
-    _render_workdir_controls()
+    # Single combined actions row directly below the chat input:
+    # workdir picker (with browse + new-project sentinels) + branch
+    # picker (with new-branch + fetch sentinels) + Changes + Sync.
+    # Cells degrade to disabled (rather than hidden) when the workdir
+    # isn't a git repo / there are no changes / git is missing, so
+    # the column layout stays stable across workdir switches.
+    _render_chat_actions_row()
 
     if not wd_ok:
         st.warning(
@@ -3622,7 +4580,50 @@ def render() -> None:
         _start_turn(pending["prompt"], override_model=pending.get("model"))
         st.rerun()
 
-    if (prompt or submitted_files) and wd_ok and chat.status != chats.STATUS_RUNNING:
+    # Validate uploaded file extensions against the curated allow-
+    # list. We surface unsupported types here (rather than in the OS
+    # picker via ``file_type=``) so the chat input's attach button
+    # doesn't render a long tooltip listing every supported
+    # extension. ``submission_valid`` gates the actual turn-start
+    # below; the dialog mounts at the bottom of ``render()`` still
+    # need to run so we don't ``return`` early on a validation error.
+    submission_valid = True
+    if submitted_files:
+        unsupported = [
+            f for f in submitted_files
+            if Path(getattr(f, "name", "") or "").suffix.lstrip(".").lower()
+            not in _SUPPORTED_FILE_EXTENSIONS
+        ]
+        if unsupported:
+            bad_names = ", ".join(
+                f"`{getattr(f, 'name', '?')}`" for f in unsupported
+            )
+            supported_pretty = ", ".join(
+                f".{ext}" for ext in _SUPPORTED_FILE_EXTENSIONS
+            )
+            st.error(
+                f"Cannot attach {bad_names} \u2014 unsupported file "
+                f"type. Supported: {supported_pretty}.",
+                icon=":material/error:",
+            )
+            submission_valid = False
+            # Restore the typed prompt as the chat draft so the next
+            # render re-flows it into the textarea (st.chat_input has
+            # already cleared its own value). The user can fix the
+            # upload and re-send without retyping.
+            if prompt:
+                chat.draft_text = prompt
+                try:
+                    chats.save_chat(chat)
+                except OSError:
+                    pass
+
+    if (
+        submission_valid
+        and (prompt or submitted_files)
+        and wd_ok
+        and chat.status != chats.STATUS_RUNNING
+    ):
         # Phase 6: persist uploads into the chat's artifacts inbox so
         # the file metadata can be threaded through ``chats.start_turn``
         # along with the prompt text. Empty prompts with attachments
@@ -3673,12 +4674,19 @@ def render() -> None:
 
     # New-branch + first-push modals are mounted next to the diff dialog
     # so all three live at the same render level. Each is gated by its
-    # own ``ss.*_dialog_open`` flag flipped from the bottom-row git
+    # own ``ss.*_dialog_open`` flag flipped from the actions-row git
     # callbacks (and cleared by the dialog itself on Cancel / Confirm).
     if ss.get("new_branch_dialog_open"):
         _new_branch_dialog()
     if ss.get("first_push_dialog_open"):
         _first_push_dialog()
+
+    # Project-context modal — mounted alongside the other dialogs,
+    # gated by ``ss.project_context_dialog_open`` (set by the
+    # **Project context** button on the model row, cleared by the
+    # dialog's body Close button or its on_dismiss callback).
+    if ss.get("project_context_dialog_open"):
+        _project_context_dialog()
 
     # Model picker modal — mounted alongside the other dialogs, gated
     # by ``ss.model_picker_open`` (set by the "current model" button
